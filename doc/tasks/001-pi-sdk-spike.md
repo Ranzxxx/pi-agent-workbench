@@ -2,10 +2,10 @@
 
 ## 元数据
 
-- 状态：`backlog`
-- 负责人：未分配
-- 分支或 worktree：未创建
-- 基线提交：未记录
+- 状态：`done`
+- 负责人：Codex
+- 分支或 worktree：`task/001-pi-sdk-spike`（当前主工作区）
+- 基线提交：`7f01b8a59cb81ee14ec8e728d958804127a83c8a`
 - 依赖任务：无
 
 ## 背景
@@ -57,18 +57,27 @@
 
 ## 验证命令
 
-实现 Agent 在确认依赖和测试框架后填写。默认验证不得调用付费模型。
+初始化由项目负责人在本地执行；依赖安装完成后运行：
+
+```bash
+cd /home/lzs/Projects/pi/spikes/pi-sdk
+npm run check
+npm start
+```
+
+默认验证不得调用付费模型。
 
 ## 决策与范围变化
 
-尚无。
+- 已恢复 `/home/lzs/Projects/pi/pi` 作为只读 PI 源码参考；该目录被根 `.gitignore` 排除，不属于本项目提交范围。
+- 当前使用 PI SDK `0.86.1` 源码文档和示例进行 API 验证；技术验证程序仍需放在 `spikes/pi-sdk/**`。
 
 ## 交接
 
-- 最终状态：未开始
-- 完成内容：无
-- 修改文件：无
-- 验证结果：未运行
-- 风险与未解决事项：无
+- 最终状态：已完成
+- 完成内容：建立隔离的 TypeScript 验证程序；验证会话创建与释放、类型化只读工具、消息和工具事件、确定性失败、显式取消及应用层超时；补写 PI SDK 适配层决策文档。
+- 修改文件：`spikes/pi-sdk/**`、`doc/decisions/001-pi-sdk-integration.md`、`doc/tasks/001-pi-sdk-spike.md`
+- 验证结果：在 `spikes/pi-sdk` 执行 `npm run check` 通过；执行 `npm start` 通过，正常、失败、取消、超时四个场景均为 `ok: true`。
+- 风险与未解决事项：faux provider 只用于确定性测试；正式接入仍需在 `packages/agent-runtime` 中处理事件信封、运行标识、持久化和工具策略。
 - 提交 SHA：无
-- 后续起点：阅读 PI SDK 文档和示例，确定无付费模型的测试路径。
+- 后续起点：以 `doc/decisions/001-pi-sdk-integration.md` 为输入创建正式 PI SDK 适配层任务；当前分支改动尚未提交。
