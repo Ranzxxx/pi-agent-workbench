@@ -1,0 +1,29 @@
+# Downloaded read-only reference repository
+/pi/
+
+# Dependencies and builds
+node_modules/
+**/node_modules/
+.next/
+dist/
+build/
+coverage/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Local runtime data
+.cache/
+var/
+artifacts/
+*.log
+
+# Private engineering notes; do not publish to GitHub
+doc/internal/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
