@@ -2,21 +2,37 @@
 
 使用 PI SDK、Node.js 和 TypeScript 构建带证据的 GitHub 仓库技术分析工作台。输入公开仓库与目标，固定提交版本，生成可追溯的分析报告并展示执行过程。
 
-**项目处于技术验证阶段，尚未提供 Web、API 或实际仓库分析功能。**
+**项目已建立协议、PI 运行适配层与离线测试，尚未提供 Web、API 或实际仓库分析功能。**
 
-## 当前可运行内容
+## 安装与验证
 
-`spikes/pi-sdk` 是独立的 SDK 实验：会话、类型化工具、事件、失败、模型取消、超时与工具取消。使用模拟 provider，不需要模型 API Key。
+正式 workspace 固定 Node.js **24.21.0**、npm **11.9.0**，使用 ESM 和 TypeScript strict。已安装 nvm 的本地环境可在项目根目录执行：
 
 ```bash
-cd spikes/pi-sdk
+nvm install
+nvm use
+npm install --global npm@11.9.0 --ignore-scripts --no-audit --no-fund
 npm ci --ignore-scripts --no-audit --no-fund
 npm run check
 npm test
-npm start
+npm run spike
 ```
 
-依赖已有时跳过 npm ci。当前使用 Node.js 22.23.1 验证；正式工程计划使用 Node.js 24。干净安装与新工具链验证仍待 CI 完成。根目录目前没有 package.json，不能在根目录执行 npm start。
+没有 nvm 时，先准备上述版本的 Node/npm，再从 `npm ci` 开始。全局 npm 安装命令仅用于你选择的 Node 环境；本轮 Agent 验证使用临时工具链，没有更改系统 Node。`npm run check` 和 `npm test` 会拒绝不一致的工具链。
+
+根目录的 `package-lock.json` 是 workspace 安装依据。根安装后无需再进入子目录安装依赖；`spikes/pi-sdk/package-lock.json` 仅保留给独立 spike 的历史复现。所有模型测试使用模拟 provider，不需要 API Key，不调用真实模型。安装依赖需要访问 npm 注册表。
+
+CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 workspace 和独立 spike 的干净安装与检查。具体已执行证据及远程 CI 状态见 [TASK-003](doc/tasks/003-project-foundation.md)。
+
+## 当前模块
+
+| 路径 | 职责 |
+| --- | --- |
+| `packages/protocol` | 版本化输入、预算、事件、结果、证据与产物引用的 schema 和校验 |
+| `packages/agent-runtime` | PI SDK 薄适配层、受控资源与工具、调用/Token/成本预算、取消和结果校验入口 |
+| `spikes/pi-sdk` | 保留的 SDK 行为实验与负向回归 |
+
+运行适配层接口与边界见 [模块说明](packages/agent-runtime/README.md)。当前源码通过 tsx 运行；未配置发布构建，也没有根 `npm start` 或 Web 服务。
 
 七个生命周期场景和回归说明见 [spike 文档](spikes/pi-sdk/README.md)。
 
@@ -28,7 +44,7 @@ npm start
 - 展示运行事件、证据和产物，支持取消。
 - 离线自动测试与单独授权的在线模型评测。
 
-这些是待实现目标。当前不支持进程重启恢复、多 Agent、Docker 执行、RAG 或长期记忆。
+仓库获取、证据采集、报告生成和 Web 仍是待实现目标。当前不支持进程重启恢复、多 Agent、Docker 执行、RAG 或长期记忆。
 
 ## 开发与协作
 
