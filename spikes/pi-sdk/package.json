@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
     "start": "tsx src/index.ts"
   },
   "dependencies": {

@@ -1,38 +1,28 @@
-# 多 Agent 任务协议
+# 任务索引与执行协议
 
-`doc/tasks/` 用于保存可以独立交付的任务合同和交接记录。`AGENTS.md` 保存长期规则，`doc/plan.md` 保存项目计划，本目录保存会变化的执行状态。
-
-完整的角色分工、任务生命周期、顺序接力、并行 worktree、交接清单和提示词模板见[多 Agent 协作开发工作流](../multi-agent-workflow.md)。
+任务卡是详细状态和验收证据的事实来源；本索引仅同步摘要。产品范围见 [计划](../plan.md)，规则见 [AGENTS.md](../../AGENTS.md)，接力提示词见 [协作流程](../multi-agent-workflow.md)。
 
 ## 状态
 
-- `backlog`：任务已定义，但尚未分配。
-- `in_progress`：已有唯一写入负责人。
-- `blocked`：存在明确阻塞条件，任务卡必须记录原因。
-- `review`：实现完成，等待集成负责人检查。
-- `done`：验收标准满足且交接完整。
+backlog（待开始）→ in_progress（实施）→ review（待验收/集成）→ done（验收、审查与集成都完成）。有具体外部阻塞时用 blocked。已经合并但复审发现验收缺口，也可以重开为 review，并保留历史。
 
-## 协作流程
-
-1. 集成负责人从 `TEMPLATE.md` 创建任务卡，定义依赖、允许路径和验收标准。
-2. 写入负责人领取任务，将状态设为 `in_progress`，记录 worktree、分支和基线 SHA。
-3. 调查 Agent 可以并行读取代码，但不得修改任务拥有的文件。
-4. 负责人只在允许路径内工作，持续记录重要范围变化和阻塞。
-5. 完成后填写修改文件、验证结果、风险和交接位置，并将状态设为 `review`。
-6. 集成负责人审查并合并后，将状态设为 `done`。
-
-## 冲突热点
-
-以下文件默认只由集成负责人修改：
-
-- `doc/plan.md`
-- `AGENTS.md`
-- 根 `package.json` 和根锁文件
-- 共享 API/事件协议
-- 数据库迁移和版本清单
+不要求每个任务建立 GitHub Issue。一个任务一个写入者，默认顺序接力；并行必须独立 worktree，共享协议与根锁文件由集成者或指定唯一写入者负责。
 
 ## 当前任务
 
-| 任务 | 状态 | 负责人 | 依赖 |
+| 任务 | 状态 | 负责人 | 依赖/下一步 |
 | --- | --- | --- | --- |
-| [001 PI SDK 技术验证](001-pi-sdk-spike.md) | backlog | 未分配 | 无 |
+| [TASK-001 PI SDK 技术验证](001-pi-sdk-spike.md) | review | Codex / 待集成者复核 | PR #1 已合并；复审重开，补强见 TASK-002，干净安装证据待 TASK-003 |
+| [TASK-002 验证补强与计划校准](002-review-hardening.md) | review | Codex | 修复与文档已验证，未提交/集成 |
+| [TASK-003 最小工程、协议与离线 CI](003-project-foundation.md) | backlog | 未分配 | TASK-002 |
+| [TASK-004 合成仓库证据与报告闭环](004-evidence-report.md) | backlog | 未分配 | TASK-003 |
+| [TASK-005 公开仓库快照与单 Agent 分析](005-public-repository.md) | backlog | 未分配 | TASK-004 |
+| [TASK-006 API、SSE 与最小 Web](006-web-workbench.md) | backlog | 未分配 | TASK-005 |
+
+下一可用编号为 TASK-007；不要提前分配给未知功能。本轮用户明确选择只完成 TASK-002，不启动 TASK-003～006。
+
+## 创建与交接
+
+从 [模板](TEMPLATE.md) 建卡，写明允许路径、共享文件所有权、依赖、验收和权限。实施前检查 Git 状态，填写基线和分支。结束时记录命令的真实结果与未验证项，同步此索引。
+
+root package.json、锁文件、协议、迁移和计划不可由多个任务同时修改。依赖安装可由用户执行；在线模型、提交和推送分别需要明确授权。
