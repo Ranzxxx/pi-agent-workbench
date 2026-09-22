@@ -1,0 +1,22 @@
+{
+  "name": "pi-agent-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "24.21.0", "npm": "11.9.0" },
+  "packageManager": "npm@11.9.0",
+  "workspaces": ["packages/protocol", "packages/agent-runtime", "spikes/pi-sdk"],
+  "scripts": {
+    "check:toolchain": "node -e \"if(process.versions.node !== '24.21.0' || !process.env.npm_config_user_agent?.startsWith('npm/11.9.0 ')) throw new Error('Use Node.js 24.21.0 and npm 11.9.0')\"",
+    "precheck": "npm run check:toolchain",
+    "pretest": "npm run check:toolchain",
+    "check": "npm run check --workspaces",
+    "test": "npm run test --workspaces",
+    "spike": "npm run start --workspace pi-sdk-spike"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.6",
+    "tsx": "4.20.5",
+    "typescript": "5.9.3"
+  }
+}

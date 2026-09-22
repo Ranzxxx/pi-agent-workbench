@@ -4,20 +4,20 @@ TASK-001 的隔离实验程序，由 TASK-002 补强验收。这里是 SDK 行�
 
 ## 运行
 
-已验证环境：Linux、Node.js 22.23.1、PI SDK 0.86.1。正式工程计划采用 Node.js 24，兼容性尚待后续 CI 验证。
+原验证环境：Linux、Node.js 22.23.1、PI SDK 0.86.1。TASK-003 将正式 workspace 固定为 Node.js 24.21.0 / npm 11.9.0；新的干净安装与兼容性证据见任务卡。
 
-从仓库根目录进入本目录：
+日常开发在仓库根目录按根锁文件统一安装：
 
 ```bash
-cd spikes/pi-sdk
-# 首次安装由使用者执行；锁文件已纳入版本管理
 npm ci --ignore-scripts --no-audit --no-fund
-npm run check
-npm test
-npm start
+npm run check --workspace pi-sdk-spike
+npm test --workspace pi-sdk-spike
+npm run spike
 ```
 
-已有完整依赖时可跳过 npm ci。本轮使用已有依赖验证，没有重新执行干净安装；不要把上述安装说明误认为干净安装已经验收。npm install 仍可用于主动更新依赖，但日常复现优先 npm ci。
+根安装完成后，在本目录执行 `npm run check`、`npm test`、`npm start` 仍然有效。不要混用根安装和子目录安装来维护依赖。
+
+独立复现实验时，将本目录的 package.json、package-lock.json、tsconfig.json、src/、tests/ 复制到一个不属于 workspace 的新目录，再执行 `npm ci --ignore-scripts --no-audit --no-fund`、`npm run check`、`npm test`、`npm start`。CI 包含这个独立安装检查；保留的子锁文件仅供该用途。
 
 ## 校验内容
 
@@ -54,4 +54,4 @@ npm start
 - `tests/spike.test.ts`：回归测试。
 - [ADR-001](../../doc/decisions/001-pi-sdk-integration.md)：观察结果和未来适配层约束。
 
-真实模型质量、费用、干净安装和 Node.js 24 兼容性尚未验证。
+真实模型质量与费用尚未验证。干净安装与 Node.js 24 的实际验证记录见 [TASK-003](../../doc/tasks/003-project-foundation.md)。

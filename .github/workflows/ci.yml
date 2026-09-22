@@ -1,0 +1,32 @@
+name: Offline checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm install --global npm@11.9.0 --ignore-scripts --no-audit --no-fund
+      - run: node --version && npm --version
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check
+      - run: npm test
+      - run: npm run spike
+      - name: Verify standalone spike installation
+        run: |
+          spike_check_dir="$(mktemp -d)"
+          cp spikes/pi-sdk/package.json spikes/pi-sdk/package-lock.json spikes/pi-sdk/tsconfig.json "$spike_check_dir/"
+          cp -R spikes/pi-sdk/src spikes/pi-sdk/tests "$spike_check_dir/"
+          cd "$spike_check_dir"
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run check
+          npm test
+          npm start
