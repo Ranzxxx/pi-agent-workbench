@@ -2,7 +2,7 @@
 
 ## 元数据
 
-- 状态：`done`
+- 状态：`review`
 - 负责人：Codex（实现与文档集成）
 - 分支或 worktree：`task/002-review-hardening`，`/home/lzs/Projects/pi`；当前 checkout 由本任务独占，无并行写入者。
 - 基线提交：`dd82a11a90676691121c2617495112563f844c6c`
@@ -59,7 +59,7 @@
 
 ## 交接
 
-- 当前状态：done；验收及差异复核完成，PR #2 已合并。
+- 当前状态：review，代码与文档可审查；未提交、未合并。
 - 完成内容：重写 spike 的隔离会话与严格断言；七场景演示、五组回归；重整计划/ADR/协作协议；更新历史卡与索引；新建 TASK-003～006；补充根 README 与 MIT LICENSE。
 - 修改文件：AGENTS.md、README.md、LICENSE；doc/plan.md、doc/multi-agent-workflow.md、doc/decisions/001-pi-sdk-integration.md；doc/tasks/001～006、README.md、TEMPLATE.md；spikes/pi-sdk 的 README.md、package.json、tsconfig.json、src/index.ts、src/harness.ts、src/checks.ts、src/assertions.ts、tests/spike.test.ts。
 - 验证结果（2026-09-21，已有依赖，Node.js 22.23.1）：
@@ -71,7 +71,6 @@
   - `git -C pi status --short`：无参考源码改动；`git ls-files pi doc/internal` 无跟踪内容；依赖锁文件未改。
   - Snap Node 在沙箱内无法启动，Node 检查通过批准的沙箱外执行完成；没有安装或升级依赖。
 - 风险与未验证事项：真实 provider、在线质量/费用、干净安装、Node.js 24、正式协议、进程恢复和非协作式工具终止未验证；不能将模拟结果推广为生产保证。
-- 提交 SHA：`e455fb3`；PR #2；合并提交：`58d4a78`。
-- 2026-09-22 状态同步：本地 main 已包含合并提交，复核无阻止提交的问题，TASK-002 完成。
+- 提交 SHA：无（未提交）。
 - 已停止写入：本轮结束后停止；下一位 Agent 先检查实际 Git 状态。
-- 下一步：启动 TASK-003，建立正式工程与干净安装验证。
+- 下一步：按本卡范围审查差异，由用户提交/推送和 PR 合并；集成者回填本卡后再启动 TASK-003，不重复安装或重做已经验证的 spike。
