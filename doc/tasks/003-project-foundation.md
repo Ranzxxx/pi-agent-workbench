@@ -2,7 +2,7 @@
 
 ## 元数据
 
-- 状态：`review`（PR #3 已合并到 main；待远程 CI 核验）
+- 状态：`done`（PR #3 已合并；用户于 2026-09-23 确认 GitHub Actions 全绿）
 - 负责人：Codex（唯一写入者与集成者）
 - 分支或 worktree：`task/003-project-foundation`；`/home/lzs/Projects/pi` 独占 checkout
 - 基线提交：`58d4a7886048581bcb6dc1b6b07ed7ab5d587f20`
@@ -38,11 +38,11 @@
 - [x] 运行状态机保证终态唯一，区分模型错误、工具错误、用户取消、超时和预算。
 - [x] PI 适配层显式注入凭据/资源/工具，业务模块不直接导入 PI。
 - [x] 离线测试验证错误拒绝、取消竞争、事件顺序、Token/调用上限与结果校验，既检查成功也检查失败。
-- [ ] CI 在干净 checkout 使用锁文件安装并运行检查，不要求模型 Key；附实际成功日志或工作流链接。
+- [x] CI 在干净 checkout 使用锁文件安装并运行检查，不要求模型 Key；用户确认 GitHub Actions 全绿，见 [Offline checks 工作流记录](https://github.com/Ranzxxx/pi-agent-workbench/actions/workflows/ci.yml)。本任务记录未取得单次运行的具体 URL 和测试 SHA。
 - [x] 按 spike 文档从无 node_modules 环境验证安装和启动，回填 TASK-001 的缺失验收证据。
 - [x] README 与任务状态真实同步。
 
-PR #3 已合并到 `main`，合并提交为 `6834ee2b4caa4b30b543da2832c6e49ebdcdf39b`。本地 main 已快进同步。CI 项保留未勾选：本地等价流程通过，GitHub Actions 远程结果仍未核实。
+PR #3 已合并到 `main`，合并提交为 `6834ee2b4caa4b30b543da2832c6e49ebdcdf39b`。本地 main 已快进同步。用户于 2026-09-23 确认 GitHub Actions 全绿；工作流入口见上方链接。单次运行 URL 和测试 SHA 未提供，因此任务记录保留此证据限制。
 
 ## 实施决策
 
@@ -83,15 +83,16 @@ PR #3 已合并到 `main`，合并提交为 `6834ee2b4caa4b30b543da2832c6e49ebdc
 - 用户已创建并合并 [PR #3](https://github.com/Ranzxxx/pi-agent-workbench/pull/3)。实现提交：`daf71765e5f22bce6507a0d658bc8f8ac230ee81`；GitHub merge commit：`6834ee2b4caa4b30b543da2832c6e49ebdcdf39b`。
 - 本地 `main` 已快进同步到 `6834ee2`。TASK-003 代码现已集成。
 - 本地全新安装、24 项测试、7 个 spike 场景均通过，证据见上节。
-- GitHub Actions 对应 PR / merge commit 的结果尚未获得可核验记录；本地运行不能替代远程 CI 结果。远程结果确认后再将 CI 验收项打勾、把任务设为 done，并启动 TASK-004。
+- 用户于 2026-09-23 确认 GitHub Actions 全绿；本地离线验证也已通过。由于未提供单次运行 URL 和测试 SHA，保留工作流总览链接及该证据限制。
+- TASK-003 的实现、本地验收、PR 集成与远程 CI 用户确认均已完成，状态设为 done；可以启动 TASK-004。
 - 用户确认远程撤销分支为误触产生；它没有影响 `main`，不要合并该分支。
 
 ## 交接
 
-- 当前状态：review；实现、本地验收和 PR #3 集成已完成，远程 CI 状态待核验。
+- 当前状态：done；实现、本地验收、PR #3 集成和用户确认的远程 CI 均完成。
 - 修改路径：根 package.json / package-lock.json / tsconfig.base.json / .nvmrc；.github/workflows/ci.yml；packages/protocol/**、packages/agent-runtime/**；README.md、spike README；计划、ADR、TASK-001～003 与任务索引。
 - 已知限制：真实 provider/成本质量、报告业务、GitHub 获取、API/Web、进程恢复与强制终止未验证或尚未实现；在途调用可能超出估算预算。GitHub Actions 远程验收待推送。
 - 实现提交：`daf71765e5f22bce6507a0d658bc8f8ac230ee81`；PR #3；合并提交：`6834ee2b4caa4b30b543da2832c6e49ebdcdf39b`。
-- 当前本地分支：`task/003-merge-record`，仅含本次状态记录草稿，尚未提交。
+- 任务分支 `task/003-merge-record` 已推送，基线状态记录提交为 `9746ed3`；本轮 TASK-003 验收文档同步尚未提交。
 - 已停止写入：本轮结束后停止；下一位 Agent 先检查实际 Git 状态。
-- 下一位 Agent 第一个动作：核对 PR #3 的远程 CI 结果；若误触的 revert PR 仍开启，先确认用户是否已在 GitHub 关闭它。没有新的修改或失败时不重复全套离线测试。
+- 下一位 Agent 第一个动作：完成本轮验收文档的提交/PR 集成，随后按索引启动 TASK-004。用户确认的远程 CI 为全绿；单次运行 URL 和测试 SHA 未取得。

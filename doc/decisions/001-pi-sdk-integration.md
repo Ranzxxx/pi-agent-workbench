@@ -2,7 +2,7 @@
 
 ## 状态与证据
 
-- TASK-001 的基本实验与 TASK-002 的补强已合并（PR #1/#2）。TASK-003 实现正式协议与适配层，待提交审查。
+- TASK-001 的基本实验与 TASK-002 的补强已合并（PR #1/#2）。TASK-003 正式协议与适配层已通过 PR #3 合并；用户于 2026-09-23 确认 GitHub Actions 全绿。
 - 验证版本：`@earendil-works/pi-coding-agent@0.86.1`、`@earendil-works/pi-ai@0.86.1`，原 Node.js 22.23.1；TASK-003 新增 Node.js 24.21.0 / npm 11.9.0 的全新安装验证。
 - 下面“已验证”仅指离线 faux provider 下的具体行为，不证明真实模型质量、持久化恢复或任意工具都能取消。
 - spike 位于 [spikes/pi-sdk](../../spikes/pi-sdk/README.md)，保留独立实验；正式适配层现位于 `packages/agent-runtime`。
@@ -44,7 +44,7 @@ SDK 的参数校验会尝试类型转换：数字 42 可能变成字符串 "42"�
 - 已安装发布包的公开导出是实现依据；本地 main 分支参考源码不能替代锁定版本的类型验证。
 - 当前实验未增加依赖；测试采用 Node 内置 test runner 和已有 tsx。
 
-## 正式协议与适配层（TASK-003 已实现，待集成）
+## 正式协议与适配层（TASK-003 已实现并验收）
 
 schema 与语义校验位于 `packages/protocol/src/index.ts`；PI 适配层位于 `packages/agent-runtime/src/index.ts`。报告内容、文件边界和证据有效性属于 TASK-004，当前产物完成门槛由应用注入的 finalize 执行。
 
@@ -97,7 +97,7 @@ npm start
 - `npm start` 校验七个生命周期场景；失败抛错并非零退出。
 - `npm test` 增加负向断言、配置污染与等待上限测试。
 - TASK-003 在不含 node_modules 的临时项目副本执行根锁文件安装、check、24 项测试和 spike；另在独立目录按 spike 原锁文件安装，类型检查、5 组测试和 7 场景通过。
-- GitHub Actions workflow 已建立；PR #3 已合并，远程运行结果仍待核实，不能将本地成功称为远程 CI 已通过。
+- GitHub Actions workflow 已建立；PR #3 已合并，用户确认远程运行全绿。具体运行 URL 与测试 SHA 未提供，见 [Offline checks 工作流记录](https://github.com/Ranzxxx/pi-agent-workbench/actions/workflows/ci.yml)。
 - faux 的文本分块固定；时间戳、耗时和模拟 usage 不作为真实模型性能依据。
 - 不执行真实 provider、联网模型、进程重启恢复、SSE、数据库、Docker 或非协作式工具强制终止测试。
 - Node.js 24 迁移已重新验证工具取消和配置隔离；后续 SDK/工具链升级仍需重新验证。

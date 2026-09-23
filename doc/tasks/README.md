@@ -14,8 +14,8 @@ backlog（待开始）→ in_progress（实施）→ review（待验收/集成�
 | --- | --- | --- | --- |
 | [TASK-001 PI SDK 技术验证](001-pi-sdk-spike.md) | done | Codex | PR #1/#2 已合并；TASK-003 已补齐独立干净安装证据 |
 | [TASK-002 验证补强与计划校准](002-review-hardening.md) | done | Codex | PR #2 已合并；提交 e455fb3，合并 58d4a78 |
-| [TASK-003 最小工程、协议与离线 CI](003-project-foundation.md) | review | Codex | PR #3 已合并到 main；远程 CI 状态待核验 |
-| [TASK-004 合成仓库证据与报告闭环](004-evidence-report.md) | backlog | 未分配 | TASK-003 |
+| [TASK-003 最小工程、协议与离线 CI](003-project-foundation.md) | done | Codex | PR #3 已合并；用户确认 GitHub Actions 全绿 |
+| [TASK-004 合成仓库证据与报告闭环](004-evidence-report.md) | backlog | 未分配 | 可开始；TASK-003 已验收 |
 | [TASK-005 公开仓库快照与单 Agent 分析](005-public-repository.md) | backlog | 未分配 | TASK-004 |
 | [TASK-006 API、SSE 与最小 Web](006-web-workbench.md) | backlog | 未分配 | TASK-005 |
 
