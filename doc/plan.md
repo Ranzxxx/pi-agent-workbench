@@ -157,7 +157,7 @@ v0.2 阶段划分为：获取快照 → 收集证据 → 分析 → 校验 → �
 
 | 问题 | 验证入口 |
 | --- | --- |
-| GitHub Actions 远程运行 | TASK-003 已由用户确认全绿；单次运行链接与测试 SHA 待补充到任务卡 |
+| GitHub Actions 远程运行 | [Offline checks 运行 #35813163678](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/35813163678) 在提交 `f14bbf8f99ac0d2c478708ae925ade818a937e94` 上通过 |
 | 协议、状态机、终态唯一与预算计算 | TASK-003 已通过离线测试；真实 provider 和业务产物待后续任务验证 |
 | 报告证据结构是否足够 | TASK-004 的合成事实清单与负向样例 |
 | 第一个公开仓库 SHA 和主模型选择 | TASK-005；真实模型调用需单独授权 |
