@@ -97,7 +97,7 @@ npm start
 - `npm start` 校验七个生命周期场景；失败抛错并非零退出。
 - `npm test` 增加负向断言、配置污染与等待上限测试。
 - TASK-003 在不含 node_modules 的临时项目副本执行根锁文件安装、check、24 项测试和 spike；另在独立目录按 spike 原锁文件安装，类型检查、5 组测试和 7 场景通过。
-- GitHub Actions workflow 已建立；远程运行需在用户推送后验收，不能将本地成功称为远程 CI 已通过。
+- GitHub Actions workflow 已建立；PR #3 已合并，远程运行结果仍待核实，不能将本地成功称为远程 CI 已通过。
 - faux 的文本分块固定；时间戳、耗时和模拟 usage 不作为真实模型性能依据。
 - 不执行真实 provider、联网模型、进程重启恢复、SSE、数据库、Docker 或非协作式工具强制终止测试。
 - Node.js 24 迁移已重新验证工具取消和配置隔离；后续 SDK/工具链升级仍需重新验证。

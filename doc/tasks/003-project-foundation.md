@@ -2,12 +2,12 @@
 
 ## 元数据
 
-- 状态：`review`（实现及本地验收完成；待提交、远程 CI 与合并）
+- 状态：`review`（PR #3 已合并到 main；待远程 CI 核验）
 - 负责人：Codex（唯一写入者与集成者）
 - 分支或 worktree：`task/003-project-foundation`；`/home/lzs/Projects/pi` 独占 checkout
 - 基线提交：`58d4a7886048581bcb6dc1b6b07ed7ab5d587f20`
 - 依赖任务：TASK-002 审查并集成；不要求 TASK-001 干净安装验收预先通过，本卡负责补齐该证据。
-- 提交/推送授权：无
+- 提交/推送：用户已在前续轮次提交 `daf7176` 并推送；未由 Codex 执行。
 - 在线模型授权：无
 
 ## 目标与非目标
@@ -42,7 +42,7 @@
 - [x] 按 spike 文档从无 node_modules 环境验证安装和启动，回填 TASK-001 的缺失验收证据。
 - [x] README 与任务状态真实同步。
 
-CI 项已完成 workflow 和本地等价执行，保留未勾选是因为分支尚未推送，GitHub Actions 远程结果待验收。它不阻塞创建 commit/PR，但必须在合并验收前核实。
+PR #3 已合并到 `main`，合并提交为 `6834ee2b4caa4b30b543da2832c6e49ebdcdf39b`。本地 main 已快进同步。CI 项保留未勾选：本地等价流程通过，GitHub Actions 远程结果仍未核实。
 
 ## 实施决策
 
@@ -73,39 +73,25 @@ CI 项已完成 workflow 和本地等价执行，保留未勾选是因为分支�
 - 根工程日志：`/tmp/pi-task003-clean-workspace.log`，SHA-256 `76887153a36445e8c36feec3f275f215c58a28fe9f3738bede65d20238f02444`。
 - 独立 spike 日志：`/tmp/pi-task003-clean-spike.log`，SHA-256 `20ea3273d97163618e581a29551d83b1aac197c7aaf80c85ae2f5319f9c74e6b`。
 - 上述为本机临时日志，不提交到仓库；远程 CI URL 待用户推送后回填。
+- 用户确认远程分支 `revert-3-task/003-project-foundation` 是误触产生；其提交 `74d257c` 会撤销 TASK-003 的 25 个文件，但不包含在 `main`。不把它当作有效回滚或合并目标。
 - 最终只读复核：`git diff --check` 通过；15 个 Markdown 文档的本地链接无缺失；24 个代码/配置/锁文件与已通过干净验证的副本逐字节一致；25 个变更文件均在任务授权范围内；原 spike 锁文件未修改，pi/ 和 doc/internal/ 无 Git 跟踪内容。Workflow YAML 已通过解析及触发器/测试步骤检查，此检查不替代远程 Actions 执行。
 - 环境限制：tsx 的 IPC socket 在沙箱内被 EPERM 拒绝，离线检查通过已批准的沙箱外执行；全程无真实模型调用。
 - 本次审查使用完整工作区差异；实现问题已修复，本地验收通过。远程 workflow 还需在推送后确认。
 
-## 用户提交与验收
+## 集成与验收
 
-1. 在项目根目录确认分支为 `task/003-project-foundation`，阅读差异与上述限制。
-2. 本机使用固定工具链后执行 `npm run check`、`npm test`、`npm run spike`；预期 24 项测试及 7 个场景通过。已有依赖可直接检查，新环境先执行根 `npm ci --ignore-scripts --no-audit --no-fund`。
-3. 按以下明确路径暂存，检查内容后提交：
-
-```bash
-git add .nvmrc package.json package-lock.json tsconfig.base.json \
-  .github/workflows/ci.yml packages/protocol packages/agent-runtime \
-  README.md spikes/pi-sdk/README.md doc/plan.md \
-  doc/decisions/001-pi-sdk-integration.md \
-  doc/tasks/001-pi-sdk-spike.md doc/tasks/002-review-hardening.md \
-  doc/tasks/003-project-foundation.md doc/tasks/README.md
-git diff --cached --check
-git diff --cached --stat
-git diff --cached
-git commit -m "feat(TASK-003): establish workspace protocol and PI runtime"
-git push -u origin task/003-project-foundation
-```
-
-4. 创建目标 main 的 PR。标题同 commit；描述建议为：建立固定 Node 24 的 npm workspace、版本化协议和受控 PI 适配层，成功结果要求应用产物校验；增加离线 CI 并同步 TASK-002 合并记录。验证为本地全新安装、24 项测试及七场景；未调用真实模型。
-5. 查看 PR 的 Checks，等待 Offline checks / offline 成功，确认对应提交。将远程成功链接加入本卡或 PR 验收记录；失败先修复，不提前合并。
-6. 审查并合并后，同步本卡与索引为 done、回填提交/合并信息；随后开始 TASK-004。不要为回填自身 SHA 反复 amend。
+- 用户已创建并合并 [PR #3](https://github.com/Ranzxxx/pi-agent-workbench/pull/3)。实现提交：`daf71765e5f22bce6507a0d658bc8f8ac230ee81`；GitHub merge commit：`6834ee2b4caa4b30b543da2832c6e49ebdcdf39b`。
+- 本地 `main` 已快进同步到 `6834ee2`。TASK-003 代码现已集成。
+- 本地全新安装、24 项测试、7 个 spike 场景均通过，证据见上节。
+- GitHub Actions 对应 PR / merge commit 的结果尚未获得可核验记录；本地运行不能替代远程 CI 结果。远程结果确认后再将 CI 验收项打勾、把任务设为 done，并启动 TASK-004。
+- 用户确认远程撤销分支为误触产生；它没有影响 `main`，不要合并该分支。
 
 ## 交接
 
-- 当前状态：review；实现和本地验收已完成，未暂存、未提交、未推送、未合并。
+- 当前状态：review；实现、本地验收和 PR #3 集成已完成，远程 CI 状态待核验。
 - 修改路径：根 package.json / package-lock.json / tsconfig.base.json / .nvmrc；.github/workflows/ci.yml；packages/protocol/**、packages/agent-runtime/**；README.md、spike README；计划、ADR、TASK-001～003 与任务索引。
 - 已知限制：真实 provider/成本质量、报告业务、GitHub 获取、API/Web、进程恢复与强制终止未验证或尚未实现；在途调用可能超出估算预算。GitHub Actions 远程验收待推送。
-- 提交 SHA：无（未提交）。
+- 实现提交：`daf71765e5f22bce6507a0d658bc8f8ac230ee81`；PR #3；合并提交：`6834ee2b4caa4b30b543da2832c6e49ebdcdf39b`。
+- 当前本地分支：`task/003-merge-record`，仅含本次状态记录草稿，尚未提交。
 - 已停止写入：本轮结束后停止；下一位 Agent 先检查实际 Git 状态。
-- 下一位 Agent 第一个动作：核对本分支和工作区，再协助用户检查提交/PR 对应的 Offline checks 结果；没有新的修改或失败时不重复全套离线测试。
+- 下一位 Agent 第一个动作：核对 PR #3 的远程 CI 结果；若误触的 revert PR 仍开启，先确认用户是否已在 GitHub 关闭它。没有新的修改或失败时不重复全套离线测试。
