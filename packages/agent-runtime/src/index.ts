@@ -29,7 +29,10 @@ export interface RuntimeOptions {
   budget: Budget;
   /** USD per million tokens; callers must supply a known, versioned price table. */
   pricing: Pricing;
-  /** Application validates content/evidence and publishes artifacts before resolving. */
+  /**
+   * 应用层的成功门：先校验报告内容/证据，再发布产物并返回引用。
+   * 运行时只校验引用协议；不能仅凭模型 stop 就认定业务完成。
+   */
   finalize: (input: { text: string; signal: AbortSignal }) => Promise<Artifact[]>;
   onEvent?: (event: RunEvent) => void;
   cancellationGraceMs?: number;
@@ -40,6 +43,7 @@ export class CancellationPendingError extends Error {
 }
 
 function blockedStream(model: Model<string>): AssistantMessageEventStream {
+  // SDK 期望拿到标准消息流；预算/取消拒绝调用时，用 aborted 流结束 Agent 循环。
   const stream = createAssistantMessageEventStream();
   const message: AssistantMessage = {
     role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
@@ -53,6 +57,7 @@ function blockedStream(model: Model<string>): AssistantMessageEventStream {
 
 export async function createSession(options: RuntimeOptions) {
   const ledger = new BudgetLedger(options.budget, options.pricing);
+  // 配置必须由应用显式注入，避免悄悄退回用户本机的模型配置或提示词。
   if (!options.credentials || typeof options.credentials.read !== "function") throw new Error("Explicit credentials are required");
   const graceMs = options.cancellationGraceMs ?? 1000;
   if (!Number.isInteger(graceMs) || graceMs < 1 || graceMs > 1000) throw new Error("Invalid cancellation grace");
@@ -66,6 +71,7 @@ export async function createSession(options: RuntimeOptions) {
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
   try {
     ({ session } = await createAgentSession({
+      // 会话数据只在内存中；resourceLoader 与显式工具列表同时关闭本机资源自动发现。
       cwd: options.cwd, agentDir: options.cwd, modelRuntime: runtime, model: options.model,
       resourceLoader: resources(options.systemPrompt), tools: tools.map((tool) => tool.name), customTools: tools,
       sessionManager: SessionManager.inMemory(options.cwd),
@@ -95,11 +101,13 @@ export async function createSession(options: RuntimeOptions) {
 
   type EventPayload = RunEvent extends infer E ? E extends RunEvent ? Pick<E, "type" | "data"> : never : never;
   function emit(payload: EventPayload): void {
+    // 所有 SDK 事件先映射为版本化公共协议；观察者异常不能打断 Agent 执行。
     const event = parseEvent({ schemaVersion: 1, eventId: randomUUID(), runId, attemptId, sequence: ++sequence, timestamp: new Date().toISOString(), ...payload });
     try { options.onEvent?.(structuredClone(event)); } catch { observerErrors++; }
   }
   function abort(reason: CancelReason = "user"): boolean {
     parse(CancelReasonSchema, reason);
+    // 只接受第一个取消原因；宽限期内等待 PI 协作退出，未退出时报告 pending 而不伪造终态。
     if (state !== "running") return false;
     cancelReason = reason;
     state = "cancelling";
@@ -120,6 +128,7 @@ export async function createSession(options: RuntimeOptions) {
   let deadline = 0;
   const originalStream = session.agent.streamFunction;
   session.agent.streamFunction = (model, context, streamOptions) => {
+    // 每次真实模型调用前检查预算，并限制单次最大输出；在途调用的最终费用仍可能超估算。
     checkDeadline();
     if (cancelReason) return blockedStream(model);
     const reason = ledger.modelCall();
@@ -143,11 +152,13 @@ export async function createSession(options: RuntimeOptions) {
       const delta = event.assistantMessageEvent.delta;
       for (let i = 0; i < delta.length; i += 8192) emit({ type: "text.delta", data: { text: delta.slice(i, i + 8192) } });
     } else if (event.type === "message_end" && event.message.role === "assistant") {
+      // 用 provider 返回的实际 usage 累加预算；思考 Token 已包含在输出 Token 中。
       lastAssistant = event.message;
       ledger.record(event.message.usage);
       const reason = ledger.exhausted();
       if (reason) abort(reason);
     } else if (event.type === "tool_execution_start") {
+      // 在 SDK 校验工具参数前计数，因而无效参数也消耗一次配额；执行体仍由 beforeToolCall 控门。
       checkDeadline();
       const reason = cancelReason ?? ledger.toolCall();
       if (reason) abort(reason); else admittedTools.add(event.toolCallId);
@@ -166,11 +177,13 @@ export async function createSession(options: RuntimeOptions) {
     try { record(event); } catch { eventError = true; session.agent.abort(); }
   });
   function cleanup(): void {
+    // 结束时统一撤销监听、释放会话并注销 provider；重复清理保持安全。
     if (disposed) return;
     clearTimeout(timer); clearTimeout(graceTimer);
     unsubscribe(); session.dispose(); runtime.unregisterProvider(options.provider.id);
     disposed = true;
   }
+  // 唯一的业务终态出口：结果先过协议校验，再更新 state 并发出 run.finished。
   function finish(outcome: { status: "completed"; artifacts: Artifact[] } | { status: "failed"; error: Extract<RunResult, { status: "failed" }>["error"] } | { status: "cancelled"; reason: CancelReason }): RunResult {
     const result = parseResult({ schemaVersion: 1, runId, attemptId, usage: ledger.snapshot(), endedAt: new Date().toISOString(), ...outcome });
     state = result.status;
@@ -192,6 +205,7 @@ export async function createSession(options: RuntimeOptions) {
       const text = lastAssistant.content.filter((c) => c.type === "text").map((c) => c.text).join("");
       let artifacts: Artifact[];
       try {
+        // finalize 承担应用的报告校验/发布；取消信号让应用避免取消后继续发布。
         artifacts = parseArtifacts(await options.finalize({ text, signal: finalization.signal }));
       } catch {
         if (cancelReason) return finish({ status: "cancelled", reason: cancelReason });
@@ -211,6 +225,7 @@ export async function createSession(options: RuntimeOptions) {
     get observerErrors(): number { return observerErrors; },
     abort,
     run(input: RunInput): Promise<RunResult> {
+      // 一个会话只运行一次；复制并校验输入，避免调用方修改运行中的数据。
       if (state !== "queued" || disposed) return Promise.reject(new Error("Session is single-use"));
       const validated = structuredClone(parse(RunInputSchema, input));
       state = "running";
