@@ -16,10 +16,10 @@ backlog（待开始）→ in_progress（实施）→ review（待验收/集成�
 | [TASK-002 验证补强与计划校准](002-review-hardening.md) | done | Codex | PR #2 已合并；提交 e455fb3，合并 58d4a78 |
 | [TASK-003 最小工程、协议与离线 CI](003-project-foundation.md) | done | Codex | PR #3 已合并；用户确认 GitHub Actions 全绿 |
 | [TASK-004 合成仓库证据与报告闭环](004-evidence-report.md) | done | Codex | PR #7 已合并至 `main`（`7dc9dc7`）；可以开始 TASK-005 |
-| [TASK-005 公开仓库快照与单 Agent 分析](005-public-repository.md) | review | Codex | PR #9 已合并；三次在线尝试因 token_limit 取消；摘要修复和 200,000-token 预算离线验证通过，等待再次授权在线验收 |
+| [TASK-005 公开仓库快照与单 Agent 分析](005-public-repository.md) | in_progress | Codex | 已授权提交/推送/PR 合并与一次 DeepSeek Flash 测评（¥0.20估算上限）；当前进行本地验收与集成 |
 | [TASK-006 API、SSE 与最小 Web](006-web-workbench.md) | backlog | 未分配 | TASK-005 |
 
-下一可用编号为 TASK-007；不要提前分配给未知功能。TASK-004 已完成并集成；TASK-005 三次在线尝试因 token_limit 取消，CLI 摘要修复与累计 Token 预算调整已通过离线验收，等待另行授权在线评测；未生成可评分报告；TASK-006 尚未启动。
+下一可用编号为 TASK-007；不要提前分配给未知功能。TASK-004 已完成并集成；TASK-005 的在线评测入口已通过 PR #11 合并且 CI 全绿。提示词 v2 离线测试已通过；用户已授权当前分支提交/合并和一次真实评测，单次费用估算上限 ¥0.20。TASK-006 尚未启动。
 
 ## 创建与交接
 
