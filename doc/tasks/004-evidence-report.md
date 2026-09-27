@@ -2,12 +2,12 @@
 
 ## 元数据
 
-- 状态：`review`
+- 状态：`done`（PR #7 已合并到 `main`）
 - 负责人：Codex 主 Agent（协议、集成、监督与验收）；subagent 实现已交付
-- 分支或 worktree：集成 checkout `task/004-evidence-report`（`/home/lzs/Projects/pi`）；实现 checkout `codex/task004-implementation`（`/tmp/pi-task004-worker`）
+- 分支或 worktree：实现分支 `task/004-evidence-report`（PR #7）；状态同步分支 `task/004-merge-record`
 - 基线提交：`0484e12ead35a0b2265ee91d6d7a478d45e2edfb`
 - 依赖任务：TASK-003
-- 提交/推送授权：用户于 2026-09-27 明确授权本地提交；推送和合并未授权。
+- 提交/推送授权：用户于 2026-09-27 明确授权本地提交，随后报告已推送并合并 PR #7。
 - 在线模型授权：无
 
 ## 目标与非目标
@@ -52,11 +52,18 @@
 - 输出目录恰有四个文件。manifest 状态为 completed，引用 report.json、report.md、events.jsonl；逐个重新计算并核对三者 SHA-256 均匹配，CLI 结果也包含 manifest 自身 SHA-256。
 - `git diff --check`：通过。Golden tree SHA-256 在运行时与预置值核对；离线报告的五个事实召回、7/7 引用有效、6/6 人工支持、0 个无依据断言仅描述这个合成样例。
 
+## 集成与验收
+
+- PR #7 已合并到 `main`；GitHub merge commit 为 `7dc9dc75c7c0df989b95eafb7df5cab2a02eab24`，包含实现提交 `ebd1a2b` 与状态提交 `909aabc`。
+- 本地 `main` 已快进同步至 `origin/main` 的 `7dc9dc7`；TASK-004 实现已集成。
+- 离线类型检查、测试文件和演示均有上方记录；本任务无需真实模型、GitHub 仓库访问或目标代码执行。
+- 验收、审查和集成都已完成，状态设为 `done`；可开始 TASK-005。
+
 ## 交接
 
 - 完成内容：subagent 在独立 worktree 实现只读仓库工具、证据登记、原创 fixture、人工 golden facts/语义标注、报告/Markdown/manifest/事件日志、离线 CLI 和单元/端到端测试；未运行本地测试、未提交。主 Agent 维护 protocol schema、根 workspace 与 lock，集成实现后独立检查并运行全套类型检查、测试、离线 CLI 和四产物摘要核验；修复了测试断言问题，并让事实召回必须由引用覆盖 golden 源码范围。
 - 修改文件：`packages/protocol/**`、`packages/tools/**`、`packages/reporting/**`、`fixtures/synthetic-ts-repo/**`、`evals/**`、根 `package.json` / `package-lock.json` / `README.md`、本任务卡及任务索引。
-- 未完成项：本地提交后仍需用户按 Git 流程推送并合并到 main；在集成完成前任务状态保持 review。
+- 未完成项：无。PR #7 已合并，代码已集成到 `main`。
 - 风险：证据位置与摘要有效不自动证明语义正确；语义支持由人工标注；分数不代表真实 GitHub 仓库质量。该演示不访问 GitHub、不使用模型/API Key，也不安装或执行 fixture 程序。
 - 提交 SHA：`ebd1a2b869e76d23ad51ff9fc538f538a9deaa2d`（本地功能提交）。
-- 下一步：由用户决定是否推送并合并；集成完成且确认验收后再改为 done。
+- 下一步：开始 TASK-005“公开仓库快照与单 Agent 分析”。
