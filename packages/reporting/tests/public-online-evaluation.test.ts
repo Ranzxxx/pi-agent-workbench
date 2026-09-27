@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
+import { buildPublicAnalysisGoal, PUBLIC_ANALYSIS_PROMPT_VERSION } from "../src/public-runner.js";
 import {
   createPublicEvaluationAnnotationsTemplate,
   DEEPSEEK_CNY_PRICING,
@@ -19,7 +20,23 @@ import {
   type PublicEvaluationRunRecord,
 } from "../src/public-online-evaluation.js";
 
-const promptVersion = "public-repository-analysis-v1";
+const promptVersion = "public-repository-analysis-v2";
+
+test("online analysis prompt targets benchmark questions without leaking the answer key", async () => {
+  const facts = await loadPublicFacts();
+  const goal = buildPublicAnalysisGoal(facts.facts);
+  const encodedQuestions = goal.split("\n").at(-1);
+
+  assert.equal(PUBLIC_ANALYSIS_PROMPT_VERSION, promptVersion);
+  assert.match(goal, /Answer only the following benchmark questions/u);
+  assert.match(goal, /Do not provide a general architecture survey/u);
+  assert.match(goal, /stop when every question is answered or marked unknown/iu);
+  assert.deepEqual(JSON.parse(encodedQuestions!), facts.facts.map(({ id, question }) => ({ id, question })));
+  for (const fact of facts.facts) {
+    assert.equal(goal.includes(fact.expectedAnswer), false, `answer key leaked for ${fact.id}`);
+    assert.equal(goal.includes(JSON.stringify(fact.expectedEvidence)), false, `expected evidence leaked for ${fact.id}`);
+  }
+});
 
 test("online evaluation requires explicit opt-in and a cost ceiling", () => {
   assert.deepEqual(parsePublicEvaluationArguments([]), { mode: "help" });
@@ -87,7 +104,7 @@ test("formats a cancelled run summary using safe metadata and includes tool usag
   assert.equal("apiKey" in summary, false);
 });
 
-async function createScorableRun(directory: string, complete = true): Promise<void> {
+async function createScorableRun(directory: string, complete = true, recordedPromptVersion = promptVersion): Promise<void> {
   const facts = await loadPublicFacts();
   const selectedFacts = facts.facts.slice(0, 4);
   const evidence = selectedFacts.map((fact, index) => ({
@@ -132,7 +149,7 @@ async function createScorableRun(directory: string, complete = true): Promise<vo
       baseUrl: "https://api.deepseek.com",
       officialVersionAsOf: "DeepSeek-V4.1-Flash",
     },
-    promptVersion,
+    promptVersion: recordedPromptVersion,
     runId: report.runId,
     attemptId: report.attemptId,
     pricing: DEEPSEEK_PRICING,
@@ -174,6 +191,17 @@ test("scores human-reviewed claims, evidence coverage, and correct abstention se
     assert.equal(score.abstentionQuality.correct, 1);
     assert.equal(score.abstentionQuality.totalUnknown, 1);
     assert.equal(score.abstentionQuality.rate, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("continues to score completed v1 records after the prompt version bump", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "pi-public-online-eval-v1-"));
+  try {
+    await createScorableRun(directory, true, "public-repository-analysis-v1");
+    const score = await scorePublicEvaluationDirectory(directory);
+    assert.equal(score.qualityGate, "passed");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

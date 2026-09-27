@@ -2,14 +2,22 @@
 
 ## 元数据
 
-- 状态：`review`
+- 状态：`in_progress`
 - 负责人：Codex
-- 分支或 worktree：`task/005-online-eval`，`/home/lzs/Projects/pi`
+- 分支或 worktree：`task/005-eval-prompt-v2`，`/home/lzs/Projects/pi`
 - 当前阶段基线提交：`c8d0f83`（TASK-005 代码及文档 PR #10 已集成）
 - 依赖任务：TASK-004
-- 提交/推送授权：无
+- 集成状态：在线评测续作已通过 PR #11 squash 合并；详见本卡末尾。本地 `main` 已同步至合并提交。
 - 在线模型选择：用户指定 PI provider `deepseek`、模型 ID `deepseek-flash`（DeepSeek 官方当前映射为 V4.1-Flash），所有后续真实模型调用使用此模型；API 地址 `https://api.deepseek.com`
 - 在线调用状态：截至 2026-09-27，已进行三次 `deepseek-flash` 评测尝试，均因 `token_limit` 取消，未产出可评分报告。最近一次经用户授权由 Codex 发起，9 次模型调用、15 次工具调用、100,247 tokens，峰时价估算 `¥0.0537868`，低于 `¥1.33` 应用侧上限。此前授权不涵盖下一次重试；任何新的付费调用前均须用户再次确认。
+
+## 在线测评提示词收敛续作（2026-09-27）
+
+- 开始基线：`main` 提交 `30c592418a4754ab3acb71d01e4eafbd1b2e8ad8`；切出独立分支 `task/005-eval-prompt-v2`。
+- 本阶段开始前工作区已有三处未提交文档改动：`doc/plan.md`、本任务卡、`doc/tasks/README.md`，用于记录 PR #11 合并；原样保留，不计作本阶段代码改动。
+- 本阶段允许路径：`packages/reporting/src/public-runner.ts`、`packages/reporting/src/public-online-eval-cli.ts`、`packages/reporting/src/public-online-evaluation.ts`、`packages/reporting/tests/public-online-evaluation.test.ts`、本任务卡、任务索引和计划。增加 `public-online-evaluation.ts` 是为了让评分器接受新版提示记录，同时保留旧版已完成运行记录的评分兼容。用户随后将范围扩展为提交、推送、创建 PR、通过 GitHub 插件合并并同步本地 `main`，继续真实模型测评；如再次因累计 Token 限制取消，可在单次最高 ¥0.20 的应用侧费用上限下将该 Token 限制提高到协议允许的最大值。保留模型/工具调用、单次输出、超时及费用保护；不自动重复调用。
+- 本阶段目标：将在线评测目标收窄到固定事实清单中的问题，只传问题 ID 与问题文本，不向模型暴露标准答案或预期证据；提示版本升级，并加入离线回归测试。
+- 用户授权（2026-09-27）：提交并推送本阶段变更、在 GitHub 创建 PR、通过 GitHub 插件合并且快进同步本地 `main`；授权继续一次 DeepSeek Flash 真实评测，费用估算上限设为 ¥0.20/次。若 v2 仍因 `token_limit` 取消，允许仅对该在线评测放宽累计 Token 上限；其他预算限制保持不变。
 
 ## 目标与非目标
 
@@ -82,15 +90,24 @@
 - 本轮离线验收：`PATH=/tmp/pi-node24/bin:/home/lzs/.npm-global/bin:$PATH npm run check` 通过；`node --import tsx --test --test-reporter=spec packages/reporting/tests/public-online-evaluation.test.ts` 通过；`npm run eval:public --workspace @pi-workbench/reporting -- --help` 显示 200,000-token 预算及软阈值说明；`git diff --check` 通过。没有运行真实模型。
 - 用户本机在线尝试记录（2026-09-27）：命令 `npm run eval:public --workspace @pi-workbench/reporting -- --online --max-cost-usd 0.20` 返回 `cancelled/token_limit`，8 model calls、16 tool calls、50,009 total tokens。旧 USD 价格快照估算 `$0.007575228`；按当前 DeepSeek 官方峰时人民币价估算约 `¥0.05050152`。产物目录只有 `evaluation-run.json`、`events.jsonl`、`manifest.json`；没有 `report.json` 或 `annotations.json`，故不可评分。确认这是模型调用已发生但质量评测未完成；下一次付费重试尚未授权。
 - 用户本机第二次在线尝试记录（2026-09-27）：命令 `npm run eval:public --workspace @pi-workbench/reporting -- --online --max-cost-cny 1.33` 返回 `cancelled/token_limit`，5 model calls、11 tool calls、44,447 total tokens（输入 19,240、输出 887、缓存读取 24,320）。按 DeepSeek 中文官方峰时人民币价估算 `¥0.0465488`。产物目录 `/tmp/pi-agent-workbench/public-evaluation/runs/3d20ee6f-1390-4ec7-85e9-8701804b31b2` 中只有 `evaluation-run.json`、`events.jsonl`、`manifest.json`；没有 `report.json` 或 `annotations.json`，故不可评分。下一次付费重试尚未授权。
+- 在线评测续作集成（2026-09-27）：PR [#11](https://github.com/Ranzxxx/pi-agent-workbench/pull/11) 已 squash 合并，提交 `30c592418a4754ab3acb71d01e4eafbd1b2e8ad8`。GitHub Actions [Offline checks #30](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36304021785) 全部通过：Node/npm 工具链、干净 `npm ci`、`npm run check`、`npm test`、`npm run spike` 和独立 spike 安装验证。PR 无 review 评论。合并后本地 `main` 快进同步到该提交，工作树原先干净。TASK-005 仍为 `review`：在线评测入口已集成，但目前三次真实模型运行都因 `token_limit` 取消，没有成功报告或人工评分；下一次付费运行仍需用户另行授权。
+
+### 在线测评提示词收敛续作结果
+
+- 在线评测提示词版本升级为 `public-repository-analysis-v2`。通用 Agent 接受可选问题列表；在线评测只将五项基准问题的 ID 和问题文本传给模型，评分答案及预期证据只保留在本地评测器。模型被要求只回答这些问题、每题输出一个同 ID 的 claim、登记必要的精确行号证据并在完成后停止。
+- 评分器接受 v1 和 v2 两种已完成运行记录，避免提示版本升级导致旧运行记录无法评分。离线回归测试验证问题清单传递不泄漏 `expectedAnswer`/`expectedEvidence`，并验证旧 v1 运行仍可评分。
+- 验证环境：Node.js 24.21.0、npm 11.9.0。根目录 `npm run check` 通过；在 `packages/reporting` 目录运行 `node --import tsx tests/public-online-evaluation.test.ts`，10/10 通过；`node --import tsx --test --test-reporter=spec tests/*.test.ts`，6/6 测试文件通过；`git diff --check` 通过。
+- `npm test --workspace @pi-workbench/reporting` 在受限 sandbox 中因 tsx IPC socket `listen EPERM` 未能启动；用 Node.js 内置测试运行器直接加载 tsx 后，全套 reporting 测试通过。没有发起真实 DeepSeek 调用。
+- 本阶段变更仍在分支 `task/005-eval-prompt-v2`，尚未提交或集成。接下来先 review 差异；在线质量测评仍需用户另行明确授权。
 
 ## 交接
 
-- 完成内容：公开仓库固定 SHA 获取、受限 tar 解包、只读工具及 faux provider 报告闭环；实现已停在 review。
+- 完成内容：公开仓库固定 SHA 获取、受限 tar 解包、只读工具及 faux provider 报告闭环；DeepSeek Flash 在线评测入口和预算/CLI 摘要改进已集成。任务因真实模型质量评测和人工评分未完成，仍停在 review。
 - 修改文件：`README.md`、`doc/decisions/002-repository-snapshots.md`、本任务卡、任务索引、`evals/public-repository-facts.json`、`packages/tools/{src/index.ts,src/public-github-snapshot.ts,tests/public-github-snapshot.test.ts}`、`packages/reporting/{package.json,src/index.ts,src/public-runner.ts,tests/public-runner.test.ts}`。
-- 在线评测续作修改文件：`packages/reporting/package.json`、`packages/reporting/src/public-runner.ts`、`packages/reporting/src/public-online-eval-cli.ts`、`packages/reporting/src/public-online-evaluation.ts`、`packages/reporting/tests/public-online-evaluation.test.ts`、根目录 `.env.example`、`doc/plan.md`、本任务卡及任务索引。续作后验收代码尚未提交。
+- 在线评测续作修改文件：`packages/reporting/package.json`、`packages/reporting/src/public-runner.ts`、`packages/reporting/src/public-online-eval-cli.ts`、`packages/reporting/src/public-online-evaluation.ts`、`packages/reporting/tests/public-online-evaluation.test.ts`、根目录 `.env.example`、`doc/plan.md`、本任务卡及任务索引。实现已由 PR #11 集成。
 - 实际验证：根锁更新后，用户本机干净 `npm ci --ignore-scripts --no-audit --no-fund` 成功；`npm run check` 通过；`npm test` 通过 50/50；集成者 `git diff --check` 通过；固定 SHA 真实 GitHub 快照→faux provider→报告产物成功。
 - 风险/未验证：GitHub API 限流；真实模型质量与价格/Token 指标无授权未测；branch/tag 的 GitHub API 实时成功路径由受控 fixture 覆盖。缓存安全依赖每次请求完成新归档验证后再与现有目录比较，不提供本地缓存免下载快捷路径。
 - 实现提交：`7e0dd03d35c9dc2062f7e1246a0583047dbbe697`。
-- PR：[#9 feat(TASK-005): add public repository analysis](https://github.com/Ranzxxx/pi-agent-workbench/pull/9)，已合并至 `main`。
-- 集成提交：`175a0fa5b6864068630515275cb466105b1bcb65`。GitHub Actions [Offline checks #24](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36298816877) 通过。本地 `main` 已快进同步到此提交。
-- 下一步：摘要格式和预算常量的离线验证已通过。若要进行第四次真实模型评测，须先获得新的用户授权（最高 ¥1.33 的应用侧估算费用上限）；成功产出报告后再人工复核并评分。在线质量评测和人工评分完成前，任务不能转为 `done`。
+- PR：[#9 feat(TASK-005): add public repository analysis](https://github.com/Ranzxxx/pi-agent-workbench/pull/9) 与 [#11 feat(TASK-005): add DeepSeek online evaluation workflow](https://github.com/Ranzxxx/pi-agent-workbench/pull/11) 均已合并至 `main`。
+- 初始闭环集成提交：`175a0fa5b6864068630515275cb466105b1bcb65`，CI [Offline checks #24](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36298816877) 通过。在线评测续作集成提交：`30c592418a4754ab3acb71d01e4eafbd1b2e8ad8`，CI [Offline checks #30](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36304021785) 全绿。本地 `main` 已快进同步至续作集成提交。
+- 下一步：若要完成在线质量验收，须先获得新的真实模型调用授权（最高 ¥1.33 的应用侧估算费用上限）；成功产出报告后再人工复核并评分。在线质量评测和人工评分完成前，任务不能转为 `done`。TASK-006 尚未启动。

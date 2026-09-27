@@ -36,6 +36,10 @@ export const DEEPSEEK_CNY_PRICING = {
 export const DEEPSEEK_PRICE_LIST_CNY_PER_USD = 20 / 3;
 // Keep the previous $0.20 ceiling equivalent, rounded down to a CNY amount.
 export const MAX_PUBLIC_EVAL_COST_CNY = 1.33;
+const supportedPromptVersions = new Set([
+  "public-repository-analysis-v1",
+  "public-repository-analysis-v2",
+]);
 
 /**
  * Conservative defaults for the public online evaluation. Token and cost
@@ -238,7 +242,7 @@ async function readRegularFile(directory: string, filename: string): Promise<Buf
 function parseRunRecord(value: unknown): PublicEvaluationRunRecord {
   if (!isObject(value) || value.schemaVersion !== 2 || value.status !== "completed" || !isObject(value.repository) ||
       value.repository.url !== publicRepository.url || value.repository.ref !== publicRepository.ref || value.repository.sha !== publicRepository.sha ||
-      value.provider !== "deepseek" || value.promptVersion !== "public-repository-analysis-v1" || typeof value.createdAt !== "string" ||
+      value.provider !== "deepseek" || typeof value.promptVersion !== "string" || !supportedPromptVersions.has(value.promptVersion) || typeof value.createdAt !== "string" ||
       !isObject(value.model) || value.model.id !== "deepseek-flash" || value.model.api !== "openai-completions" ||
       value.model.baseUrl !== "https://api.deepseek.com" || typeof value.model.name !== "string" || typeof value.model.officialVersionAsOf !== "string" ||
       !isObject(value.pricingCny) || value.pricingCny.version !== DEEPSEEK_CNY_PRICING.version || value.pricingCny.currency !== "CNY" ||

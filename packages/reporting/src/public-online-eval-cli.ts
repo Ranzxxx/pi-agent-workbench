@@ -88,6 +88,8 @@ async function runOnline(maxCostCny: number, maxCostUsd: number): Promise<void> 
   };
   const result = await runPublicRepositoryAnalysis({
     repository: { url: facts.repository.url, ref: facts.repository.sha },
+    // Pass questions only. The evaluator's expected answers and evidence stay local for scoring.
+    questions: facts.facts.map(({ id, question }) => ({ id, question })),
     cacheDirectory,
     outputDirectory,
     credentials,
