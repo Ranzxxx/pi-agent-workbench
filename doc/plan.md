@@ -3,7 +3,7 @@
 ## 当前状态与事实来源
 
 - 最近更新：2026-09-27。
-- 当前阶段：TASK-005 的公开仓库固定 SHA 快照与 DeepSeek Flash 在线评测入口已通过 PR #9、#11 集成；三次旧版提示词的真实模型尝试均因 `token_limit` 取消且未生成报告。v2 提示词收敛到五项评分问题，离线检查已通过；用户已授权该分支提交与合并，并授权一次 DeepSeek Flash 在线测评（每次应用侧费用估算上限 ¥0.20）。TASK-006 尚未启动，API 或 Web 尚未建设。
+- 当前阶段：TASK-005 已完成并经 PR #9、#11、#12 集成。提示词 v2 的 DeepSeek Flash 固定样本在线评测和人工评分通过质量门（事实召回 0.80、引用有效性与证据支持均 1.00、无不支持断言）；GitHub Actions #33 通过，本地 `main` 与远程同步。此次结果不构成跨仓库泛化保证。下一项可开始 TASK-006；API 或 Web 尚未建设。
 - TASK-001 的代码经 PR #1 合并到 `dd82a11`；复审补强已在 PR #2 合并；TASK-003 补齐独立干净安装证据，状态恢复 done。
 - TASK-002 已通过 PR #2 合并到 `58d4a78`，状态 done；TASK-003 已通过 PR #3 集成，且用户确认远程 CI 全绿，状态 done。当前范围不包含 API 或 Web。
 - 任务的详细状态、验证和提交以任务卡为准；[任务索引](tasks/README.md)仅作摘要。
@@ -163,7 +163,7 @@ v0.2 阶段划分为：获取快照 → 收集证据 → 分析 → 校验 → �
 | GitHub Actions 远程运行 | [Offline checks 运行 #35813163678](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/35813163678) 在提交 `f14bbf8f99ac0d2c478708ae925ade818a937e94` 上通过 |
 | 协议、状态机、终态唯一与预算计算 | TASK-003 已通过离线测试；真实 provider 和业务产物待后续任务验证 |
 | 报告证据结构是否足够 | TASK-004 的合成事实清单与负向样例 |
-| 第一个公开仓库 SHA 和主模型选择 | TASK-005 已固定 slugify 样例 SHA；在线模型已选 `deepseek-flash`，真实在线评测仍需明确调用预算并授权 |
+| 第一个公开仓库 SHA 和主模型选择 | TASK-005 已固定 slugify 样例 SHA；`deepseek-flash` 已在该固定样本完成一次在线质量评测；更多仓库/重复运行的泛化表现仍待后续任务验证 |
 | 浏览器事件补发、取消和产物展示 | TASK-006 |
 | 真实模型、恢复、并发与隔离效果 | 对应版本建立新任务，不提前声称已支持 |
 
@@ -189,5 +189,6 @@ v0.2 阶段划分为：获取快照 → 收集证据 → 分析 → 校验 → �
 - 2026-09-27：用户授权 Codex 进行一次在线评测。运行 9 次模型调用、15 次工具调用后达到 100,247 tokens，因 token_limit 取消；人民币估算 `¥0.0537868`，未产出报告。运行目录记录存在，但 CLI 只打印了通用错误，没有结构化结果摘要；没有自动重试。再次在线调用前需用户重新确认。
 - 2026-09-27：针对第三次运行的退出诊断，无法从安全记录确定未显示摘要的具体异常点；将 CLI 的安全摘要移至运行器返回后的第一步、放在可选产物记录写入之前，并等待 stdout 写入完成，同时加入摘要格式离线测试。专用在线 Token 阈值调高至 200,000。
 - 2026-09-27：TASK-005 在线评测入口续作通过 [PR #11](https://github.com/Ranzxxx/pi-agent-workbench/pull/11) squash 合并，合并提交 `30c592418a4754ab3acb71d01e4eafbd1b2e8ad8`；GitHub Actions [Offline checks #30](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36304021785) 全绿。本地 `main` 已快进同步。在线质量评测仍未完成，任务保持 review。
+- 2026-09-27：提示词 v2 通过 [PR #12](https://github.com/Ranzxxx/pi-agent-workbench/pull/12) squash 合并（`48bab4c5edfe0fcd0af6e7cff40bafbc3e37d3ab`）；GitHub Actions [Offline checks #33](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36305446234) 全绿。本地 `main` 已同步。获授权的真实评测生成 5 项基准结果、3 次模型调用、7,353 tokens，保守费用估算 `¥0.01424648`；人工复核后的评分质量门通过。TASK-005 验收完成，固定单样本之外的泛化表现仍未验证。
 
-下一步：若要验证真实评测能否完成，须在新一次付费调用前再次确认；TASK-006 尚未启动，任务状态见索引。
+下一步：开始 TASK-006（API、SSE 与最小 Web），以其任务卡为准；不得将 TASK-005 的单一样本分数视为普遍质量保证。
