@@ -3,12 +3,13 @@
 ## 元数据
 
 - 状态：`review`
-- 负责人：Codex / 实现代理
-- 分支或 worktree：`task/005-public-repository`，`/home/lzs/Projects/pi-task-005`
-- 基线提交：`8ce3ae7d422ef0830a5aaf6251284c743d518ed7`
+- 负责人：Codex
+- 分支或 worktree：`task/005-online-eval`，`/home/lzs/Projects/pi`
+- 当前阶段基线提交：`c8d0f83`（TASK-005 代码及文档 PR #10 已集成）
 - 依赖任务：TASK-004
 - 提交/推送授权：无
-- 在线模型授权：无；模拟测试不需要授权，真实调用另行确认模型与预算
+- 在线模型选择：用户指定 PI provider `deepseek`、模型 ID `deepseek-flash`（DeepSeek 官方当前映射为 V4.1-Flash），所有后续真实模型调用使用此模型；API 地址 `https://api.deepseek.com`
+- 在线调用状态：截至 2026-09-27，已进行三次 `deepseek-flash` 评测尝试，均因 `token_limit` 取消，未产出可评分报告。最近一次经用户授权由 Codex 发起，9 次模型调用、15 次工具调用、100,247 tokens，峰时价估算 `¥0.0537868`，低于 `¥1.33` 应用侧上限。此前授权不涵盖下一次重试；任何新的付费调用前均须用户再次确认。
 
 ## 目标与非目标
 
@@ -21,7 +22,13 @@
 - `doc/decisions/002-repository-snapshots.md`、README、计划中的真实模型/固定 SHA 记录、本任务卡及索引。
 - 若需变更协议或引入归档解析依赖，先在本卡记录具体 schema/依赖和理由，经集成者指定唯一写入者后再修改共享文件。
 
-## 本轮执行记录
+## TASK-005 在线评测入口续作（2026-09-27）
+
+- 在线评测续作开始（2026-09-27）：主工作区 `/home/lzs/Projects/pi` 从 `main` 的 `c8d0f83` 建立专用分支 `task/005-online-eval`；开始时已有两处未提交文档改动：`doc/plan.md` 与本任务卡，内容为用户选择 DeepSeek Flash 的模型策略和价格记录。这些是本阶段开始前已有改动，继续保留，不覆盖。
+- 本阶段允许路径：`packages/reporting/**`、`evals/**`、`doc/plan.md`、`doc/tasks/README.md`、本任务卡。用户随后明确希望使用本地 `.env` 配置 API key、向 GitHub 提供可复制模板，因此额外授权添加仅含占位符的根目录 `.env.example`；`.gitignore` 已忽略真实 `.env` 并允许提交 `.env.example`。不得修改根配置/锁文件、公共协议、`packages/agent-runtime/**` 或既有快照实现；若评测入口需要扩大范围，先记录理由并暂停该部分。
+- 本阶段范围：提供显式启用的 `deepseek-flash` 评测命令，使用固定公开仓库 SHA 与既有人工事实清单，记录模型 ID、提示/评测版本、usage、保守价格估算及结果评分；补齐 faux provider/离线测试和误用保护。真实 API 调用尚未授权，本阶段不运行真实模型。
+
+## 原始公开仓库闭环实现阶段记录
 
 - 开始时主工作区 `/home/lzs/Projects/pi` 为干净的 `main`，HEAD 与 `origin/main` 均为 `8ce3ae7d422ef0830a5aaf6251284c743d518ed7`；任务开始前无未提交修改。
 - 实现工作区为上述独立 worktree；验收代理只读审查。
@@ -39,12 +46,12 @@
 - [x] 固定首个公开小仓库：sindresorhus/slugify，v3.0.0，SHA 7c318bd1aa4b4affab29761f15a9604323fe2a3b，MIT；人工必答清单见 evals/public-repository-facts.json。
 - [x] 可控 HTTP fixture 覆盖 ref 解析、下载和归档边界；faux provider 离线端到端生成通过 schema 与源行重新校验的报告。
 - [x] 复用 runtime 时长、模型调用、工具调用、Token/费用预算；集成测试将模型调用限额设为 1，证明只有一次 provider 调用，后续调用被阻止，取消结果与部分 events/manifest 说明 call_limit。
-- [ ] 在线质量评测未运行。没有在线模型调用授权、选定模型或可核对的价格表，未生成任何模型指标；授权和成本上限确定后再建立在线评测命令与评分记录。
+- [ ] 在线质量评测未完成。前三次 `deepseek-flash` 调用分别在 50,009、44,447 和 100,247 tokens 时因 `token_limit` 取消，均未生成报告或评分，不能视作质量评测。累计 Token 按 provider 返回 usage 事后检查，不能阻止单个请求增加大量输入 Token。在线入口使用人民币费用参数；当前专用累计 Token 阈值提高至 200,000，保留 12 次模型调用、24 次工具调用、每次最多输出 2,000 tokens、180 秒和 ¥1.33 应用侧费用上限。仍是软预算，下一次在线验证前须再次确认授权。价格与峰谷时段见 [DeepSeek 模型与价格（中文官方文档）](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)。
 - [x] 真实固定 SHA 仓库快照→PI faux provider→report.json/report.md/manifest/events 的展示闭环成功。它验证真实仓库获取，不验证真实模型质量；真实模型验收仍未勾选。
 
 ## 验证计划（实施后提供）
 
-根 check/test；针对快照下载/路径边界的离线测试；带明确开关的在线评测命令。真实 GitHub 获取与真实模型计费分别记录，不混为一次“离线测试”。
+根 check/test；针对快照下载/路径边界的离线测试；验证在线评测默认关闭、缺少显式开关/Key 时失败、模型/provider 固定为 `deepseek-flash`、评分输入和输出可复现。真实 GitHub 获取与真实模型计费分别记录，不混为一次“离线测试”。在线调用待用户确认预算与授权后进行。
 
 ## 实际实现与验证
 
@@ -57,15 +64,33 @@
 - SHA 缓存命中现在会与本次刚验证的归档逐路径、逐字节比对，并检查缓存中无额外路径、符号链接、特殊文件或超限内容；回归覆盖合法命中及篡改文件、额外文件、链接后拒绝。
 - 缓存缺陷修复后的复验：`PATH=/tmp/pi-node24/bin:/home/lzs/.npm-global/bin:$PATH npm run test --workspace @pi-workbench/tools` → 13/13 通过；`PATH=/tmp/pi-node24/bin:/home/lzs/.npm-global/bin:$PATH npm run check` → 所有 workspace TypeScript 检查通过。普通 sandbox 下 `tsx` IPC socket 收到 `EPERM`，在获批的本地测试运行中重跑后通过。
 - 用户本机干净安装复验（2026-09-27）：Node.js 24.21.0/npm 11.9.0；`npm ci --ignore-scripts --no-audit --no-fund` 成功（242 packages；仅出现 node-domexception 弃用警告）；随后 `npm run check` 通过、`npm test` 50/50 通过。
-- 未验证：真实模型质量、价格/Token指标、在线评分；GitHub 可变 ref 的实时 API 成功路径受限流，当前由受控 fixture 验证。当前任务不声称通过在线评测。
+- 未验证：成功完成的真实模型运行、人工在线评分、服务端实际账单；GitHub 可变 ref 的实时 API 成功路径受限流，当前由受控 fixture 验证。PI SDK 0.86.1 已内置 `deepseek` provider 和 `deepseek-flash` 模型定义；离线测试继续使用 faux provider。
+
+### 在线评测入口续作结果
+
+- 新增 `packages/reporting/src/public-online-eval-cli.ts` 和 `public-online-evaluation.ts`，并在 reporting workspace 增加 `eval:public` 命令。真实调用须显式传 `--online` 和 `--max-cost-cny`（最高 ¥1.33），仅使用 PI SDK 的 `deepseek` / `deepseek-flash`，固定到公开仓库 SHA `7c318bd1aa4b4affab29761f15a9604323fe2a3b`；模型输出、事件和报告保存在系统临时目录，不写入仓库。
+- DeepSeek 中文官方峰时单价快照为每百万 tokens：输入（缓存未命中）¥2、输出 ¥8、缓存命中 ¥0.04；闲时为峰时一半。入口按峰时价格保守估算人民币费用。底层 protocol 的 `estimatedCostUsd`/`maxCostUsd` 字段保持美元语义，CLI 按官方同时公布的 USD/CNY 价格比例将人民币上限换算后传入 runtime，不修改公共协议或锁文件。历史运行的 `$0.20` 上限对应当前人民币命令上限约 `¥1.33`。
+- CLI 不读取个人 PI 配置；只从本机环境读取 `DEEPSEEK_API_KEY`，注入内存凭据存储。输出目录设置为仅当前用户访问。费用和 Token 阈值是基于 provider 返回 usage 的应用侧停止阈值，不是 provider 侧硬限额；单个在途请求可能造成明显超限。
+- `eval:public` 通过 Node.js 24 的 `--env-file-if-exists=../../.env` 加载项目根目录本机配置；根目录 `.env.example` 只含空值占位符。`.gitignore` 已忽略 `.env`，所以团队成员可以各自复制模板和填入自己的密钥，GitHub 仓库只公开模板。
+- 自动评分结合机器校验与人工标注：固定事实召回、引用有效性、人工证据支持判断、断言审查覆盖及未知项正确弃答；不调用第二个模型充当裁判。成功阈值为事实召回至少 80%、引用和证据支持均 100%、无不支持断言且所有结论经人工复核。
+- 验证（人民币调整后）：`PATH=/tmp/pi-node24/bin:/home/lzs/.npm-global/bin:$PATH npm run check` → 所有 workspace TypeScript 检查通过；`packages/reporting/tests/public-online-evaluation.test.ts` 的 6 项测试通过，覆盖人民币价格、人民币费用换算及上限解析；`npm run eval:public --workspace @pi-workbench/reporting -- --help` → 显示人民币参数和阈值；`git diff --check` → 通过。该次验证没有运行在线模型。
+- 前两次在线尝试由用户在本机手动发起。DeepSeek 返回了 usage，但运行均以 `token_limit` 取消，未生成 `report.json`/`annotations.json`，没有可评分结果。第二次报告 5 次模型调用、11 次工具调用、44,447 tokens（输入 19,240、输出 887、缓存读取 24,320），峰时价估算 `¥0.0465488`；实际服务账单未核对。由于 token 阈值是在响应后检查，usage 可超出配置值。
+- 针对前两次用量，曾将本地默认在线评测预算调整为 12 次模型调用、24 次工具调用、100,000 tokens、每次最多输出 2,000 tokens、180 秒；但第三次运行仍以 100,247 tokens 因 `token_limit` 取消，说明输入 usage 事后计量会造成软阈值越界。现在将累计 Token 阈值提高到 200,000，为后续模型和工具步骤预留空间；这仍不构成 provider 侧硬限额。在线质量、成功产物、人工评分和服务端实际账单仍未验证；TASK-005 保持 `review`。
+- 第三次运行由 Codex 根据用户明确请求发起，目录 `/tmp/pi-agent-workbench/public-evaluation/runs/86995250-03ab-469d-aae9-5bce2d7c4a13`。白名单运行记录包含 9 次模型调用、15 次工具调用、输入 20,263、输出 1,264、缓存读取 78,720、总计 100,247 tokens；DeepSeek 官方峰时价估算为 `¥0.0537868`。只生成 `evaluation-run.json`、`events.jsonl`、`manifest.json`，没有 `report.json` 或 `annotations.json`，不能评分。CLI 输出了通用错误而未显示结构化摘要；安全记录无法确认具体异常点。没有进行自动重试。
+- CLI 摘要修复：将不含提示词、模型文本和凭据的结构化摘要放到 `runPublicRepositoryAnalysis` 返回之后立即输出，并等待 stdout 写入完成，再进行可选运行记录写入；摘要包含状态、模型/工具调用数、tokens、CNY 估算、取消原因和运行目录。加入取消状态摘要格式的离线测试。此举确保后续可选产物写入失败不会先于摘要遮蔽已返回的运行结果；先前错误的具体触发点仍未确认。
+- 当前累计 Token 预算调整为 200,000（此前曾设为 100,000），模型调用 12、工具调用 24、每次输出 2,000、超时 180 秒不变；依据最近 100,247-token 的运行留出约一倍空间。Token/cost 仍在响应后按 usage 检查，可能越界。没有授权或发起第四次运行。
+- 本轮离线验收：`PATH=/tmp/pi-node24/bin:/home/lzs/.npm-global/bin:$PATH npm run check` 通过；`node --import tsx --test --test-reporter=spec packages/reporting/tests/public-online-evaluation.test.ts` 通过；`npm run eval:public --workspace @pi-workbench/reporting -- --help` 显示 200,000-token 预算及软阈值说明；`git diff --check` 通过。没有运行真实模型。
+- 用户本机在线尝试记录（2026-09-27）：命令 `npm run eval:public --workspace @pi-workbench/reporting -- --online --max-cost-usd 0.20` 返回 `cancelled/token_limit`，8 model calls、16 tool calls、50,009 total tokens。旧 USD 价格快照估算 `$0.007575228`；按当前 DeepSeek 官方峰时人民币价估算约 `¥0.05050152`。产物目录只有 `evaluation-run.json`、`events.jsonl`、`manifest.json`；没有 `report.json` 或 `annotations.json`，故不可评分。确认这是模型调用已发生但质量评测未完成；下一次付费重试尚未授权。
+- 用户本机第二次在线尝试记录（2026-09-27）：命令 `npm run eval:public --workspace @pi-workbench/reporting -- --online --max-cost-cny 1.33` 返回 `cancelled/token_limit`，5 model calls、11 tool calls、44,447 total tokens（输入 19,240、输出 887、缓存读取 24,320）。按 DeepSeek 中文官方峰时人民币价估算 `¥0.0465488`。产物目录 `/tmp/pi-agent-workbench/public-evaluation/runs/3d20ee6f-1390-4ec7-85e9-8701804b31b2` 中只有 `evaluation-run.json`、`events.jsonl`、`manifest.json`；没有 `report.json` 或 `annotations.json`，故不可评分。下一次付费重试尚未授权。
 
 ## 交接
 
 - 完成内容：公开仓库固定 SHA 获取、受限 tar 解包、只读工具及 faux provider 报告闭环；实现已停在 review。
 - 修改文件：`README.md`、`doc/decisions/002-repository-snapshots.md`、本任务卡、任务索引、`evals/public-repository-facts.json`、`packages/tools/{src/index.ts,src/public-github-snapshot.ts,tests/public-github-snapshot.test.ts}`、`packages/reporting/{package.json,src/index.ts,src/public-runner.ts,tests/public-runner.test.ts}`。
+- 在线评测续作修改文件：`packages/reporting/package.json`、`packages/reporting/src/public-runner.ts`、`packages/reporting/src/public-online-eval-cli.ts`、`packages/reporting/src/public-online-evaluation.ts`、`packages/reporting/tests/public-online-evaluation.test.ts`、根目录 `.env.example`、`doc/plan.md`、本任务卡及任务索引。续作后验收代码尚未提交。
 - 实际验证：根锁更新后，用户本机干净 `npm ci --ignore-scripts --no-audit --no-fund` 成功；`npm run check` 通过；`npm test` 通过 50/50；集成者 `git diff --check` 通过；固定 SHA 真实 GitHub 快照→faux provider→报告产物成功。
 - 风险/未验证：GitHub API 限流；真实模型质量与价格/Token 指标无授权未测；branch/tag 的 GitHub API 实时成功路径由受控 fixture 覆盖。缓存安全依赖每次请求完成新归档验证后再与现有目录比较，不提供本地缓存免下载快捷路径。
 - 实现提交：`7e0dd03d35c9dc2062f7e1246a0583047dbbe697`。
 - PR：[#9 feat(TASK-005): add public repository analysis](https://github.com/Ranzxxx/pi-agent-workbench/pull/9)，已合并至 `main`。
 - 集成提交：`175a0fa5b6864068630515275cb466105b1bcb65`。GitHub Actions [Offline checks #24](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36298816877) 通过。本地 `main` 已快进同步到此提交。
-- 下一步：真实模型在线质量评测尚未授权，相关验收项保持未勾选；在用户明确授权模型、价格及 Token/成本上限并完成评测前，TASK-005 保持 `review`，不标记 `done`。
+- 下一步：摘要格式和预算常量的离线验证已通过。若要进行第四次真实模型评测，须先获得新的用户授权（最高 ¥1.33 的应用侧估算费用上限）；成功产出报告后再人工复核并评分。在线质量评测和人工评分完成前，任务不能转为 `done`。

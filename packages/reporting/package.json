@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "exports": { ".": "./src/index.ts" },
-  "scripts": { "check": "tsc --noEmit", "test": "tsx --test tests/*.test.ts", "demo": "tsx src/cli.ts" },
+  "scripts": { "check": "tsc --noEmit", "test": "tsx --test tests/*.test.ts", "demo": "tsx src/cli.ts", "eval:public": "node --env-file-if-exists=../../.env --import tsx src/public-online-eval-cli.ts" },
   "dependencies": {
     "@pi-workbench/protocol": "0.1.0",
     "@pi-workbench/tools": "0.1.0",
