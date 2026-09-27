@@ -1,0 +1,9 @@
+{
+  "name": "@pi-workbench/tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "check": "tsc --noEmit", "test": "tsx --test tests/*.test.ts" },
+  "dependencies": { "@pi-workbench/protocol": "0.1.0" }
+}

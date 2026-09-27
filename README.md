@@ -2,7 +2,7 @@
 
 使用 PI SDK、Node.js 和 TypeScript 构建带证据的 GitHub 仓库技术分析工作台。输入公开仓库与目标，固定提交版本，生成可追溯的分析报告并展示执行过程。
 
-**项目已建立协议、PI 运行适配层与离线测试，尚未提供 Web、API 或实际仓库分析功能。**
+**现已提供只针对原创合成仓库的离线证据与报告演示；尚未连接真实 GitHub 仓库，也没有 Web 或 API。**
 
 ## 安装与验证
 
@@ -16,6 +16,7 @@ npm ci --ignore-scripts --no-audit --no-fund
 npm run check
 npm test
 npm run spike
+npm run demo:offline
 ```
 
 没有 nvm 时，先准备上述版本的 Node/npm，再从 `npm ci` 开始。全局 npm 安装命令仅用于你选择的 Node 环境；本轮 Agent 验证使用临时工具链，没有更改系统 Node。`npm run check` 和 `npm test` 会拒绝不一致的工具链。
@@ -30,6 +31,8 @@ CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 wo
 | --- | --- |
 | `packages/protocol` | 版本化输入、预算、事件、结果、证据与产物引用的 schema 和校验 |
 | `packages/agent-runtime` | PI SDK 薄适配层、受控资源与工具、调用/Token/成本预算、取消和结果校验入口 |
+| `packages/tools` | 固定快照内只读列举、读取、检索与证据登记；拒绝路径逃逸、符号链接和特殊文件 |
+| `packages/reporting` | 校验结构化报告和证据、生成 Markdown 与 manifest/事件日志，并计算离线评测指标 |
 | `spikes/pi-sdk` | 保留的 SDK 行为实验与负向回归 |
 
 运行适配层接口与边界见 [模块说明](packages/agent-runtime/README.md)。当前源码通过 tsx 运行；未配置发布构建，也没有根 `npm start` 或 Web 服务。
@@ -44,7 +47,7 @@ CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 wo
 - 展示运行事件、证据和产物，支持取消。
 - 离线自动测试与单独授权的在线模型评测。
 
-仓库获取、证据采集、报告生成和 Web 仍是待实现目标。当前不支持进程重启恢复、多 Agent、Docker 执行、RAG 或长期记忆。
+`npm run demo:offline` 使用 `fixtures/synthetic-ts-repo`，写入被 Git 忽略的 `artifacts/TASK-004/`。它不会连接网络、读取 API Key、安装或执行 fixture 中的脚本；评测基于预先维护的合成 golden facts，证据支持与无依据断言由人工标注。真实 GitHub 快照获取、Agent 驱动的仓库分析、Web/API 仍待后续任务实现。当前不支持进程重启恢复、多 Agent、Docker 执行、RAG 或长期记忆。
 
 ## 开发与协作
 
