@@ -9,3 +9,8 @@ export {
   type OfflineRunSummary,
 } from "./offline-runner.js";
 export { SYNTHETIC_SNAPSHOT_ID } from "./contracts.js";
+export {
+  runPublicRepositoryAnalysis,
+  type PublicAnalysisOptions,
+  type PublicAnalysisSummary,
+} from "./public-runner.js";
