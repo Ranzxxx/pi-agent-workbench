@@ -13,3 +13,12 @@ export {
   type EvidenceInput,
   type EvidenceRecord,
 } from "./evidence.js";
+export {
+  fetchPublicGitHubSnapshot,
+  SnapshotError,
+  type PublicRepositoryInput,
+  type SnapshotErrorCode,
+  type SnapshotInfo,
+  type SnapshotLimits,
+  type SnapshotOptions,
+} from "./public-github-snapshot.js";

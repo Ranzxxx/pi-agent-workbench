@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "repository": {
+    "url": "https://github.com/sindresorhus/slugify",
+    "ref": "v3.0.0",
+    "sha": "7c318bd1aa4b4affab29761f15a9604323fe2a3b",
+    "license": "MIT",
+    "licenseEvidence": [
+      { "path": "package.json", "startLine": 5, "endLine": 5 },
+      { "path": "license", "startLine": 1, "endLine": 3 }
+    ],
+    "metadataSource": "The public source archive at the pinned commit was read without installing dependencies or executing repository code."
+  },
+  "facts": [
+    {
+      "id": "package-identity",
+      "question": "What are the package name and version?",
+      "expectedAnswer": "@sindresorhus/slugify, version 3.0.0.",
+      "expectedEvidence": [{ "path": "package.json", "startLine": 2, "endLine": 3 }]
+    },
+    {
+      "id": "license",
+      "question": "Which license does the package declare?",
+      "expectedAnswer": "MIT.",
+      "expectedEvidence": [{ "path": "package.json", "startLine": 5, "endLine": 5 }]
+    },
+    {
+      "id": "module-format",
+      "question": "Which module format and default export entry does it declare?",
+      "expectedAnswer": "ESM; the default export points to ./index.js.",
+      "expectedEvidence": [{ "path": "package.json", "startLine": 13, "endLine": 17 }]
+    },
+    {
+      "id": "node-engine",
+      "question": "What Node.js engine range is declared?",
+      "expectedAnswer": "Node.js >=20.",
+      "expectedEvidence": [{ "path": "package.json", "startLine": 19, "endLine": 21 }]
+    },
+    {
+      "id": "test-status",
+      "question": "Has the repository's declared test command been verified by this read-only run?",
+      "expectedAnswer": "No. package.json declares xo && ava; repository code and scripts were not executed.",
+      "expectedEvidence": [{ "path": "package.json", "startLine": 22, "endLine": 24 }]
+    }
+  ],
+  "method": "Human-maintained facts for the first pinned public repository. Evidence must match the indicated path, line range, and fixed SHA. The expected answers are review criteria, not machine proof of semantic support."
+}

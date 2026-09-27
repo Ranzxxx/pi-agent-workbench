@@ -16,10 +16,10 @@ backlog（待开始）→ in_progress（实施）→ review（待验收/集成�
 | [TASK-002 验证补强与计划校准](002-review-hardening.md) | done | Codex | PR #2 已合并；提交 e455fb3，合并 58d4a78 |
 | [TASK-003 最小工程、协议与离线 CI](003-project-foundation.md) | done | Codex | PR #3 已合并；用户确认 GitHub Actions 全绿 |
 | [TASK-004 合成仓库证据与报告闭环](004-evidence-report.md) | done | Codex | PR #7 已合并至 `main`（`7dc9dc7`）；可以开始 TASK-005 |
-| [TASK-005 公开仓库快照与单 Agent 分析](005-public-repository.md) | backlog | 未分配 | TASK-004 |
+| [TASK-005 公开仓库快照与单 Agent 分析](005-public-repository.md) | review | Codex / 实现代理 | 实现、独立验收及本机干净安装通过；待用户提交与集成 |
 | [TASK-006 API、SSE 与最小 Web](006-web-workbench.md) | backlog | 未分配 | TASK-005 |
 
-下一可用编号为 TASK-007；不要提前分配给未知功能。TASK-004 已完成并集成；TASK-005～006 尚未启动。
+下一可用编号为 TASK-007；不要提前分配给未知功能。TASK-004 已完成并集成；TASK-005 实现已完成并进入 review，TASK-006 尚未启动。
 
 ## 创建与交接
 
