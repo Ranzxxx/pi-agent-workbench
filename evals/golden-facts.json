@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "snapshotId": "synthetic-harborlight-v1",
+  "contentDigestSha256": "2c12777a98aae20f4919170635844cdbcdb98c27f1f2bfe4165f74fe3263d0d1",
+  "facts": [
+    {
+      "id": "GF-001",
+      "statement": "The package is named harborlight-service and has version 0.4.2.",
+      "expectedEvidence": [{ "path": "package.json", "startLine": 2, "endLine": 3 }]
+    },
+    {
+      "id": "GF-002",
+      "statement": "The package entry module exports startServer and getHealth.",
+      "expectedEvidence": [{ "path": "src/index.ts", "startLine": 1, "endLine": 2 }]
+    },
+    {
+      "id": "GF-003",
+      "statement": "startServer defaults its port to 4317.",
+      "expectedEvidence": [{ "path": "src/server.ts", "startLine": 8, "endLine": 8 }]
+    },
+    {
+      "id": "GF-004",
+      "statement": "The /health route returns the value produced by getHealth, whose status is ok.",
+      "expectedEvidence": [
+        { "path": "src/server.ts", "startLine": 12, "endLine": 13 },
+        { "path": "src/health.ts", "startLine": 1, "endLine": 3 }
+      ]
+    },
+    {
+      "id": "GF-005",
+      "statement": "The package declares npm test as node --test; this declaration does not prove that tests were run.",
+      "expectedEvidence": [{ "path": "package.json", "startLine": 6, "endLine": 8 }]
+    }
+  ],
+  "method": "A human maintains these expected facts and source ranges before the demo report is built. This synthetic corpus does not measure real repository accuracy."
+}

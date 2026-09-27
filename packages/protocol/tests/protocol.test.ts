@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BudgetSchema, RunInputSchema, parse, parseArtifacts, parseEvent, parseEvidence, parseResult } from "../src/index.js";
+import { BudgetSchema, RunInputSchema, parse, parseArtifacts, parseEvent, parseEvidence, parseManifest, parseReport, parseResult } from "../src/index.js";
 
 const usage = { modelCalls: 1, toolCalls: 0, inputTokens: 2, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 5, estimatedCostUsd: 0, pricingVersion: "offline" };
 const result = { schemaVersion: 1, runId: "run-1", attemptId: "attempt-1", usage, endedAt: "2026-09-22T00:00:00.000Z", status: "completed", artifacts: [{ kind: "report.json", path: "reports/report.json", sha256: "a".repeat(64) }] };
@@ -32,18 +32,66 @@ test("cancelled and failed are distinct unions", () => {
   const { artifacts: _, ...base } = result;
   assert.equal(parseResult({ ...base, status: "cancelled", reason: "user" }).status, "cancelled");
   assert.equal(parseResult({ ...base, status: "failed", error: { code: "model_error", message: "failed" } }).status, "failed");
+  assert.equal(parseResult({ ...base, status: "cancelled", reason: "user", artifacts: result.artifacts }).status, "cancelled");
+  assert.equal(parseResult({ ...base, status: "failed", error: { code: "runtime_error", message: "failed" }, artifacts: result.artifacts }).status, "failed");
   assert.throws(() => parseResult({ ...base, status: "cancelled", error: { code: "model_error", message: "failed" } }));
   assert.throws(() => parseResult({ ...base, status: "cancelled", reason: "anything" }));
 });
 
 test("paths and evidence ranges reject malformed references", () => {
-  const evidence = { id: "e-1", path: "src/index.ts", sha: "a".repeat(40), startLine: 1, endLine: 3, excerpt: "synthetic content" };
+  const evidence = { id: "e-1", snapshotId: "synthetic-v1", path: "src/index.ts", fileSha256: "c".repeat(64), startLine: 1, endLine: 3, excerpt: "synthetic content" };
   assert.equal(parseEvidence(evidence).endLine, 3);
   assert.throws(() => parseEvidence({ ...evidence, startLine: 4 }));
   for (const path of ["../secret", "/etc/passwd", "a/../b", "a\\b", "a\u0000b", "./a", "C:/secret"]) {
     assert.throws(() => parseEvidence({ ...evidence, path }), path);
     assert.throws(() => parseArtifacts([{ ...result.artifacts[0], path }]), path);
   }
+});
+
+test("reports bind evidence to a snapshot and reject dangling or ambiguous claims", () => {
+  const evidence = { id: "e-entry", snapshotId: "synthetic-v1", path: "src/index.ts", fileSha256: "c".repeat(64), startLine: 1, endLine: 2, excerpt: "export function main() {}" };
+  const report = {
+    schemaVersion: 1, runId: "run-1", attemptId: "attempt-1", snapshotId: "synthetic-v1", title: "Synthetic analysis",
+    limitations: ["Only the synthetic fixture is in scope."],
+    evidence: [evidence],
+    claims: [
+      { id: "claim-fact", kind: "fact", text: "The source exports main.", evidenceIds: ["e-entry"] },
+      { id: "claim-inference", kind: "inference", text: "main is likely an entry point.", evidenceIds: ["e-entry"] },
+      { id: "claim-unknown", kind: "unknown", text: "Execution status is unknown.", reason: "The fixture was not executed.", evidenceIds: [] },
+    ],
+  };
+  assert.equal(parseReport(report).claims.length, 3);
+  for (const bad of [
+    { ...report, evidence: [{ ...evidence, snapshotId: "other-snapshot" }] },
+    { ...report, evidence: [evidence, evidence] },
+    { ...report, claims: [...report.claims, report.claims[0]] },
+    { ...report, claims: [{ ...report.claims[0], evidenceIds: ["missing"] }] },
+    { ...report, claims: [{ ...report.claims[0], evidenceIds: [] }] },
+    { ...report, claims: [{ ...report.claims[0], evidenceIds: ["e-entry", "e-entry"] }] },
+    { ...report, claims: [{ id: "claim-unknown", kind: "unknown", text: "unknown", evidenceIds: ["e-entry"] }] },
+    { ...report, claims: [{ id: "claim-unknown", kind: "unknown", text: "unknown", evidenceIds: [] }] },
+  ]) assert.throws(() => parseReport(bad));
+});
+
+test("manifests require all three non-self artifacts only for completed runs", () => {
+  const manifest = {
+    schemaVersion: 1, runId: "run-1", attemptId: "attempt-1", snapshotId: "synthetic-v1",
+    status: "completed", startedAt: "2026-09-22T00:00:00.000Z", endedAt: "2026-09-22T00:01:00.000Z",
+    artifacts: [
+      { kind: "report.json", path: "report.json", sha256: "a".repeat(64) },
+      { kind: "report.md", path: "report.md", sha256: "b".repeat(64) },
+      { kind: "events.jsonl", path: "events.jsonl", sha256: "c".repeat(64) },
+    ],
+  };
+  assert.equal(parseManifest(manifest).artifacts.length, 3);
+  assert.equal(parseManifest({ ...manifest, status: "failed", artifacts: [] }).artifacts.length, 0);
+  assert.equal(parseManifest({ ...manifest, status: "cancelled", artifacts: manifest.artifacts.slice(2) }).artifacts.length, 1);
+  for (const bad of [
+    { ...manifest, artifacts: manifest.artifacts.slice(0, 2) },
+    { ...manifest, artifacts: [manifest.artifacts[0], manifest.artifacts[0], manifest.artifacts[2]] },
+    { ...manifest, endedAt: "2026-09-21T23:59:00.000Z" },
+    { ...manifest, artifacts: [...manifest.artifacts, { kind: "manifest.json", path: "manifest.json", sha256: "d".repeat(64) }] },
+  ]) assert.throws(() => parseManifest(bad));
 });
 
 test("inputs require immutable SHA and numeric bounded budgets without coercion", () => {

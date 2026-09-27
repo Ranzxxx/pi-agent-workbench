@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "claimFactMap": {
+    "claim-identity": ["GF-001"],
+    "claim-exports": ["GF-002"],
+    "claim-default-port": ["GF-003"],
+    "claim-health-route": ["GF-004"],
+    "claim-test-command": ["GF-005"]
+  },
+  "reviewedAssertionClaimIds": [
+    "claim-identity",
+    "claim-exports",
+    "claim-default-port",
+    "claim-health-route",
+    "claim-test-command",
+    "claim-bun-runtime-inference"
+  ],
+  "supportedAssertionClaimIds": [
+    "claim-identity",
+    "claim-exports",
+    "claim-default-port",
+    "claim-health-route",
+    "claim-test-command",
+    "claim-bun-runtime-inference"
+  ],
+  "unsupportedAssertionClaimIds": [],
+  "method": "Claim-to-fact mapping and whether cited source meaning supports an assertion are human-authored judgments. Path, line, digest, and reference validity are checked mechanically."
+}
