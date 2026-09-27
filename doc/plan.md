@@ -3,7 +3,7 @@
 ## 当前状态与事实来源
 
 - 最近更新：2026-09-27。
-- 当前阶段：TASK-004 的合成仓库离线证据与报告闭环已合并；尚未接入真实 GitHub 仓库，也未建设 API 或 Web，下一步为 TASK-005。
+- 当前阶段：TASK-005 的公开仓库固定 SHA 快照与单 Agent 报告流程已通过 PR #9 集成到 `main`；尚未建设 API 或 Web。真实模型在线质量评测未获授权，TASK-005 保持 review。
 - TASK-001 的代码经 PR #1 合并到 `dd82a11`；复审补强已在 PR #2 合并；TASK-003 补齐独立干净安装证据，状态恢复 done。
 - TASK-002 已通过 PR #2 合并到 `58d4a78`，状态 done；TASK-003 已通过 PR #3 集成，且用户确认远程 CI 全绿，状态 done。当前范围不包含 API 或 Web。
 - 任务的详细状态、验证和提交以任务卡为准；[任务索引](tasks/README.md)仅作摘要。
@@ -160,7 +160,7 @@ v0.2 阶段划分为：获取快照 → 收集证据 → 分析 → 校验 → �
 | GitHub Actions 远程运行 | [Offline checks 运行 #35813163678](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/35813163678) 在提交 `f14bbf8f99ac0d2c478708ae925ade818a937e94` 上通过 |
 | 协议、状态机、终态唯一与预算计算 | TASK-003 已通过离线测试；真实 provider 和业务产物待后续任务验证 |
 | 报告证据结构是否足够 | TASK-004 的合成事实清单与负向样例 |
-| 第一个公开仓库 SHA 和主模型选择 | TASK-005；真实模型调用需单独授权 |
+| 第一个公开仓库 SHA 和主模型选择 | TASK-005 已固定 slugify 样例 SHA；真实模型选择与在线评测仍需单独授权 |
 | 浏览器事件补发、取消和产物展示 | TASK-006 |
 | 真实模型、恢复、并发与隔离效果 | 对应版本建立新任务，不提前声称已支持 |
 
@@ -177,5 +177,6 @@ v0.2 阶段划分为：获取快照 → 收集证据 → 分析 → 校验 → �
 - 2026-09-22：TASK-003 工程、协议与适配层实现完成；根工程 24 项测试及独立 spike 干净安装通过，进入 review。TASK-001 验收补齐并恢复 done。
 - 2026-09-23：用户确认 TASK-003 的 GitHub Actions 全绿，验收完成；下一步启动 TASK-004。
 - 2026-09-27：TASK-004 经 PR #7 合并到 `main`（`7dc9dc7`），本地离线类型检查、测试和合成仓库演示通过；下一步启动 TASK-005。
+- 2026-09-27：TASK-005 经 [PR #9](https://github.com/Ranzxxx/pi-agent-workbench/pull/9) 合并到 `main`（merge commit `175a0fa5b6864068630515275cb466105b1bcb65`）；GitHub Actions [Offline checks #24](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36298816877) 通过。固定 SHA 公开仓库到 faux provider 报告闭环已集成；真实模型在线质量评测未授权，任务保持 review。
 
-下一步：启动 TASK-005“公开仓库快照与单 Agent 分析”。用户已确认未合并的 revert 分支由误触产生，不代表要回滚 main。任务分配和准确状态见任务索引。
+下一步：TASK-005 的代码已集成；在线质量评测是否另行授权由用户决定。TASK-006 尚未启动，任务状态见索引。
