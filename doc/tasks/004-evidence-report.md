@@ -58,5 +58,5 @@
 - 修改文件：`packages/protocol/**`、`packages/tools/**`、`packages/reporting/**`、`fixtures/synthetic-ts-repo/**`、`evals/**`、根 `package.json` / `package-lock.json` / `README.md`、本任务卡及任务索引。
 - 未完成项：本地提交后仍需用户按 Git 流程推送并合并到 main；在集成完成前任务状态保持 review。
 - 风险：证据位置与摘要有效不自动证明语义正确；语义支持由人工标注；分数不代表真实 GitHub 仓库质量。该演示不访问 GitHub、不使用模型/API Key，也不安装或执行 fixture 程序。
-- 提交 SHA：无。
-- 下一步：记录本地提交 SHA；之后由用户决定推送和合并，集成完成并确认验收后再改为 done。
+- 提交 SHA：`ebd1a2b869e76d23ad51ff9fc538f538a9deaa2d`（本地功能提交）。
+- 下一步：由用户决定是否推送并合并；集成完成且确认验收后再改为 done。
