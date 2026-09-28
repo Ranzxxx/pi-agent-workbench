@@ -17,9 +17,9 @@ backlog（待开始）→ in_progress（实施）→ review（待验收/集成�
 | [TASK-003 最小工程、协议与离线 CI](003-project-foundation.md) | done | Codex | PR #3 已合并；用户确认 GitHub Actions 全绿 |
 | [TASK-004 合成仓库证据与报告闭环](004-evidence-report.md) | done | Codex | PR #7 已合并至 `main`（`7dc9dc7`）；可以开始 TASK-005 |
 | [TASK-005 公开仓库快照与单 Agent 分析](005-public-repository.md) | done | Codex | PR #9/#11/#12 已合并，CI #24/#30/#33 通过；DeepSeek Flash 固定样本在线质量门与人工评分通过 |
-| [TASK-006 API、SSE 与通用 Agent 工作台基础界面](006-web-workbench.md) | review | 主 Agent | 全仓离线检查和 fake 浏览器闭环已有通过记录；Token 修复与错误响应复审后的 server 定向检查通过；用户确认在线报告引用正确；用户已授权提交、推送并创建/合并 PR |
+| [TASK-006 API、SSE 与通用 Agent 工作台基础界面](006-web-workbench.md) | done | 主 Agent | PR #14 已合并至 main；GitHub Actions #39 成功；本地 main 已快进同步。仍保留真实 socket 断线重连未端到端模拟等限制 |
 
-下一可用编号为 TASK-007；不要提前分配给未知功能。TASK-005 已通过真实固定样本在线评测和人工评分，PR #12 与 CI #33 已合并/通过；评分质量门通过。该单一样本不构成跨仓库泛化保证。TASK-006 已校准为通用 Agent 工作台：普通提示词直接进入 PI Agent 对话，特殊需求可通过 `@名称` 显式调用已注册能力；默认不开放工具，仓库分析是首个能力。fake 浏览器闭环及先前全仓验证已通过。用户一次在线仓库分析遇到 GitHub API 匿名限流（HTTP 403、剩余额度 0）；已补可选服务端 Token 透传和安全限流提示，相关工作区测试通过；主 Agent 复审还补强了 Fastify 错误码映射并验证 server 定向检查。用户反馈在线仓库分析成功并确认报告引用正确；完整 run ID/仓库 SHA 尚缺，真实 socket 断线自动重连也未端到端模拟。TASK-006 保持 review，用户已授权提交与 PR 集成流程，合并后再同步完成状态。
+下一可用编号为 TASK-007；不要提前分配给未知功能。TASK-005 已通过真实固定样本在线评测和人工评分，PR #12 与 CI #33 已合并/通过；评分质量门通过。该单一样本不构成跨仓库泛化保证。TASK-006 已校准为通用 Agent 工作台：普通提示词直接进入 PI Agent 对话，特殊需求可通过 `@名称` 显式调用已注册能力；默认不开放工具，仓库分析是首个能力。fake 浏览器闭环及先前全仓验证已通过。用户一次在线仓库分析遇到 GitHub API 匿名限流（HTTP 403、剩余额度 0）；已补可选服务端 Token 透传和安全限流提示，相关工作区测试通过；主 Agent 复审还补强了 Fastify 错误码映射并验证 server 定向检查。用户反馈在线仓库分析成功并确认报告引用正确；完整 run ID/仓库 SHA 尚缺，真实 socket 断线自动重连也未端到端模拟。TASK-006 的 PR #14 已合并、CI #39 成功并同步到本地 `main`，状态为 `done`；上述未验证事项仍作为已知限制。
 
 ## 创建与交接
 

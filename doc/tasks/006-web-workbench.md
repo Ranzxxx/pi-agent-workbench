@@ -2,7 +2,7 @@
 
 ## 元数据
 
-- 状态：`review`
+- 状态：`done`
 - 负责人：主 Agent（补充修复、独立测试与验收）；此前实现由实现子代理完成
 - 分支或 worktree：集成/验收 `task/006-web-workbench`（当前 checkout）；实现 `task/006-web-workbench-impl`（`/tmp/pi-task006-implementation`）
 - 计划校准基线：`a726c26c6fdab2c167aa39d048d7886bb117bd30`
@@ -10,7 +10,7 @@
 - 依赖任务：TASK-005 的可运行分析流水线
 - 提交/推送授权：用户于 2026-09-28 明确授权创建本地提交、推送分支，并通过 GitHub 插件创建和合并 PR。
 - 在线模型授权：用户于 2026-09-28 授权一次 DeepSeek Flash 普通对话冒烟验证，应用侧单次成本上限 USD 0.20；已完成
-- 状态说明：原实现与主 Agent 独立审查、测试和 fake 浏览器验收已完成；2026-09-28 在线仓库分析复现出 GitHub API 匿名速率限制耗尽，故复开补齐可选服务端 GitHub Token 透传和安全错误提示。复开基线为当前 checkout 的 `a726c26`；新增允许路径仅限 `apps/server/**`、`packages/reporting/src/public-runner.ts`、`packages/tools/src/public-github-snapshot.ts` 及对应测试、`.env.example` 和 README 的在线配置说明。任务开始前已有修改：`AGENTS.md`、`README.md`、`doc/plan.md`、本任务卡、`doc/tasks/README.md`；均予以保留，不能当成 TASK-006 新增内容提交。实现期间确认了普通提示词、显式 `@` 能力、进程内上下文、对话/运行 ID、全局单运行、进程内对话列表及失败/取消规则。
+- 状态说明：原实现与主 Agent 独立审查、测试和 fake 浏览器验收已完成；2026-09-28 在线仓库分析复现出 GitHub API 匿名速率限制耗尽，故复开补齐可选服务端 GitHub Token 透传和安全错误提示。复开基线为当前 checkout 的 `a726c26`；新增允许路径仅限 `apps/server/**`、`packages/reporting/src/public-runner.ts`、`packages/tools/src/public-github-snapshot.ts` 及对应测试、`.env.example` 和 README 的在线配置说明。复开前已有修改：`AGENTS.md`、`README.md`、`doc/plan.md`、本任务卡、`doc/tasks/README.md`；未覆盖这些改动，并在用户明确授权下随 TASK-006 一并提交，以保持产品说明、任务计划和实现状态一致。私有参考笔记仍留在被忽略的 `doc/internal/`，未提交。实现期间确认了普通提示词、显式 `@` 能力、进程内上下文、对话/运行 ID、全局单运行、进程内对话列表及失败/取消规则。
 
 ## 目标与非目标
 
@@ -79,5 +79,6 @@ API 与 Agent 执行器同进程；请求契约必须同时表达普通对话消
 - 在线冒烟验证（2026-09-28）：用户明确授权一次 DeepSeek Flash 普通对话调用，应用侧单次运行成本上限 USD 0.20。为避免改变用户默认服务，在 `127.0.0.1:3027` 单独启动 `WORKBENCH_MODE=online` API；运行时 Node.js `24.19.0`、npm `11.9.0`。健康接口确认 `mode=online`；创建新对话并提交一条普通提示后，运行状态为 `completed`，回复为“DeepSeek 在线调用成功。”，assistant 消息已写入对话；SSE 回放包含 `run.started`、`message.delta` 和 `run.finished`。本次只验证普通对话 API 与 SSE 的真实 provider 调用，不是浏览器 UI 在线模式验收，也未调用在线仓库分析能力。公开 API 响应未暴露本次实际 Token/费用，因此只记录应用侧配置的 USD 0.20 上限，不推断实际费用。临时在线 API 已停止，默认服务仍报告 `mode=fake`。此冒烟使用 Node.js `24.19.0`，不能替代固定工具链 `24.21.0` 的工程检查。
 - 未验证/限制：真实 socket 断线期间的浏览器自动重连未作端到端网络中断模拟；真实模型回答质量、成功运行的仓库/ref/SHA 与实际服务账单未独立核验。用户已确认在线 `@仓库分析` 报告引用正确，但缺少完整 run ID 和仓库版本详情，Agent 无法独立复现。Agent 沙箱无法自行绑定 localhost；此前 fake 浏览器验收复用用户当前项目的 API `2027` 与 Web `2026`，未停止该进程。任务范围外的公网部署、数据库/进程重启恢复和动态插件市场未实现。
 - 已知限制：服务状态只在进程内；fake 普通回答与固定合成仓库只用于闭环演示，不证明在线模型质量或真实 GitHub 全面兼容；活跃运行最多一个；没有登录、持久化或公网部署。浏览器刷新后的活动运行恢复已验证，但真实 socket 断线自动重连没有端到端模拟。
-- 提交 SHA：实现提交 `1f031d9`（`feat(TASK-006): add API, SSE, and web workbench`）。
-- 下一步：推送任务分支并创建 PR；通过 GitHub 插件核查 PR、CI 后合并，再同步本地 `main` 并复核集成状态。若需补足可复核的在线运行记录，可提供成功运行的完整 run ID、仓库/ref/SHA 与报告产物摘要（不要提供 Token）。真实 socket 自动重连仍未端到端模拟；该限制保留在验收记录中。
+- GitHub 集成：PR [#14](https://github.com/Ranzxxx/pi-agent-workbench/pull/14) 已合并到 `main`；GitHub Actions “Offline checks” #39 成功；合并提交 `c5b050523cfec6b6c049a5688b0e3cdb9b95ceda`。本地 `main` 已快进到该提交。
+- 提交 SHA：实现提交 `1f031d9`（`feat(TASK-006): add API, SSE, and web workbench`）；交接记录提交 `863e648`（`docs(TASK-006): record implementation commit`）。
+- 下一步：TASK-006 已集成完成，可开始规划 TASK-007。若需补足可复核的在线运行记录，可提供成功运行的完整 run ID、仓库/ref/SHA 与报告产物摘要（不要提供 Token）。真实 socket 自动重连仍未端到端模拟；该限制保留为已知限制。
