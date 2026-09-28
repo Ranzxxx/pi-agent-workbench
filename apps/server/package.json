@@ -1,0 +1,21 @@
+{
+  "name": "@pi-workbench/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts",
+    "check": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.86.1",
+    "@pi-workbench/agent-runtime": "0.1.0",
+    "@pi-workbench/protocol": "0.1.0",
+    "@pi-workbench/reporting": "0.1.0",
+    "@pi-workbench/tools": "0.1.0",
+    "fastify": "5.12.5"
+  }
+}

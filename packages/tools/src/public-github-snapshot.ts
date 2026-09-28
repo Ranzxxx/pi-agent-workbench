@@ -40,6 +40,8 @@ export interface SnapshotInfo {
 
 export interface SnapshotOptions {
   cacheDirectory: string;
+  /** Optional token for GitHub API metadata/ref requests only; never sent to codeload. */
+  githubToken?: string;
   fetch?: typeof fetch;
   limits?: Partial<SnapshotLimits>;
   signal?: AbortSignal;
@@ -78,10 +80,12 @@ function safeResponseUrl(response: Response, expectedHosts: string[]): void {
   }
 }
 
-async function fetchChecked(fetcher: typeof fetch, url: string, hosts: string[], signal: AbortSignal): Promise<Response> {
+async function fetchChecked(fetcher: typeof fetch, url: string, hosts: string[], signal: AbortSignal, githubToken?: string): Promise<Response> {
   if (signal.aborted) throw new SnapshotError("timeout", "GitHub snapshot request timed out");
   let response: Response;
-  try { response = await fetcher(url, { redirect: "manual", signal, headers: { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "user-agent": "pi-agent-workbench" } }); }
+  const headers = new Headers({ accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "user-agent": "pi-agent-workbench" });
+  if (hosts.includes("api.github.com") && githubToken) headers.set("authorization", `Bearer ${githubToken}`);
+  try { response = await fetcher(url, { redirect: "manual", signal, headers }); }
   catch {
     const code = signal.aborted ? "timeout" : "network_error";
     throw new SnapshotError(code, code === "timeout" ? "GitHub snapshot request timed out" : "GitHub snapshot request failed");
@@ -397,6 +401,10 @@ export async function fetchPublicGitHubSnapshot(input: PublicRepositoryInput, op
   const identity = parseRepository(input);
   const limits = validateLimits(options.limits);
   const fetcher = options.fetch ?? fetch;
+  const githubToken = options.githubToken?.trim();
+  if (githubToken && (githubToken.length > 512 || /[\u0000-\u0020\u007f]/u.test(githubToken))) {
+    throw new SnapshotError("http_error", "Optional GitHub API token is invalid");
+  }
   const cache = await ensureDirectory(options.cacheDirectory);
   const canonicalUrl = `https://github.com/${identity.owner}/${identity.repo}`;
   const stats: ExtractStats = { compressed: 0, expanded: 0, files: 0, entries: 0 };
@@ -413,11 +421,11 @@ export async function fetchPublicGitHubSnapshot(input: PublicRepositoryInput, op
     let sha = identity.ref;
     if (!shaPattern.test(identity.ref)) {
       const apiRoot = `https://api.github.com/repos/${encodeURIComponent(identity.owner)}/${encodeURIComponent(identity.repo)}`;
-      const repository = await json(await fetchChecked(fetcher, apiRoot, ["api.github.com"], signal), "repository_not_found");
+      const repository = await json(await fetchChecked(fetcher, apiRoot, ["api.github.com"], signal, githubToken), "repository_not_found");
       resolvedRef = identity.ref === "HEAD" ? fieldText(repository.default_branch) ?? "" : identity.ref;
       if (!resolvedRef) throw new SnapshotError("http_error", "GitHub repository did not report its default branch");
       const commitUrl = `${apiRoot}/commits/${encodeURIComponent(resolvedRef)}`;
-      const commit = await json(await fetchChecked(fetcher, commitUrl, ["api.github.com"], signal), "ref_not_found");
+      const commit = await json(await fetchChecked(fetcher, commitUrl, ["api.github.com"], signal, githubToken), "ref_not_found");
       sha = fieldText((commit.commit as Record<string, unknown> | undefined)?.sha) ?? fieldText(commit.sha) ?? "";
       if (!shaPattern.test(sha)) throw new SnapshotError("http_error", "GitHub did not return a full commit SHA");
     }

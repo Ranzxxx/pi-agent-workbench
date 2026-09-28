@@ -47,6 +47,7 @@ export interface PublicAnalysisOptions {
   model: Model<string>;
   budget: Budget;
   pricing: Pricing;
+  githubToken?: string;
   fetch?: SnapshotOptions["fetch"];
   snapshotLimits?: SnapshotOptions["limits"];
   signal?: AbortSignal;
@@ -210,6 +211,7 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
   const snapshot = await fetchPublicGitHubSnapshot(options.repository, {
     cacheDirectory: options.cacheDirectory,
     fetch: options.fetch,
+    githubToken: options.githubToken,
     limits: options.snapshotLimits,
     signal: options.signal,
   });
