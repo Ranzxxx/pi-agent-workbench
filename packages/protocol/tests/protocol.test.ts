@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BudgetSchema, RunInputSchema, parse, parseArtifacts, parseEvent, parseEvidence, parseManifest, parseReport, parseResult } from "../src/index.js";
+import {
+  BudgetSchema, CapabilityInfoSchema, CreateRunRequestSchema, RunInputSchema, WorkbenchEventSchema, WorkbenchResultSchema,
+  parse, parseArtifacts, parseEvent, parseEvidence, parseManifest, parseReport, parseResult, parseWorkbenchEvent,
+} from "../src/index.js";
 
 const usage = { modelCalls: 1, toolCalls: 0, inputTokens: 2, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 5, estimatedCostUsd: 0, pricingVersion: "offline" };
 const result = { schemaVersion: 1, runId: "run-1", attemptId: "attempt-1", usage, endedAt: "2026-09-22T00:00:00.000Z", status: "completed", artifacts: [{ kind: "report.json", path: "reports/report.json", sha256: "a".repeat(64) }] };
@@ -101,4 +104,42 @@ test("inputs require immutable SHA and numeric bounded budgets without coercion"
   const budget = { timeoutMs: 1000, maxModelCalls: 8, maxToolCalls: 20, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 };
   assert.deepEqual(parse(BudgetSchema, budget), budget);
   for (const bad of [{ ...budget, timeoutMs: "1000" }, { ...budget, maxTokens: -1 }, { ...budget, maxCostUsd: NaN }]) assert.throws(() => parse(BudgetSchema, bad));
+});
+
+test("workbench requests distinguish ordinary prompts from the one registered capability", () => {
+  const message = { schemaVersion: 1, input: { kind: "message", text: "Explain this concept" } };
+  const capability = { schemaVersion: 1, input: {
+    kind: "capability", capabilityId: "public_repository_analysis",
+    input: { repositoryUrl: "https://github.com/example/project", ref: "v1.0.0", goal: "Describe the entry points" },
+  } };
+  assert.deepEqual(parse(CreateRunRequestSchema, message), message);
+  assert.deepEqual(parse(CreateRunRequestSchema, capability), capability);
+  assert.throws(() => parse(CreateRunRequestSchema, { ...capability, input: { ...capability.input, capabilityId: "unregistered" } }));
+  assert.throws(() => parse(CreateRunRequestSchema, { ...capability, input: { ...capability.input, input: { ...capability.input.input, repositoryUrl: "file:///etc/passwd" } } }));
+  assert.throws(() => parse(CreateRunRequestSchema, { schemaVersion: 1, input: { kind: "message", text: "  " } }));
+});
+
+test("workbench outcomes and events enforce bounded payloads and consistent run identities", () => {
+  const completed = {
+    schemaVersion: 1, status: "completed", runId: "run_1", conversationId: "conversation_1", endedAt: new Date(0).toISOString(),
+    reply: "Done", artifacts: [{ kind: "report.md", sha256: "a".repeat(64) }],
+  };
+  assert.deepEqual(parse(WorkbenchResultSchema, completed), completed);
+  const event = {
+    schemaVersion: 1, eventId: "run_1_1", runId: "run_1", conversationId: "conversation_1", sequence: 1,
+    timestamp: new Date(0).toISOString(), type: "run.finished", data: completed,
+  };
+  assert.deepEqual(parseWorkbenchEvent(event), event);
+  assert.throws(() => parseWorkbenchEvent({ ...event, data: { ...completed, runId: "other_run" } }));
+  assert.throws(() => parse(WorkbenchResultSchema, { ...completed, reply: "x".repeat(16_001) }));
+});
+
+test("capability catalog exposes bounded form metadata for generic rendering", () => {
+  const capability = {
+    id: "public_repository_analysis", name: "仓库分析", description: "只读分析公开仓库。",
+    inputs: [{ id: "goal", label: "分析目标", required: true, description: "描述目标。", control: "textarea", maxLength: 8000 }],
+  };
+  assert.deepEqual(parse(CapabilityInfoSchema, capability), capability);
+  assert.throws(() => parse(CapabilityInfoSchema, { ...capability, inputs: [{ ...capability.inputs[0], control: "shell" }] }));
+  assert.throws(() => parse(CapabilityInfoSchema, { ...capability, inputs: [{ ...capability.inputs[0], maxLength: 1_000_000 }] }));
 });

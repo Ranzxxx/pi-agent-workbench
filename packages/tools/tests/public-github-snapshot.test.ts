@@ -47,15 +47,16 @@ function fixtureFetch(contents = archive([
   { name: "slugify-7c318bd/index.js", content: "export default true;\n" },
 ])) {
   const urls: string[] = [];
-  const fetcher: typeof fetch = async (input) => {
-    const url = String(input); urls.push(url);
+  const authorizations: Array<string | null> = [];
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = String(input); urls.push(url); authorizations.push(new Headers(init?.headers).get("authorization"));
     if (url === "https://api.github.com/repos/sindresorhus/slugify") return response(JSON.stringify({ default_branch: "main" }), url);
     if (url.endsWith("/commits/v3.0.0")) return response(JSON.stringify({ sha, commit: { sha } }), url);
     if (url.endsWith("/commits/main")) return response(JSON.stringify({ sha, commit: { sha } }), url);
     if (url.endsWith("/legacy.tar.gz/" + sha)) return response(contents.buffer.slice(contents.byteOffset, contents.byteOffset + contents.byteLength) as ArrayBuffer, url);
     return response("", url, 404);
   };
-  return { fetcher, urls };
+  return { fetcher, urls, authorizations };
 }
 async function temp(): Promise<string> { return mkdtemp(path.join(os.tmpdir(), "pi-task005-snapshot-")); }
 async function assertCode(promise: Promise<unknown>, code: SnapshotErrorCode): Promise<void> {
@@ -93,6 +94,19 @@ test("uses the default branch when no ref is supplied", async () => {
     const snapshot = await fetchPublicGitHubSnapshot({ url: "https://github.com/sindresorhus/slugify" }, { cacheDirectory, fetch: fake.fetcher });
     assert.equal(snapshot.ref, "main");
     assert.ok(fake.urls[1]!.endsWith("/commits/main"));
+  } finally { await rm(cacheDirectory, { recursive: true, force: true }); }
+});
+
+test("sends the optional GitHub token only to API metadata requests, never to codeload", async () => {
+  const cacheDirectory = await temp(); const fake = fixtureFetch();
+  try {
+    await fetchPublicGitHubSnapshot({ url: "https://github.com/sindresorhus/slugify", ref: "v3.0.0" }, {
+      cacheDirectory, fetch: fake.fetcher, githubToken: "  github_pat_test_only  ",
+    });
+    assert.equal(fake.authorizations[0], "Bearer github_pat_test_only");
+    assert.equal(fake.authorizations[1], "Bearer github_pat_test_only");
+    assert.match(fake.urls[2]!, /^https:\/\/codeload\.github\.com\//u);
+    assert.equal(fake.authorizations[2], null);
   } finally { await rm(cacheDirectory, { recursive: true, force: true }); }
 });
 

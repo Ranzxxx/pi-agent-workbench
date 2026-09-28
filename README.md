@@ -1,8 +1,8 @@
 # PI Agent Workbench
 
-使用 PI SDK、Node.js 和 TypeScript 构建带证据的 GitHub 仓库技术分析工作台。输入公开仓库与目标，固定提交版本，生成可追溯的分析报告并展示执行过程。
+使用 PI SDK、Node.js 和 TypeScript 构建可扩展的本地 Agent 工作台。首个已接入能力是只读分析公开 GitHub 仓库：固定提交版本，生成带源码证据的报告，并展示执行过程。
 
-**现已提供合成仓库离线演示、公开 GitHub 固定 SHA 快照，以及显式注入 PI provider 的单 Agent 报告流水线。尚无 Web 或 API 服务；真实模型质量和在线评测未验证。**
+**现已提供本地 Web/API 工作台、默认离线模拟的普通多轮对话、显式 `@仓库分析` 能力、SSE 运行事件和受限报告产物访问。公开 GitHub 分析复用现有只读流水线；在线模式必须在服务端显式配置 `WORKBENCH_MODE=online` 和 DeepSeek API Key。内存对话与运行在服务重启后清空，当前全进程最多一个活动运行。**
 
 ## 安装与验证
 
@@ -15,13 +15,17 @@ npm install --global npm@11.9.0 --ignore-scripts --no-audit --no-fund
 npm ci --ignore-scripts --no-audit --no-fund
 npm run check
 npm test
+npm run dev
+# 浏览器打开 http://127.0.0.1:2026
 npm run spike
 npm run demo:offline
 ```
 
 没有 nvm 时，先准备上述版本的 Node/npm，再从 `npm ci` 开始。全局 npm 安装命令仅用于你选择的 Node 环境；本轮 Agent 验证使用临时工具链，没有更改系统 Node。`npm run check` 和 `npm test` 会拒绝不一致的工具链。
 
-根目录的 `package-lock.json` 是 workspace 安装依据。根安装后无需再进入子目录安装依赖；`spikes/pi-sdk/package-lock.json` 仅保留给独立 spike 的历史复现。所有模型测试使用模拟 provider，不需要 API Key，不调用真实模型。安装依赖需要访问 npm 注册表。
+根目录的 `package-lock.json` 是 workspace 安装依据。根安装后无需再进入子目录安装依赖；`npm run dev` 同时启动只绑定 `127.0.0.1` 的 API (`2027`) 与 Web (`2026`)。如果 Web 端口被其他本地服务占用，可运行 `WEB_PORT=3026 npm run dev` 使用其他端口；API 地址可通过 `API_PORT` 调整。默认使用不产生真实模型费用的离线模拟；仓库分析在离线模式下只支持合成仓库 `https://github.com/demo/harborlight`，其他仓库和演示数据未覆盖的 ref 会被拒绝，不会将合成结果冒充成真实仓库分析。需要分析真实仓库时，将 `.env.example` 复制为本地 `.env`，设置 `WORKBENCH_MODE=online` 并填写 `DEEPSEEK_API_KEY`，密钥只由服务进程读取。`spikes/pi-sdk/package-lock.json` 仅保留给独立 spike 的历史复现。离线测试和演示使用模拟 provider，不需要 API Key，也不会调用真实模型。单独的在线评测 CLI 默认关闭；在线调用需要本地配置密钥、显式启用 `--online` 并设置人民币费用上限。安装依赖需要访问 npm 注册表。
+
+在线 `@仓库分析` 需要先解析 GitHub 分支/标签到固定提交；若遇到 GitHub 匿名 API 限额，可在 `.env` 另设可选只读 `GITHUB_TOKEN`。它只供服务端访问 `api.github.com` 的仓库元数据和 ref，不传给浏览器或 `codeload.github.com`，不要提交 `.env`。
 
 CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 workspace 和独立 spike 的干净安装与检查。具体已执行证据及远程 CI 状态见 [TASK-003](doc/tasks/003-project-foundation.md)。
 
@@ -29,25 +33,33 @@ CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 wo
 
 | 路径 | 职责 |
 | --- | --- |
+| `apps/server` | 同进程版本化 REST/SSE API、内存对话/运行状态、显式能力注册表与安全产物访问 |
+| `apps/web` | Next.js 通用深色工作台、会话导航、普通提示、显式 `@` 能力调用与报告展示 |
 | `packages/protocol` | 版本化输入、预算、事件、结果、证据与产物引用的 schema 和校验 |
 | `packages/agent-runtime` | PI SDK 薄适配层、受控资源与工具、调用/Token/成本预算、取消和结果校验入口 |
 | `packages/tools` | 获取固定 SHA 的公开 GitHub 快照并施加下载/解包边界；只读列举、读取、检索与证据登记 |
-| `packages/reporting` | 单 Agent 快照分析、报告和证据校验、Markdown 与 manifest/事件日志生成、离线评测 |
+| `packages/reporting` | 单 Agent 快照分析、报告和证据校验、Markdown 与 manifest/事件日志生成、离线评测及显式在线评测 CLI |
 | `spikes/pi-sdk` | 保留的 SDK 行为实验与负向回归 |
 
-运行适配层接口与边界见 [模块说明](packages/agent-runtime/README.md)。当前源码通过 tsx 运行；未配置发布构建，也没有根 `npm start` 或 Web 服务。
+运行适配层接口与边界见 [模块说明](packages/agent-runtime/README.md)。API、Web 开发服务通过 workspace `tsx` 与 Next.js 运行；生产打包目前仅为 Web 提供 `next build`。
 
 七个生命周期场景和回归说明见 [spike 文档](spikes/pi-sdk/README.md)。
 
 ## 第一版目标
 
+- 建立可增加已注册任务能力的通用工作台基础；未知任务类型必须拒绝，通用界面不代表可执行任意提示词或工具。
+- 从独立能力栏目发现已注册能力，或在通用输入框中使用 `@名称` 调用；主界面不固定绑定某项能力的表单。
 - 公开 GitHub 仓库固定 SHA，限制文件和获取范围。
 - 单 Agent 通过只读工具收集证据，不安装或执行目标仓库代码。
 - 结构化报告与 Markdown 报告共享事实来源。
 - 展示运行事件、证据和产物，支持取消。
 - 离线自动测试与单独授权的在线模型评测。
 
-`npm run demo:offline` 使用 `fixtures/synthetic-ts-repo`，写入被 Git 忽略的 `artifacts/TASK-004/`。它不会连接网络、读取 API Key、安装或执行 fixture 中的脚本；评测基于预先维护的合成 golden facts，证据支持与无依据断言由人工标注。当前还提供真实固定 SHA 的只读快照与报告库入口，但尚无 Web/API、在线评测 CLI 或真实模型质量验证。当前不支持进程重启恢复、多 Agent、Docker 执行、RAG 或长期记忆。
+`npm run demo:offline` 使用 `fixtures/synthetic-ts-repo`，写入被 Git 忽略的 `artifacts/TASK-004/`。它不会连接网络、读取 API Key、安装或执行 fixture 中的脚本；评测基于预先维护的合成 golden facts，证据支持与无依据断言由人工标注。公开仓库分析入口会获取固定 SHA 快照并生成证据报告；在线评测 CLI 通过单独命令显式启用。一次固定样本的真实模型评测和人工评分已通过质量门，但样本不足以证明模型在其他仓库上的表现。工作台默认离线模式只连接 faux provider 与合成仓库；在浏览器可验证正常对话、取消、能力报告查看和 API 的重连回放。对话、会话上下文、运行和幂等表只存在于当前进程，重启后不可恢复；服务进程全局最多运行一个 Agent。当前只注册公开仓库分析一种能力；不支持登录、多 Agent、Docker 执行、RAG 或长期记忆。
+
+### 在线模型评测
+
+`@pi-workbench/reporting` 提供 `eval:public` CLI。离线模式用于查看帮助和评分既有运行；真实调用须在项目根目录本地配置 `.env` 中的 `DEEPSEEK_API_KEY`，并显式传入 `--online` 与 `--max-cost-cny`。应用侧 Token、时长和费用阈值按 provider 返回的 usage 事后核算，是软预算而非服务端硬限额。真实凭据和运行产物不得提交。
 
 ### TASK-005 公开仓库分析入口
 

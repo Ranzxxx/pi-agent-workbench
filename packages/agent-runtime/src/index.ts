@@ -18,6 +18,12 @@ import { resources } from "./resources.js";
 export { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 export { defineTool } from "@earendil-works/pi-coding-agent";
 export type { CredentialStore, Model, Provider, ToolDefinition };
+export {
+  createConversationSession,
+  type ConversationRuntimeOptions,
+  type ConversationPromptOptions,
+  type ConversationTurnResult,
+} from "./conversation.js";
 
 export interface RuntimeOptions {
   cwd: string;
