@@ -18,9 +18,9 @@ backlog（待开始）→ in_progress（实施）→ review（待验收/集成�
 | [TASK-004 合成仓库证据与报告闭环](004-evidence-report.md) | done | Codex | PR #7 已合并至 `main`（`7dc9dc7`）；可以开始 TASK-005 |
 | [TASK-005 公开仓库快照与单 Agent 分析](005-public-repository.md) | done | Codex | PR #9/#11/#12 已合并，CI #24/#30/#33 通过；DeepSeek Flash 固定样本在线质量门与人工评分通过 |
 | [TASK-006 API、SSE 与通用 Agent 工作台基础界面](006-web-workbench.md) | done | 主 Agent | PR #14 已合并至 main；GitHub Actions #39 成功；本地 main 已快进同步。仍保留真实 socket 断线重连未端到端模拟等限制 |
-| [TASK-007 v0.1 Review 问题修复与回归验收](007-v01-review-fixes.md) | review | Codex | 9 项实现、离线回归和 README 已更新；待独立审查、固定工具链复核、提交与集成 |
+| [TASK-007 v0.1 Review 问题修复与回归验收](007-v01-review-fixes.md) | done | Codex | PR #17 已 squash 合并至 `main`（`cede3fd`）；浏览器完整交互和固定工具链仍有任务卡记录的后补验证项 |
 
-下一可用编号为 TASK-008；TASK-007 是修复和验收任务，不代表已决定下一项产品功能。TASK-005 已通过真实固定样本在线评测和人工评分；单一样本不构成跨仓库泛化保证。TASK-006 的 API、SSE、通用工作台和首个注册能力已集成，但独立 Review 后确认 9 项代码问题，现由 TASK-007 跟踪修复；此前浏览器验收和全仓检查的历史证据仍保留在 [TASK-006 任务卡](006-web-workbench.md)，不能替代 TASK-007 的回归验收。真实 socket 断线重连、固定 Node.js 工具链复核和真实在线运行的完整元数据仍是已有验证缺口。详细修复项、触发证据和验收要求见 [TASK-007 任务卡](007-v01-review-fixes.md)。
+下一可用编号为 TASK-008；TASK-007 是已完成的修复和验收任务，不代表已决定下一项产品功能。TASK-005 已通过真实固定样本在线评测和人工评分；单一样本不构成跨仓库泛化保证。TASK-006 的 API、SSE、通用工作台和首个注册能力已集成，独立 Review 确认的 9 项代码问题已由 TASK-007 修复并集成；此前浏览器验收和全仓检查的历史证据仍保留在 [TASK-006 任务卡](006-web-workbench.md)，不能替代 TASK-007 的回归验收。真实 socket 断线重连、固定 Node.js 工具链复核和真实在线运行的完整元数据仍是已有验证缺口。详细修复项、触发证据和验收记录见 [TASK-007 任务卡](007-v01-review-fixes.md)。
 
 ## 创建与交接
 
