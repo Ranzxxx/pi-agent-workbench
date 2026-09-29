@@ -4,6 +4,8 @@
 
 **现已提供本地 Web/API 工作台、默认离线模拟的普通多轮对话、显式 `@仓库分析` 能力、SSE 运行事件和受限报告产物访问。公开 GitHub 分析复用现有只读流水线；在线模式必须在服务端显式配置 `WORKBENCH_MODE=online` 和 DeepSeek API Key。内存对话与运行在服务重启后清空，当前全进程最多一个活动运行。**
 
+当前 [TASK-007](doc/tasks/007-v01-review-fixes.md) 已进入验收。仓库分析的取消会等待底层执行真正退出后才释放全局运行名额；同一会话中的历史运行及其报告可以在 Web 端重新选择，失败或取消时也可查看已登记的部分产物。具体通过情况以任务卡的验证记录为准。
+
 ## 安装与验证
 
 正式 workspace 固定 Node.js **24.21.0**、npm **11.9.0**，使用 ESM 和 TypeScript strict。已安装 nvm 的本地环境可在项目根目录执行：
@@ -44,6 +46,8 @@ CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 wo
 运行适配层接口与边界见 [模块说明](packages/agent-runtime/README.md)。API、Web 开发服务通过 workspace `tsx` 与 Next.js 运行；生产打包目前仅为 Web 提供 `next build`。
 
 七个生命周期场景和回归说明见 [spike 文档](spikes/pi-sdk/README.md)。
+
+运行记录只在当前服务进程内保存。新一轮对话不会覆盖旧报告入口：在当前会话的“运行记录”中选择旧能力运行，即可打开其报告与已登记产物；刷新页面后会默认选择最新运行，但仍可切回旧运行。仓库分析的 `events.jsonl` 保存可解析的归档完成事件，指向 `report.json` 和 `report.md`；日志及 manifest 不能引用自身哈希，完整的四项产物哈希由运行结果和 manifest 分别提供。普通提示按 UTF-8 32 KiB 上限在提交时校验，超限会返回 `invalid_request`，不会消耗模型调用。
 
 ## 第一版目标
 

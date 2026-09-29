@@ -16,6 +16,11 @@ export class UnsafeRepositoryPathError extends Error {
   }
 }
 
+type SkippedSearchReason = "binary" | "file_too_large";
+class UnsearchableRepositoryFileError extends Error {
+  constructor(message: string, readonly reason: SkippedSearchReason) { super(message); }
+}
+
 export interface ReadOnlyRepositoryOptions {
   root: string;
   snapshotId: string;
@@ -48,7 +53,7 @@ export interface ReadOnlyRepository {
   readonly snapshotId: string;
   listFiles(relativePath?: string): Promise<string[]>;
   readFile(relativePath: string): Promise<RepositoryFile>;
-  searchText(query: string): Promise<SearchMatch[]>;
+  searchText(query: string, onSkippedFile?: (path: string, reason: SkippedSearchReason) => void): Promise<SearchMatch[]>;
   fingerprint(): Promise<SnapshotFingerprint>;
 }
 
@@ -81,7 +86,7 @@ function utf8(buffer: Buffer): string {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
   } catch {
-    throw new Error("Repository file is not valid UTF-8 text");
+    throw new UnsearchableRepositoryFileError("Repository file is not valid UTF-8 text", "binary");
   }
 }
 
@@ -131,14 +136,14 @@ export function createReadOnlyRepository(options: ReadOnlyRepositoryOptions): Re
 
   async function readChecked(relativePath: string): Promise<RepositoryFile> {
     const checked = await inspect(relativePath, "file");
-    if (checked.stat.size > maxFileBytes) throw new Error("Repository file exceeds the read limit");
+    if (checked.stat.size > maxFileBytes) throw new UnsearchableRepositoryFileError("Repository file exceeds the read limit", "file_too_large");
     const noFollow = constants.O_NOFOLLOW ?? 0;
     const nonBlock = constants.O_NONBLOCK ?? 0;
     const handle = await open(checked.absolutePath, constants.O_RDONLY | noFollow | nonBlock);
     try {
       const openedStat = await handle.stat();
       if (!openedStat.isFile() || openedStat.dev !== checked.stat.dev || openedStat.ino !== checked.stat.ino) throw new UnsafeRepositoryPathError();
-      if (openedStat.size > maxFileBytes) throw new Error("Repository file exceeds the read limit");
+      if (openedStat.size > maxFileBytes) throw new UnsearchableRepositoryFileError("Repository file exceeds the read limit", "file_too_large");
       const chunks: Buffer[] = [];
       let total = 0;
       let position = 0;
@@ -150,10 +155,10 @@ export function createReadOnlyRepository(options: ReadOnlyRepositoryOptions): Re
         total += bytesRead;
         position += bytesRead;
       }
-      if (total > maxFileBytes) throw new Error("Repository file exceeds the read limit");
+      if (total > maxFileBytes) throw new UnsearchableRepositoryFileError("Repository file exceeds the read limit", "file_too_large");
       const bytes = Buffer.concat(chunks, total);
       const text = utf8(bytes);
-      if (Buffer.byteLength(text, "utf8") > maxOutputBytes) throw new Error("Repository tool output exceeds the response limit");
+      if (Buffer.byteLength(text, "utf8") > maxOutputBytes) throw new UnsearchableRepositoryFileError("Repository tool output exceeds the response limit", "file_too_large");
       return { path: relativePath, text, fileSha256: createHash("sha256").update(bytes).digest("hex"), byteLength: bytes.length };
     } finally {
       await handle.close();
@@ -199,13 +204,21 @@ export function createReadOnlyRepository(options: ReadOnlyRepositoryOptions): Re
     return files;
   }
 
-  async function searchText(query: string): Promise<SearchMatch[]> {
+  async function searchText(query: string, onSkippedFile?: (path: string, reason: SkippedSearchReason) => void): Promise<SearchMatch[]> {
     if (typeof query !== "string" || query.length === 0 || query.length > 256 || /[\u0000-\u001f\u007f]/u.test(query)) {
       throw new Error("Search query must be a bounded non-empty text string");
     }
     const matches: SearchMatch[] = [];
     for (const relativePath of await listFiles()) {
-      const file = await readChecked(relativePath);
+      let file: RepositoryFile;
+      try { file = await readChecked(relativePath); }
+      catch (error) {
+        // Only content-format/size failures are skippable. Unsafe paths, links,
+        // special files, and I/O errors must still fail the entire search.
+        if (!(error instanceof UnsearchableRepositoryFileError)) throw error;
+        onSkippedFile?.(relativePath, error.reason);
+        continue;
+      }
       const lines = file.text.split(/\r?\n/u);
       for (let index = 0; index < lines.length; index++) {
         const line = lines[index]!;

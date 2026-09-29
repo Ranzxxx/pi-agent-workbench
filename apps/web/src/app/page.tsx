@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { CapabilityInfo, Conversation, ConversationSummary, WorkbenchEvent, WorkbenchRun, WorkbenchStreamReset } from "@pi-workbench/protocol";
+import { RunArtifacts } from "./run-artifacts";
 
 const API = "/api/v1";
 const SUGGESTIONS = ["帮我制定一个清晰的实施计划", "解释一下 Agent 是如何工作的", "把这个想法拆解成可执行的步骤"];
@@ -60,6 +61,8 @@ export default function HomePage() {
   const [showPicker, setShowPicker] = useState(false);
   const [pickerQuery, setPickerQuery] = useState("");
   const [activeRun, setActiveRun] = useState<WorkbenchRun | null>(null);
+  const [runs, setRuns] = useState<WorkbenchRun[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [events, setEvents] = useState<WorkbenchEvent[]>([]);
   const [draftReply, setDraftReply] = useState("");
   const [notice, setNotice] = useState("");
@@ -69,6 +72,9 @@ export default function HomePage() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const selectedConversationIdRef = useRef<string | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
+  const navigationTokenRef = useRef(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const busy = activeRun !== null && ["queued", "running", "cancelling"].includes(activeRun.status);
 
@@ -77,41 +83,70 @@ export default function HomePage() {
     setConversations(result.conversations);
   }, []);
   const loadConversation = useCallback(async (id: string) => {
+    const token = ++navigationTokenRef.current;
+    eventSourceRef.current?.close();
+    eventSourceRef.current = null;
+    activeRunIdRef.current = null;
+    selectedConversationIdRef.current = id;
+    setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
     const [loaded, runResult] = await Promise.all([
       api<Conversation>(`/conversations/${encodeURIComponent(id)}`),
       api<{ runs: WorkbenchRun[] }>(`/conversations/${encodeURIComponent(id)}/runs`),
     ]);
+    if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== id) return;
     localStorage.setItem("pi-workbench-conversation", id);
     setConversation(loaded);
+    setRuns(runResult.runs);
     const latestRun = runResult.runs[0];
-    if (latestRun) { setActiveRun(latestRun); setEvents([]); setDraftReply(""); connectEvents(latestRun.runId); }
-    else { setActiveRun(null); setEvents([]); setDraftReply(""); }
+    setSelectedRunId(latestRun?.runId ?? null);
+    setActiveRun(latestRun ?? null); setEvents([]); setDraftReply("");
+    if (latestRun) connectEvents(latestRun.runId);
   }, []);
   const connectEvents = useCallback((runId: string, afterEventId?: string) => {
     eventSourceRef.current?.close();
+    activeRunIdRef.current = runId;
+    const conversationId = selectedConversationIdRef.current;
+    const token = navigationTokenRef.current;
     const cursor = afterEventId ? `?after=${encodeURIComponent(afterEventId)}` : "";
     const source = new EventSource(`${API}/runs/${encodeURIComponent(runId)}/events${cursor}`);
     eventSourceRef.current = source;
-    source.onerror = () => setNotice("事件连接暂时中断，浏览器正在自动重连；运行仍在服务端继续。可点击“重新连接”立即恢复。" );
+    const isCurrent = () => eventSourceRef.current === source && activeRunIdRef.current === runId &&
+      selectedConversationIdRef.current === conversationId && navigationTokenRef.current === token;
+    source.onerror = () => { if (isCurrent()) setNotice("事件连接暂时中断，浏览器正在自动重连；运行仍在服务端继续。可点击“重新连接”立即恢复。"); };
     for (const type of EVENT_TYPES) source.addEventListener(type, (message) => {
+      if (!isCurrent()) return;
       try {
         const payload = JSON.parse((message as MessageEvent<string>).data) as WorkbenchEvent | WorkbenchStreamReset;
         if ("type" in payload && payload.type === "stream.reset") {
           source.close();
           void api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}`).then((snapshot) => {
+            if (!isCurrent()) return;
             setActiveRun(snapshot);
+            setRuns((current) => current.map((item) => item.runId === runId ? snapshot : item));
             if (["queued", "running", "cancelling"].includes(snapshot.status)) connectEvents(runId, payload.data.latestEventId);
-          });
+            else {
+              eventSourceRef.current = null;
+              void refreshSidebar();
+              if (conversationId) void api<Conversation>(`/conversations/${encodeURIComponent(conversationId)}`).then((loaded) => {
+                if (selectedConversationIdRef.current === conversationId && navigationTokenRef.current === token) setConversation(loaded);
+              }).catch(() => setNotice("对话刷新失败，请重新选择该对话。"));
+            }
+          }).catch(() => { if (isCurrent()) setNotice("运行状态恢复失败，请重新连接。"); });
           return;
         }
         const event = payload as WorkbenchEvent;
+        if (event.runId !== runId || event.conversationId !== conversationId) return;
         setEvents((current) => current.some((item) => item.eventId === event.eventId) ? current : [...current, event].slice(-256));
         if (event.type === "message.delta") setDraftReply((current) => current + event.data.text);
         if (event.type === "run.finished") {
           setActiveRun((current) => current?.runId === runId ? { ...current, status: event.data.status, result: event.data } : current);
+          setRuns((current) => current.map((item) => item.runId === runId ? { ...item, status: event.data.status, result: event.data } : item));
           source.close();
+          eventSourceRef.current = null;
           void refreshSidebar();
-          void api<Conversation>(`/conversations/${encodeURIComponent(event.conversationId)}`).then(setConversation);
+          void api<Conversation>(`/conversations/${encodeURIComponent(event.conversationId)}`).then((loaded) => {
+            if (selectedConversationIdRef.current === event.conversationId && navigationTokenRef.current === token && activeRunIdRef.current === runId) setConversation(loaded);
+          }).catch(() => { if (selectedConversationIdRef.current === conversationId) setNotice("对话刷新失败，请重新选择该对话。"); });
         }
         setNotice("");
       } catch { setNotice("收到无法识别的事件；正在保留当前对话状态。"); }
@@ -133,14 +168,21 @@ export default function HomePage() {
       } catch (error) { if (!ignore) setNotice(error instanceof Error ? error.message : "无法连接本地工作台服务。"); }
       finally { if (!ignore) setLoading(false); }
     })();
-    return () => { ignore = true; eventSourceRef.current?.close(); };
+    return () => { ignore = true; navigationTokenRef.current++; eventSourceRef.current?.close(); eventSourceRef.current = null; };
   }, [loadConversation]);
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [conversation?.messages.length, events.length, draftReply]);
 
   async function createConversation() {
+    const token = ++navigationTokenRef.current;
     eventSourceRef.current?.close();
+    eventSourceRef.current = null;
+    activeRunIdRef.current = null;
+    selectedConversationIdRef.current = null;
+    setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
     const created = await api<Conversation>("/conversations", { method: "POST", body: "{}" });
-    setConversation(created); setActiveRun(null); setEvents([]); setDraftReply("");
+    if (token !== navigationTokenRef.current) return;
+    selectedConversationIdRef.current = created.conversationId;
+    setConversation(created); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
     localStorage.setItem("pi-workbench-conversation", created.conversationId);
     await refreshSidebar();
     textareaRef.current?.focus();
@@ -158,6 +200,8 @@ export default function HomePage() {
   function clearCapability() { setSelectedCapability(null); setCapabilityValues({}); }
   async function submit() {
     if (!conversation || busy) return;
+    const conversationId = conversation.conversationId;
+    const token = navigationTokenRef.current;
     const trimmed = text.trim();
     let capabilityInput: Record<string, string> | undefined;
     if (selectedCapability) {
@@ -185,10 +229,13 @@ export default function HomePage() {
       input: capabilityInput,
     } : { kind: "message", text: trimmed };
     try {
-      const created = await api<WorkbenchRun>(`/conversations/${encodeURIComponent(conversation.conversationId)}/runs`, {
+      const created = await api<WorkbenchRun>(`/conversations/${encodeURIComponent(conversationId)}/runs`, {
         method: "POST", headers: { "Idempotency-Key": key() }, body: JSON.stringify({ schemaVersion: 1, input }),
       });
+      if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== conversationId) return;
       setActiveRun(created);
+      setRuns((current) => [created, ...current].slice(0, 32));
+      setSelectedRunId(created.runId);
       setText("");
       clearCapability();
       await refreshSidebar();
@@ -210,16 +257,22 @@ export default function HomePage() {
     }
     catch (error) { setNotice(error instanceof Error ? error.message : "取消请求失败。"); }
   }
-  async function retry() {
-    if (!activeRun || busy) return;
+  async function retry(runId: string) {
+    if (busy) return;
+    const conversationId = selectedConversationIdRef.current;
+    const token = navigationTokenRef.current;
     try {
-      const next = await api<WorkbenchRun>(`/runs/${encodeURIComponent(activeRun.runId)}/retry`, { method: "POST", headers: { "Idempotency-Key": key() }, body: "{}" });
-      setActiveRun(next); setEvents([]); setDraftReply(""); connectEvents(next.runId);
+      const next = await api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: { "Idempotency-Key": key() }, body: "{}" });
+      if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== conversationId) return;
+      setActiveRun(next); setRuns((current) => [next, ...current].slice(0, 32)); setSelectedRunId(next.runId);
+      setEvents([]); setDraftReply(""); connectEvents(next.runId);
     } catch (error) { setNotice(error instanceof Error ? error.message : "重试失败。"); }
   }
   const filteredCapabilities = capabilities.filter((capability) => `${capability.name} ${capability.id}`.toLowerCase().includes(pickerQuery.toLowerCase()));
-  const isWelcome = !conversation?.messages.length;
-  const result = activeRun?.result;
+  const isWelcome = !conversation?.messages.length && !activeRun;
+  const selectedRun = selectedRunId === activeRun?.runId ? activeRun : runs.find((run) => run.runId === selectedRunId) ?? activeRun;
+  const selectedIsActive = selectedRun?.runId === activeRun?.runId;
+  const result = selectedRun?.result;
 
   return <div className={`workbench-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
     <aside className={`sidebar ${mobileOpen ? "mobile-open" : ""}`}>
@@ -244,13 +297,14 @@ export default function HomePage() {
         {loading ? <div className="loading-state"><span className="loader" /> 正在打开工作台</div> : <>
           {isWelcome ? <section className="welcome-block"><div className="welcome-mark"><Icon name="spark" /></div><h1>你好，今天想解决什么问题？</h1><p>直接描述你的目标，PI Workbench 会通过对话协助你。<br className="wide-break" />需要读取公开仓库时，可以在输入框中用 <kbd>@</kbd> 显式选择“仓库分析”。</p></section> : <section className="transcript" aria-label="对话记录">
             {conversation?.messages.map((message) => <article key={message.id} className={`message-row ${message.role === "assistant" ? "assistant" : "user"}`}><div className="message-avatar">{message.role === "assistant" ? <span>PI</span> : "你"}</div><div className="message-body"><div className="message-role">{message.role === "assistant" ? "PI Workbench" : message.role === "capability" ? "能力调用" : "你"}</div><div className="message-text">{message.text}</div>{message.role === "capability" && <div className="capability-chip">@{capabilities.find((cap) => cap.id === message.capabilityId)?.name ?? "能力"}</div>}</div></article>)}
-            {busy && <article className="message-row assistant"><div className="message-avatar"><span>PI</span></div><div className="message-body"><div className="message-role">PI Workbench</div>{draftReply ? <div className="message-text">{draftReply}</div> : <div className="thinking"><span /><span /><span /> 正在处理你的请求</div>}</div></article>}
-            {activeRun && <div className="run-card"><div className="run-card-head"><div><span className={`run-state ${activeRun.status}`}>{activeRun.status === "running" ? "运行中" : activeRun.status === "cancelling" ? "正在取消" : activeRun.status === "completed" ? "已完成" : activeRun.status === "failed" ? "失败" : activeRun.status === "cancelled" ? "已取消" : "等待中"}</span><span className="run-id">运行 {activeRun.runId.slice(0, 8)}</span></div><div className="run-actions">{busy && <button className="quiet-button" onClick={() => void cancel()}>取消</button>}{!busy && activeRun.status !== "completed" && <button className="quiet-button" onClick={() => void retry()}>重试</button>}<button className="quiet-button" onClick={() => activeRun && connectEvents(activeRun.runId)}>重新连接</button></div></div>
-              <div className="event-list">{events.filter((event) => event.type !== "message.delta").slice(-10).map((event) => <div className="event-item" key={event.eventId}><span className={`event-dot ${event.type}`} /><span>{eventLabel(event)}</span></div>)}</div>
+            {busy && selectedIsActive && <article className="message-row assistant"><div className="message-avatar"><span>PI</span></div><div className="message-body"><div className="message-role">PI Workbench</div>{draftReply ? <div className="message-text">{draftReply}</div> : <div className="thinking"><span /><span /><span /> 正在处理你的请求</div>}</div></article>}
+            {runs.length > 0 && <div className="run-history" aria-label="运行记录"><span>运行记录</span>{runs.map((run) => <button key={run.runId} className={`run-history-item ${selectedRun?.runId === run.runId ? "current" : ""}`} onClick={() => setSelectedRunId(run.runId)} aria-pressed={selectedRun?.runId === run.runId}>{run.input.kind === "capability" ? "能力" : "对话"} · {run.runId.slice(0, 8)} · {run.status === "completed" ? "完成" : run.status === "cancelled" ? "取消" : run.status === "failed" ? "失败" : "执行中"}</button>)}</div>}
+            {selectedRun && <div className="run-card"><div className="run-card-head"><div><span className={`run-state ${selectedRun.status}`}>{selectedRun.status === "running" ? "运行中" : selectedRun.status === "cancelling" ? "正在取消" : selectedRun.status === "completed" ? "已完成" : selectedRun.status === "failed" ? "失败" : selectedRun.status === "cancelled" ? "已取消" : "等待中"}</span><span className="run-id">运行 {selectedRun.runId.slice(0, 8)}</span></div><div className="run-actions">{selectedIsActive && busy && <button className="quiet-button" onClick={() => void cancel()}>取消</button>}{!busy && selectedRun.status !== "completed" && <button className="quiet-button" onClick={() => void retry(selectedRun.runId)}>重试</button>}{selectedIsActive && <button className="quiet-button" onClick={() => connectEvents(selectedRun.runId)}>重新连接</button>}</div></div>
+              {selectedIsActive && <div className="event-list">{events.filter((event) => event.type !== "message.delta").slice(-10).map((event) => <div className="event-item" key={event.eventId}><span className={`event-dot ${event.type}`} /><span>{eventLabel(event)}</span></div>)}</div>}
               {!busy && result?.status === "failed" && <p className="result-error">{result.error.message}</p>}
               {!busy && result?.status === "cancelled" && <p className="result-note">运行已取消。未把部分执行结果加入 Agent 上下文。</p>}
-              {result?.status === "completed" && result.capabilityResult && <section className="report-card"><div className="report-heading"><div><span className="eyebrow">能力结果</span><h3>{result.capabilityResult.title}</h3></div></div><p>{result.capabilityResult.summary}</p><div className="claim-list">{result.capabilityResult.claims.map((claim) => <article className="claim" key={claim.id}><span className={`claim-kind ${claim.kind}`}>{claim.kind === "fact" ? "事实" : claim.kind === "inference" ? "推断" : "未知"}</span><p>{claim.text}</p>{claim.evidence.map((evidence, index) => <div className="evidence-ref" key={`${evidence.path}-${index}`}>{evidence.path}:{evidence.startLine}-{evidence.endLine}</div>)}</article>)}</div>
-                  <div className="artifact-list">{result.artifacts?.map((artifact) => <a className="artifact-link" key={artifact.kind} href={`${API}/runs/${encodeURIComponent(activeRun.runId)}/artifacts/${encodeURIComponent(artifact.kind)}`} target="_blank" rel="noreferrer">查看产物 · {artifact.kind}</a>)}</div></section>}
+              {result?.status === "completed" && result.capabilityResult && <section className="report-card"><div className="report-heading"><div><span className="eyebrow">能力结果</span><h3>{result.capabilityResult.title}</h3></div></div><p>{result.capabilityResult.summary}</p><div className="claim-list">{result.capabilityResult.claims.map((claim) => <article className="claim" key={claim.id}><span className={`claim-kind ${claim.kind}`}>{claim.kind === "fact" ? "事实" : claim.kind === "inference" ? "推断" : "未知"}</span><p>{claim.text}</p>{claim.evidence.map((evidence, index) => <div className="evidence-ref" key={`${evidence.path}-${index}`}>{evidence.path}:{evidence.startLine}-{evidence.endLine}</div>)}</article>)}</div></section>}
+              <RunArtifacts run={selectedRun} />
             </div>}
             <div ref={messagesEndRef} />
           </section>}

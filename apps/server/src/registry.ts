@@ -1,4 +1,4 @@
-import { parse, RepositoryAnalysisInputSchema, type CapabilityInfo, type RepositoryAnalysisInput } from "@pi-workbench/protocol";
+import { parse, RepositoryAnalysisInputSchema, type CancelReason, type CapabilityInfo, type RepositoryAnalysisInput } from "@pi-workbench/protocol";
 import type { PublicAnalysisSummary } from "@pi-workbench/reporting";
 
 export const publicRepositoryCapability: CapabilityInfo = {
@@ -14,7 +14,11 @@ export const publicRepositoryCapability: CapabilityInfo = {
 
 export interface RepositoryAnalysisContext {
   signal: AbortSignal;
-  onEvent: (event: { type: "tool.started" | "tool.finished"; toolCallId: string; toolName: string; isError?: boolean }) => void;
+  onEvent: (event:
+    | { type: "tool.started" | "tool.finished"; toolCallId: string; toolName: string; isError?: boolean }
+    | { type: "run.cancelling"; reason: CancelReason }
+    | { type: "run.warning"; code: "cancellation_pending" }
+  ) => void;
 }
 
 export type RepositoryAnalysisOutput = PublicAnalysisSummary;

@@ -46,6 +46,9 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
   app.get<{ Params: { runId: string; kind: string }; Querystring: { after?: string } }>("/api/v1/runs/:runId/events", async (request, reply) => {
     const rawCursor = request.headers["last-event-id"];
     const cursor = (Array.isArray(rawCursor) ? rawCursor[0] : rawCursor) || request.query.after;
+    // Validate before taking ownership of the raw response. An unknown run
+    // must use the versioned 404 envelope instead of leaving an open 200 SSE.
+    service.getRun(request.params.runId);
     reply.hijack();
     const raw = reply.raw;
     raw.writeHead(200, {
