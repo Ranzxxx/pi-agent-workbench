@@ -2,7 +2,7 @@
 
 ## 元数据
 
-- 状态：`review`（实现和本地离线验证完成，尚未提交、独立审查或集成）
+- 状态：`review`（实现、本地离线验证、提交和 GitHub 分支推送已完成，待 PR 审查与集成）
 - 负责人：Codex（本任务独占写入者）
 - 分支或 worktree：`task/007-v01-review-fixes`，工作区 `/home/lzs/Projects/pi`
 - 基线提交：Review 基线 `7aebe6c9ca9751c5450340ef6d4870fc45aed64f`（当前 `main`）；功能实现基线 `a726c26 → 1f031d9`
@@ -141,7 +141,7 @@
 - [x] 7 个 workspace 的 TypeScript 检查、16 个测试文件和 Web 生产构建通过；`git diff --check` 通过。固定工具链命令未运行，见下文限制。
 - [ ] 浏览器完整交互验收：已验证旧报告选择/刷新、A→空白 B 的迟到 finished、A→已有历史 C 的迟到 finished、普通运行快速切换后的无污染、失败运行卡、取消运行卡、390px 宽度及导航；由于 fake provider 没有可控的“带部分产物的 failed/cancelled”浏览器 fixture，部分产物入口由 React SSR 和服务端回归覆盖；迟到 `stream.reset` 仍未在真实页面稳定制造，迟到 delta 仅完成快速切换冒烟，未宣称完整通过。
 - [x] 没有修改 `packages/protocol`、新增依赖、密钥或真实运行产物；改动保持原只读能力白名单和资源边界。
-- [x] 实现结束进入 `review`；独立审查、提交与集成尚未发生，不标 `done`。
+- [x] 实现结束进入 `review`；提交和 GitHub 分支推送已完成，待 PR 审查与集成，不标 `done`。
 
 ## 验证命令与证据
 
@@ -175,11 +175,11 @@ git diff --check
 
 ## 交接
 
-- 当前状态：`review`，实现和本地离线检查完成，尚未独立审查/提交/集成。
+- 当前状态：`review`，实现、本地离线检查、提交和 GitHub 分支推送完成，待 PR 审查/集成。
 - 完成内容：9 项修复及 README 同步；成功归档终态的非循环哈希布局已记录。
 - 修改路径：`README.md`、`apps/server/src/{app,registry,service}.ts`、`apps/server/tests/workbench.test.ts`、`apps/web/src/app/{page,globals,run-artifacts}`、`apps/web/tests/run-artifacts.test.tsx`、`packages/agent-runtime/src/index.ts`、`packages/reporting/src/public-runner.ts` 及其测试、`packages/tools/src/read-only-repository.ts` 及其测试、本任务卡和索引。`doc/plan.md` 为任务开始前已有改动，本轮没有把它当作本次代码修复。
 - 实际验证：见“验证命令与证据”；7/7 类型检查、16/16 测试文件、Web build 和部分浏览器场景通过。
 - 风险与未验证：固定 Node24.21/npm11.9 复核、浏览器 failed/cancelled 与全部迟到事件变体、真实 socket 断线、在线模型未验证；归档终态为报告引用子集而非完整四产物结果。
-- 提交 SHA / PR：无；没有提交、推送或合并。
+- 提交 SHA / PR：`ec72532a35847c89d0e3c777a532db1fd8432368`（`fix(TASK-007): close v0.1 review gaps`），已推送到 `origin/task/007-v01-review-fixes`；PR 尚未创建，未合并。
 - 已停止写入：是；待独立审查与固定工具链复核。
 - 下一位 Agent 第一个动作：在本分支复核 `git status` 和任务起点已有的文档差异，独立检查 9 项修复及归档终态语义，尽可能用固定工具链重跑，并逐项处理审查问题。
