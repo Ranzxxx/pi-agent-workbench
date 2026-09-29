@@ -19,9 +19,9 @@ backlog（待开始）→ in_progress（实施）→ review（待验收/集成�
 | [TASK-005 公开仓库快照与单 Agent 分析](005-public-repository.md) | done | Codex | PR #9/#11/#12 已合并，CI #24/#30/#33 通过；DeepSeek Flash 固定样本在线质量门与人工评分通过 |
 | [TASK-006 API、SSE 与通用 Agent 工作台基础界面](006-web-workbench.md) | done | 主 Agent | PR #14 已合并至 main；GitHub Actions #39 成功；本地 main 已快进同步。仍保留真实 socket 断线重连未端到端模拟等限制 |
 | [TASK-007 v0.1 Review 问题修复与回归验收](007-v01-review-fixes.md) | done | Codex | PR #17 已 squash 合并至 `main`（`cede3fd`）；浏览器完整交互和固定工具链仍有任务卡记录的后补验证项 |
-| [TASK-008 v0.1 收尾与聚焦验证](008-v01-closeout.md) | review | Codex 主 Agent | Node 24.21/npm 11.9 下 7 个 workspace 类型检查、80 项测试、Web 构建和差异检查通过 |
+| [TASK-008 v0.1 收尾与聚焦验证](008-v01-closeout.md) | done | Codex 主 Agent | PR #18 已 squash 合并至 `main`（`f31681b`）；GitHub Actions Offline checks #53 全部通过 |
 
-TASK-007 已完成 v0.1 Review 问题修复并集成；TASK-008 已完成收尾状态同步和固定工具链下的聚焦本地检查，当前进入 review，不代表已决定 TASK-009 或后续产品功能。TASK-005 的在线质量结果来自一个固定样本，不构成跨仓库泛化保证。真实 socket 断线重连和真实在线运行完整元数据仍是已有验证限制；本任务没有把这些限制误记为通过。详细修复与回归记录见 [TASK-007 任务卡](007-v01-review-fixes.md)，本轮收尾范围见 [TASK-008 任务卡](008-v01-closeout.md)。
+TASK-007 已完成 v0.1 Review 问题修复并集成；TASK-008 的 v0.1 收尾和聚焦检查已完成并经 PR #18 集成。当前没有预先决定 TASK-009 或后续产品功能。TASK-005 的在线质量结果来自一个固定样本，不构成跨仓库泛化保证。真实 socket 断线重连和真实在线运行完整元数据仍是已有验证限制；本任务没有把这些限制误记为通过。详细修复与回归记录见 [TASK-007 任务卡](007-v01-review-fixes.md)，本轮收尾范围见 [TASK-008 任务卡](008-v01-closeout.md)。
 
 ## 创建与交接
 

@@ -2,12 +2,15 @@
 
 ## 元数据
 
-- 状态：`review`
+- 状态：`done`
 - 负责人：Codex 主 Agent
-- 分支或 worktree：`codex/task-008-v01-closeout`，`/home/lzs/Projects/pi`
+- 实施分支：`codex/task-008-v01-closeout`；合并状态同步分支：`codex/task-008-integration-record`；`/home/lzs/Projects/pi`
 - 基线提交：`0c6d3ff86645cfe70be8cf96144158ecfe30cecb`
 - 依赖任务：TASK-007（已完成并合并）
 - 提交/推送授权：用户于 2026-09-29 明确授权本地提交、推送、创建 PR 并合并。
+- 实施提交：`b4c27f8990ea319c5e40d09407713c6de709db6e`
+- 集成记录：PR #18 squash 合并；合并提交 `f31681bb29f23c68a46bda29fad97b04f88ae190`
+- GitHub Actions：Offline checks #53 全部通过（[运行记录](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36571628811)）
 - 在线模型授权：无；本任务只运行离线检查
 
 ## 背景与目标
@@ -16,7 +19,7 @@
 
 ## 范围与非目标
 
-- 校正 `doc/plan.md`、本任务卡与任务索引的状态：TASK-007 已完成，TASK-008 收尾完成并进入 review。
+- 校正 `doc/plan.md`、本任务卡与任务索引的状态：TASK-007 已完成，TASK-008 收尾完成并经 review、集成后标记 done。
 - 运行已有 workspace 类型检查、测试、Web 构建和差异格式检查，记录实际工具链版本与命令结果。
 - 如固定 Node.js 24.21.0/npm 11.9.0 不可用，可用当前可用版本进行聚焦检查，但必须明确记录版本差异，不称为固定工具链验证。
 - 不新增产品功能，不做真实 socket 断线重连的完整浏览器验收，不发起真实 GitHub/模型请求，不进行付费在线评测。
@@ -74,11 +77,13 @@ git diff --check
 
 ## 交接
 
-- 当前状态：`review`；聚焦检查及状态同步已完成，等待审查和集成。
+- 当前状态：`done`；聚焦检查、审查和集成都已完成。
 - 完成内容：TASK-007 状态校正；TASK-008 计划与索引同步；7 个 workspace 类型检查通过，80 项测试通过，Web 生产构建和 `git diff --check` 通过。
 - 修改路径：`doc/tasks/008-v01-closeout.md`、`doc/tasks/README.md`、`doc/plan.md`。
 - 实际验证：见“验证命令与证据”。
 - 风险与未验证：真实 socket 断线 E2E、额外在线评测不属于本任务且仍未验证。
-- 提交 SHA / PR：待创建；用户已授权本地提交、推送、创建 PR 并合并。
-- 已停止写入：是；本轮差异已整理，等待 review 与集成。
-- 下一位 Agent 第一个动作：复核本任务的工作区差异和状态同步；若无问题，按集成负责人安排集成。固定工具链已通过，不要把本任务外未执行的 socket/在线验证描述为通过。
+- 实施提交 / PR：`b4c27f8990ea319c5e40d09407713c6de709db6e` / [PR #18](https://github.com/Ranzxxx/pi-agent-workbench/pull/18)。
+- 集成提交：`f31681bb29f23c68a46bda29fad97b04f88ae190`；GitHub Actions Offline checks #53 通过。
+- 状态同步分支：`codex/task-008-integration-record`；其提交与 PR 在本卡更新合并后补记。
+- 已停止写入：是；实施已合并，任务最终状态和证据已同步。
+- 下一步：根据使用反馈与已记录的限制决定是否需要新的、有明确范围的任务；不预设 TASK-009。
