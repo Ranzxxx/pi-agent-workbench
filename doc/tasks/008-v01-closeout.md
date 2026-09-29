@@ -84,6 +84,6 @@ git diff --check
 - 风险与未验证：真实 socket 断线 E2E、额外在线评测不属于本任务且仍未验证。
 - 实施提交 / PR：`b4c27f8990ea319c5e40d09407713c6de709db6e` / [PR #18](https://github.com/Ranzxxx/pi-agent-workbench/pull/18)。
 - 集成提交：`f31681bb29f23c68a46bda29fad97b04f88ae190`；GitHub Actions Offline checks #53 通过。
-- 状态同步分支：`codex/task-008-integration-record`；其提交与 PR 在本卡更新合并后补记。
+- 状态同步分支 / PR：`codex/task-008-integration-record` / [PR #19](https://github.com/Ranzxxx/pi-agent-workbench/pull/19)。
 - 已停止写入：是；实施已合并，任务最终状态和证据已同步。
 - 下一步：根据使用反馈与已记录的限制决定是否需要新的、有明确范围的任务；不预设 TASK-009。
