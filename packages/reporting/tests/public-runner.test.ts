@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -92,6 +93,23 @@ test("runs pinned public snapshot through faux PI provider and publishes evidenc
     assert.equal(manifest.status, "completed");
     assert.equal(manifest.snapshotId, sha);
     assert.equal(manifest.artifacts.length, 3);
+    const archived = (await readFile(path.join(result.directory!, "events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => parseEvent(JSON.parse(line)));
+    const archivedFinish = archived.at(-1);
+    assert.ok(archivedFinish?.type === "run.finished" && archivedFinish.data.status === "completed");
+    assert.equal(archived.filter((event) => event.type === "run.finished").length, 1);
+    assert.equal(archivedFinish.runId, result.result.runId);
+    assert.equal(archivedFinish.attemptId, result.result.attemptId);
+    assert.equal(archivedFinish.data.usage.modelCalls, result.result.usage.modelCalls);
+    assert.equal(archivedFinish.data.endedAt, manifest.endedAt);
+    assert.ok(Date.parse(result.result.endedAt) >= Date.parse(archivedFinish.data.endedAt));
+    assert.deepEqual(archivedFinish.data.artifacts.map((artifact) => artifact.kind).sort(), ["report.json", "report.md"]);
+    for (const archivedRef of archivedFinish.data.artifacts) {
+      assert.equal(archivedRef.sha256, result.artifacts.find((item) => item.kind === archivedRef.kind)?.sha256);
+    }
+    for (const item of manifest.artifacts) {
+      const bytes: Buffer = await readFile(path.join(result.directory!, item.path));
+      assert.equal(createHash("sha256").update(bytes).digest("hex"), item.sha256);
+    }
     assert.equal(events[0]?.type, "run.started");
     assert.ok(events.some((event) => event.type === "tool.started" && event.data.toolName === "register_evidence"));
     for (const event of events) parseEvent(event);
@@ -139,4 +157,57 @@ test("stops before a second faux model call when the model-call budget is exhaus
     assert.ok(terminal?.type === "run.finished" && terminal.data.status === "cancelled" && terminal.data.reason === "call_limit");
     assert.deepEqual(await readdir(path.join(root, "runs")), [result.result.runId]);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("external cancellation reaches the PI analysis session and stops further model calls", { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-task007-abort-"));
+  const archive = fixtureArchive();
+  const fetcher: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/legacy.tar.gz/" + sha)) return response(new Uint8Array(archive), url);
+    return new Response("", { status: 404 });
+  };
+  const faux = fauxProvider({ api: "public-abort-test", provider: "public-abort-test", models: [{ id: "test" }], tokenSize: { min: 8, max: 8 } });
+  let started!: () => void;
+  const modelStarted = new Promise<void>((resolve) => { started = resolve; });
+  faux.setResponses([
+    async (_context, options) => {
+      started();
+      await new Promise<void>((resolve) => {
+        if (options?.signal?.aborted) resolve();
+        else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return fauxAssistantMessage("", { stopReason: "aborted" });
+    },
+    fauxAssistantMessage("This model call must never run"),
+  ]);
+  let modelCalls = 0;
+  const originalStream = faux.provider.streamSimple.bind(faux.provider);
+  const provider: typeof faux.provider = { ...faux.provider, streamSimple(model, context, options) {
+    modelCalls++;
+    return originalStream(model, context, options);
+  } };
+  const controller = new AbortController();
+  try {
+    const pending = runPublicRepositoryAnalysis({
+      repository: { url: "https://github.com/sindresorhus/slugify", ref: sha },
+      cacheDirectory: path.join(root, "cache"), outputDirectory: path.join(root, "runs"),
+      credentials: new InMemoryCredentialStore(), provider, model: faux.getModel(),
+      budget: { timeoutMs: 5000, maxModelCalls: 4, maxToolCalls: 4, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
+      pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      fetch: fetcher, signal: controller.signal,
+    });
+    await modelStarted;
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.status, "cancelled");
+    assert.equal(modelCalls, 1);
+    assert.ok(result.directory);
+    assert.deepEqual(result.artifacts.map((artifact) => artifact.kind).sort(), ["events.jsonl", "manifest.json"]);
+    const log = (await readFile(path.join(result.directory!, "events.jsonl"), "utf8")).trimEnd().split("\n").map((line) => parseEvent(JSON.parse(line)));
+    assert.equal(log.filter((event) => event.type === "run.finished").length, 1);
+    assert.equal(log.at(-1)?.type, "run.finished");
+    const finish = log.at(-1);
+    assert.equal(finish?.type === "run.finished" ? finish.data.status : "", "cancelled");
+  } finally { controller.abort(); await rm(root, { recursive: true, force: true }); }
 });

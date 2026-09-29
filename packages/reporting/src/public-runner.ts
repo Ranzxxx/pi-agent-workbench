@@ -2,9 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Type } from "typebox";
-import { parseArtifacts, parseManifest, parseReport, parseResult, type Artifact, type Budget, type Pricing, type Report, type RunEvent, type RunResult } from "@pi-workbench/protocol";
+import { parseArtifacts, parseEvent, parseManifest, parseReport, parseResult, type Artifact, type Budget, type Pricing, type Report, type RunEvent, type RunResult } from "@pi-workbench/protocol";
 import { createEvidenceRegistry, createReadOnlyRepository, fetchPublicGitHubSnapshot, type PublicRepositoryInput, type SnapshotOptions, type SnapshotInfo } from "@pi-workbench/tools";
-import { createSession, defineTool, type CredentialStore, type Model, type Provider } from "@pi-workbench/agent-runtime";
+import { CancellationPendingError, createSession, defineTool, type CredentialStore, type Model, type Provider } from "@pi-workbench/agent-runtime";
 
 const MAX_REPORT_BYTES = 512 * 1024;
 const MAX_EVENTS = 1024;
@@ -111,8 +111,16 @@ function createTools(repository: ReturnType<typeof createReadOnlyRepository>, ev
     name: "search_text", label: "Search snapshot text", description: "Search bounded UTF-8 text in the fixed SHA snapshot.",
     parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 256 }) }),
     async execute(_id, args) {
-      const matches = await repository.searchText(args.query);
-      return { content: [{ type: "text", text: JSON.stringify(matches) }], details: {} };
+      let skippedCount = 0;
+      const skipped: Array<{ path: string; reason: "binary" | "file_too_large" }> = [];
+      const matches = await repository.searchText(args.query, (filePath, reason) => {
+        skippedCount++;
+        if (skipped.length < 16) skipped.push({ path: filePath, reason });
+      });
+      // Diagnostics are bounded even when a repository has thousands of binary
+      // files. The model can see that a search was partial rather than assuming
+      // it inspected every file.
+      return { content: [{ type: "text", text: JSON.stringify({ matches, skippedCount, skipped }) }], details: {} };
     },
   });
   const registerEvidence = defineTool({
@@ -227,7 +235,7 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
     cwd: snapshot.root, credentials: options.credentials, provider: options.provider, model: options.model,
     systemPrompt: SYSTEM_PROMPT, tools: createTools(repository, evidence), budget: options.budget, pricing: options.pricing,
     onEvent(event) { events.push(event); try { options.onEvent?.(event); } catch { /* Observer callbacks must not affect execution. */ } },
-    finalize: async ({ text, signal }) => {
+    finalize: async ({ text, signal, usage }) => {
       if (signal.aborted) throw new Error("Public analysis cancelled before report validation");
       const started = events[0];
       if (!started || started.type !== "run.started") throw new Error("Public analysis has no run identity");
@@ -245,15 +253,23 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
         if (Buffer.byteLength(json, "utf8") > MAX_REPORT_BYTES || Buffer.byteLength(markdown, "utf8") > MAX_REPORT_BYTES) throw new Error("Public report exceeds the output limit");
         await writeAtomic(stage, "report.json", json);
         await writeAtomic(stage, "report.md", markdown);
-        await writeAtomic(stage, "events.jsonl", eventLog(events));
-        const core = await Promise.all([
-          artifact(stage, runId, "report.json"),
-          artifact(stage, runId, "report.md"),
-          artifact(stage, runId, "events.jsonl"),
-        ]);
+        const reportArtifacts = await Promise.all([artifact(stage, runId, "report.json"), artifact(stage, runId, "report.md")]);
+        const endedAt = new Date().toISOString();
+        // The archived terminal event intentionally references only report files:
+        // including events.jsonl or manifest.json here would make their digests
+        // self-referential. The runtime emits the full run.finished result after
+        // finalize returns; the archive closes at this report publication point.
+        const archivedTerminal = parseEvent({
+          schemaVersion: 1, eventId: randomUUID(), runId, attemptId,
+          sequence: (events.at(-1)?.sequence ?? 0) + 1, timestamp: endedAt,
+          type: "run.finished",
+          data: parseResult({ schemaVersion: 1, runId, attemptId, status: "completed", usage, endedAt, artifacts: reportArtifacts }),
+        });
+        await writeAtomic(stage, "events.jsonl", eventLog([...events, archivedTerminal]));
+        const core = [...reportArtifacts, await artifact(stage, runId, "events.jsonl")];
         const manifest = parseManifest({
           schemaVersion: 1, runId, attemptId, snapshotId: snapshot.sha,
-          status: "completed", startedAt: started.timestamp, endedAt: new Date().toISOString(),
+          status: "completed", startedAt: started.timestamp, endedAt,
           artifacts: core.map(({ kind, path: artifactPath, sha256: digest }) => ({ kind, path: artifactPath.slice(runId.length + 1), sha256: digest })),
         });
         await writeAtomic(stage, "manifest.json", JSON.stringify(manifest, null, 2) + "\n");
@@ -268,10 +284,20 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
       }
     },
   });
+  const abortAnalysis = () => { session.abort("user"); };
+  options.signal?.addEventListener("abort", abortAnalysis, { once: true });
   try {
+    // The snapshot uses the external signal directly; the PI session needs its
+    // own abort bridge after snapshot acquisition has finished.
+    if (options.signal?.aborted) throw new DOMException("Analysis cancelled before starting", "AbortError");
     const result = await session.run({
       repository: { url: snapshot.canonicalUrl, sha: snapshot.sha },
       goal: buildPublicAnalysisGoal(options.questions),
+    }).catch((error: unknown) => {
+      // Pending is not a terminal state. Keep the caller's single-run lock until
+      // the provider/tool really settles, even when it ignores abort.
+      if (error instanceof CancellationPendingError) return session.waitForResult();
+      throw error;
     });
     if (result.status === "completed") {
       if (!stagedDirectory) throw new Error("Completed runtime result has no staged report");
@@ -288,5 +314,7 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
     if (stagedDirectory) await rm(stagedDirectory, { recursive: true, force: true });
     await session.dispose().catch(() => undefined);
     throw error;
+  } finally {
+    options.signal?.removeEventListener("abort", abortAnalysis);
   }
 }

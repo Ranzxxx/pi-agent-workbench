@@ -53,6 +53,25 @@ test("lists, reads, and searches bounded fixture text deterministically", async 
   }
 });
 
+test("search skips binary and oversized files without losing text matches", async () => {
+  const temporary = await temporaryRepository();
+  try {
+    await writeFile(path.join(temporary.root, "image.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0xff]));
+    await writeFile(path.join(temporary.root, "oversized.txt"), "match\n".repeat(100));
+    await writeFile(path.join(temporary.root, "small.txt"), "match on a safe line\n");
+    const repository = createReadOnlyRepository({ root: temporary.root, snapshotId: "synthetic-harborlight-v1", maxFileBytes: 128 });
+    const skipped: Array<{ path: string; reason: string }> = [];
+    const matches = await repository.searchText("match", (filePath, reason) => skipped.push({ path: filePath, reason }));
+    assert.deepEqual(matches, [{ path: "small.txt", line: 1, text: "match on a safe line" }]);
+    assert.ok(skipped.some((item) => item.path === "image.png" && item.reason === "binary"));
+    assert.ok(skipped.some((item) => item.path === "oversized.txt" && item.reason === "file_too_large"));
+    await assert.rejects(repository.readFile("image.png"), /UTF-8/u);
+    await assert.rejects(repository.readFile("oversized.txt"), /read limit/u);
+    await symlink(path.join(temporary.root, "small.txt"), path.join(temporary.root, "linked.txt"));
+    await assert.rejects(repository.searchText("match"), UnsafeRepositoryPathError);
+  } finally { await temporary.cleanup(); }
+});
+
 test("rejects escape paths, directories, final symlinks, and intermediate symlinks", async () => {
   const temporary = await temporaryRepository();
   try {

@@ -9,7 +9,7 @@ import {
 import {
   RunInputSchema, CancelReasonSchema, parse, parseArtifacts, parseEvent, parseResult,
   type Artifact, type Budget, type CancelReason, type Pricing, type RunEvent,
-  type RunInput, type RunResult, type RunState,
+  type RunInput, type RunResult, type RunState, type Usage,
 } from "@pi-workbench/protocol";
 import { BudgetLedger } from "./budget.js";
 import { resources } from "./resources.js";
@@ -39,7 +39,7 @@ export interface RuntimeOptions {
    * 应用层的成功门：先校验报告内容/证据，再发布产物并返回引用。
    * 运行时只校验引用协议；不能仅凭模型 stop 就认定业务完成。
    */
-  finalize: (input: { text: string; signal: AbortSignal }) => Promise<Artifact[]>;
+  finalize: (input: { text: string; signal: AbortSignal; usage: Usage }) => Promise<Artifact[]>;
   onEvent?: (event: RunEvent) => void;
   cancellationGraceMs?: number;
 }
@@ -212,7 +212,7 @@ export async function createSession(options: RuntimeOptions) {
       let artifacts: Artifact[];
       try {
         // finalize 承担应用的报告校验/发布；取消信号让应用避免取消后继续发布。
-        artifacts = parseArtifacts(await options.finalize({ text, signal: finalization.signal }));
+        artifacts = parseArtifacts(await options.finalize({ text, signal: finalization.signal, usage: ledger.snapshot() }));
       } catch {
         if (cancelReason) return finish({ status: "cancelled", reason: cancelReason });
         return failure("invalid_result", "Application result validation failed");

@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore } from "@pi-workbench/agent-runtime";
 import { createWorkbenchApp } from "../src/app.js";
 import { createFakeChatConfiguration, type ModelConfiguration } from "../src/model-config.js";
 import type { WorkbenchRun } from "@pi-workbench/protocol";
@@ -46,6 +48,63 @@ await test("Fastify parser errors use the versioned API error envelope", async (
   assert.equal(response.statusCode, 400);
   assert.deepEqual(Object.keys(response.json()).sort(), ["error", "schemaVersion"]);
   assert.equal(response.json<{ error: { code: string } }>().error.code, "invalid_request");
+});
+
+await test("unknown run SSE returns a versioned 404 before opening the stream", { timeout: 3000 }, async (t) => {
+  const app = await createWorkbenchApp({ mode: "fake" });
+  t.after(async () => { await app.close(); });
+  const response = await app.inject({ method: "GET", url: "/api/v1/runs/nonexistent/events" });
+  assert.equal(response.statusCode, 404);
+  assert.equal(response.json<{ schemaVersion: number; error: { code: string } }>().schemaVersion, 1);
+  assert.equal(response.json<{ error: { code: string } }>().error.code, "not_found");
+  assert.doesNotMatch(response.headers["content-type"] ?? "", /text\/event-stream/u);
+});
+
+await test("multibyte prompts exceeding runtime bytes are rejected before a run is created", async (t) => {
+  const app = await createWorkbenchApp({ mode: "fake" });
+  t.after(async () => { await app.close(); });
+  const conversationId = await createConversation(app);
+  const rejected = await submit(app, conversationId, { kind: "message", text: "汉".repeat(10_923) });
+  assert.equal(rejected.statusCode, 400);
+  assert.equal(rejected.json<{ error: { code: string } }>().error.code, "invalid_request");
+  const history = await app.inject({ method: "GET", url: `/api/v1/conversations/${conversationId}/runs` });
+  assert.deepEqual(history.json<{ runs: unknown[] }>().runs, []);
+  const accepted = await submit(app, conversationId, { kind: "message", text: "汉".repeat(10_922) });
+  assert.equal(accepted.statusCode, 202);
+  assert.equal((await waitForRun(app, accepted.json<WorkbenchRun>().runId)).status, "completed");
+});
+
+await test("large valid Chinese capability reports are summarized within the PI context byte budget", async (t) => {
+  const root = await temporaryRoot();
+  const fake = fauxProvider({ api: "large-context-test", provider: "large-context-test", models: [{ id: "test" }], tokenSize: { min: 8, max: 8 } });
+  fake.setResponses([fauxAssistantMessage(JSON.stringify({
+    title: "中文仓库分析",
+    claims: Array.from({ length: 32 }, (_, index) => ({
+      id: `unknown-${index}`, kind: "unknown", text: `待确认-${index}：` + "这是一个有效但较长的中文结论。".repeat(60),
+      evidenceIds: [], reason: "当前快照中没有直接证据。",
+    })),
+  }))]);
+  const app = await createWorkbenchApp({
+    mode: "fake", dataDirectory: root,
+    createAnalysisConfiguration: async () => ({
+      credentials: new InMemoryCredentialStore(), provider: fake.provider, model: fake.getModel(),
+      budget: { timeoutMs: 5000, maxModelCalls: 4, maxToolCalls: 4, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
+      pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    }),
+  });
+  t.after(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
+  const conversationId = await createConversation(app);
+  const response = await submit(app, conversationId, {
+    kind: "capability", capabilityId: "public_repository_analysis",
+    input: { repositoryUrl: "https://github.com/demo/harborlight", goal: "给出未知项。" },
+  });
+  assert.equal(response.statusCode, 202);
+  const run = await waitForRun(app, response.json<WorkbenchRun>().runId);
+  assert.equal(run.status, "completed");
+  assert.equal(run.result?.status === "completed" ? run.result.capabilityResult?.claims.length : 0, 32);
+  const followUp = await submit(app, conversationId, { kind: "message", text: "继续讨论这个报告" });
+  assert.equal(followUp.statusCode, 202);
+  assert.equal((await waitForRun(app, followUp.json<WorkbenchRun>().runId)).status, "completed");
 });
 
 await test("versioned API runs ordinary multi-turn prompts; idempotency and run IDs are stable", async (t) => {
@@ -138,6 +197,56 @@ await test("global concurrency, cancellation, retry association, and unknown cap
   const unsupported = await submit(app, secondConversation, { kind: "capability", capabilityId: "not_registered", input: {} });
   assert.equal(unsupported.statusCode, 400);
   assert.equal(unsupported.json<{ error: { code: string } }>().error.code, "unsupported_capability");
+});
+
+await test("analysis cancellation-pending keeps the global run lock until an uncooperative provider exits", { timeout: 10000 }, async (t) => {
+  const root = await temporaryRoot();
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const fake = fauxProvider({ api: "pending-analysis-test", provider: "pending-analysis-test", models: [{ id: "test" }], tokenSize: { min: 8, max: 8 } });
+  fake.setResponses([async () => {
+    entered.resolve();
+    await release.promise; // Deliberately ignores AbortSignal to exercise the grace period.
+    return fauxAssistantMessage("", { stopReason: "aborted" });
+  }]);
+  const app = await createWorkbenchApp({
+    mode: "fake", dataDirectory: root,
+    createAnalysisConfiguration: async () => ({
+      credentials: new InMemoryCredentialStore(), provider: fake.provider, model: fake.getModel(),
+      budget: { timeoutMs: 30, maxModelCalls: 4, maxToolCalls: 4, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
+      pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    }),
+  });
+  t.after(async () => { release.resolve(); await app.close(); await rm(root, { recursive: true, force: true }); });
+  try {
+    const conversationId = await createConversation(app);
+    const response = await submit(app, conversationId, {
+      kind: "capability", capabilityId: "public_repository_analysis",
+      input: { repositoryUrl: "https://github.com/demo/harborlight", goal: "Inspect the fixture." },
+    });
+    assert.equal(response.statusCode, 202);
+    const first = response.json<WorkbenchRun>();
+    await entered.promise;
+    await sleep(1150); // Runtime cancellation grace is currently 1000 ms.
+    const stillRunning = (await app.inject({ method: "GET", url: `/api/v1/runs/${first.runId}` })).json<WorkbenchRun>();
+    assert.equal(stillRunning.status, "cancelling");
+    const blocked = await submit(app, conversationId, { kind: "message", text: "must remain busy" });
+    assert.equal(blocked.statusCode, 409);
+    assert.equal(blocked.json<{ error: { code: string } }>().error.code, "busy");
+    release.resolve();
+    const finished = await waitForRun(app, first.runId);
+    assert.equal(finished.status, "cancelled");
+    assert.deepEqual(finished.result?.artifacts?.map((item) => item.kind).sort(), ["events.jsonl", "manifest.json"]);
+    const partial = await app.inject({ method: "GET", url: `/api/v1/runs/${first.runId}/artifacts/events.jsonl` });
+    assert.equal(partial.statusCode, 200);
+    assert.match(partial.payload, /"type":"run.finished"/u);
+    const events = await app.inject({ method: "GET", url: `/api/v1/runs/${first.runId}/events` });
+    assert.equal((events.payload.match(/event: run\.finished\n/gu) ?? []).length, 1);
+    assert.match(events.payload, /cancellation_pending/u);
+    const next = await submit(app, conversationId, { kind: "message", text: "after provider settled" });
+    assert.equal(next.statusCode, 202);
+    assert.equal((await waitForRun(app, next.json<WorkbenchRun>().runId)).status, "completed");
+  } finally { release.resolve(); }
 });
 
 await test("repeated cancellation is idempotent and run.finished keeps the winning terminal state", async (t) => {
