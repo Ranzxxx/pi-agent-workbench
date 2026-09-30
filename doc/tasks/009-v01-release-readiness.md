@@ -44,7 +44,7 @@
 - [x] 发布前源文件、可达 Git 历史和 GitHub Actions 日志完成密钥/敏感信息模式扫描，并记录局限及结果。
 - [x] MIT 许可证、提交身份和 SDK 来源已检查；代码证据无法确认的所有权事项留给用户确认。
 - [x] 用户要求的类型检查、测试、生产构建、spike 与差异检查均记录真实结果。
-- [ ] README 变更经 PR review 和集成；此任务不切换仓库可见性、不发布 tag/Release。
+- [ ] PR #20 获得 review 并集成；此任务不切换仓库可见性、不发布 tag/Release。
 - [ ] 用户确认自有代码可按 MIT 发布，并决定是否公开现有模型评测运行与成本元数据。
 
 ## 验证命令与证据
@@ -93,6 +93,6 @@ git diff --check
 - 修改路径：`README.md`、`doc/tasks/README.md`、`doc/tasks/009-v01-release-readiness.md`。
 - 实际验证：见“验证命令与证据”；本地各项命令结果均已记录。
 - 风险与未验证：密钥扫描是有限模式扫描；MIT 权利归属、已提交模型评测研究元数据的公开意愿、含本地 `/home/lzs/...` 路径的旧文档/历史是否清理待用户决定；没有检查未公开的本地 `.env` 内容。
-- 提交 SHA / PR：待创建。
+- 提交 SHA / PR：`a9a37e4a457381106aa8704f06b86dc77f8fd6c7`；[PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20)，当前 open、未合并。
 - 已停止写入：是；本轮差异已整理，等待审查和必要的用户确认。
-- 下一步：创建 README 发布准备 PR；等待 PR review 与用户决定是否公开模型评测元数据，并确认 MIT 权利归属。不要在此任务内公开仓库或创建 release。
+- 下一步：等待 PR #20 review 与用户决定是否公开模型评测元数据、旧文档本地路径，并确认 MIT 权利归属。不要在此任务内公开仓库或创建 release。
