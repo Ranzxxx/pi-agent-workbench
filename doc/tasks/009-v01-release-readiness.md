@@ -85,10 +85,11 @@ git diff --check
 - GitHub 仓库当前为 private；打开 PR 前有 19 个远端分支，PR #20 创建后为 20 个，本地远端跟踪引用与 GitHub 分支名一致。最新本地快照有 461 个可达 Git 对象（约 2.41 MB blob 内容）。
 - 自定义模式扫描未发现 GitHub/npm/provider token、私钥标记、JWT、真实凭据赋值或含凭据 URL。扫描器只做有限模式匹配；环境中没有安装 Gitleaks 或 TruffleHog，不能将结果称为对所有秘密的证明。
 - 邮箱模式只匹配到 `packages/tools/tests/public-github-snapshot.test.ts` 中用于拒绝 user-info URL 的合成恶意 URL；没有发现真实邮箱。数字/电话启发式命中来自 SVG 坐标、版本、动作运行号、哈希和费用/Token 测试数据，复核为非电话号码。唯一提交者邮箱使用 GitHub noreply 地址。
-- PR 创建前取得的 59 次 GitHub Actions 运行均为成功，已逐一检查其 job 日志中的令牌、凭据、私钥、JWT、邮箱和凭据 URL 模式，未发现命中。PR checks #61/#63/#65 通过，日志扫描也无上述模式命中。push 触发的 PR 分支日志未能通过当前 GitHub Actions 接口单独取得，故不声称覆盖这些新增日志。CI workflow 不配置真实模型凭据。
+- PR 创建前取得的 59 次 GitHub Actions 运行均为成功，已逐一检查其 job 日志中的令牌、凭据、私钥、JWT、邮箱和凭据 URL 模式，未发现命中。PR checks #61/#63/#65/#67 通过，日志扫描也无上述模式命中。push 触发的 PR 分支日志未能通过当前 GitHub Actions 接口单独取得，故不声称覆盖这些新增日志。CI workflow 不配置真实模型凭据。
 - `doc/internal/`、`.env`、运行 artifacts 和日志不在任何可达 Git 历史路径中；根 `.gitignore` 排除这些本地数据。工作区有一个被忽略且未跟踪的 `.env` 文件；未读取其内容，也不纳入本次发布内容。
 - 已在 9 个当前跟踪文件中定位本机绝对 home 路径，并替换为仓库相对路径或通用工作区描述。当前工作树 `rg` 扫描无此类路径命中。按用户选择不改写历史；旧提交和未更新的既有远端分支仍含这些路径，修改合并后旧提交也继续可达。
-- 根 `LICENSE` 为 MIT，README 声明项目采用 MIT；`pi/` 参考源码没有被跟踪，PI SDK 以依赖包使用。用户已确认自有代码均有权按 MIT 发布。`package-lock.json` 中 372 个依赖条目的许可证元数据包含 14 个 LGPL 条目、1 个 CC-BY-4.0 条目，另有 7 个 workspace 条目未声明许可证；清单包括平台可选包，尚未逐包核验许可证文本、实际分发形态和兼容性，不能仅凭 SPDX 字段得出法律结论。
+- 根 `LICENSE` 为 MIT，README 声明项目采用 MIT；`pi/` 参考源码没有被跟踪，PI SDK 以依赖包使用。用户已确认自有代码均有权按 MIT 发布。检查了当前 7 个正式 workspace/spike 清单中声明的外部直接生产依赖：其锁定版本在 lock metadata 中均标为 MIT。根及 workspace 均为 `private: true`，本仓库分发的是源码归档；`git ls-files` 未发现 `node_modules/`、`dist/`、`.next/` 或 `pi/` 内容，因此发布归档本身不打包 npm 依赖源码。
+- 依赖安装仍会按 `package-lock.json` 拉取第三方包，第三方许可证不由根 MIT 覆盖。当前锁文件中，`next@16.3.6` 声明可选依赖 `sharp@0.35.5`；Sharp 的可选平台条目涉及 10 个 `LGPL-3.0-or-later` 元数据项、3 个 `Apache-2.0 AND LGPL-3.0-or-later` 项和 1 个 `Apache-2.0 AND LGPL-3.0-or-later AND MIT` 项，另有 `caniuse-lite@1.0.30001812` 的 `CC-BY-4.0` 元数据。七个本地 workspace package 的清单未声明 `license` 字段（lock 中因 workspace 链接表示重复为 14 项）；`README` 和仓库根 LICENSE 表明的是项目自身 MIT 声明。以上是锁文件和已安装 package metadata 的盘点，未逐一核对每个归档中的完整许可证文本、通知要求、兼容性或发布后二进制再分发义务；不能仅凭 SPDX 字段得出法律结论。
 - [项目计划](../plan.md)和 [TASK-005 任务卡](005-public-repository.md)包含真实模型评测研究记录：provider/model 与提示版本、固定样本、运行标识、质量指标、Token 数和估算费用。用户已明确选择公开完整记录；相关内容保留，其中固定单样本结果不应表述为跨仓库泛化保证。
 
 ## 决策、冲突与范围变化
@@ -103,7 +104,7 @@ git diff --check
 - 完成内容：校正 TASK-007/TASK-008 状态；补全 v0.1.0 README 范围与限制；审计文件、当前全部远端分支的可达历史和 Actions 日志；完成固定工具链本地检查。
 - 修改路径：README、项目协作指引、计划、旧任务卡和任务索引；具体允许路径见本卡范围清单。
 - 实际验证：见“验证命令与证据”；本地各项命令结果均已记录。
-- 风险与未验证：密钥扫描是有限模式扫描；新增 push 触发的 Actions 日志未直接检查；依赖许可证兼容性未完整审查；旧 Git 历史继续包含本机绝对路径；没有检查未公开的本地 `.env` 内容。
+- 风险与未验证：密钥扫描是有限模式扫描；新增 push 触发的 Actions 日志未直接检查；依赖许可证盘点只核对锁文件及已安装 package metadata，未完成逐包许可证文本、通知和再分发兼容性审查；旧 Git 历史继续包含本机绝对路径；没有检查未公开的本地 `.env` 内容。
 - 提交 SHA / PR：初始文档提交 `a9a37e4a457381106aa8704f06b86dc77f8fd6c7`；[PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20)，当前 open、未合并，含后续任务记录与路径清理提交。
 - 已停止写入：是；当前差异已整理，等待 PR review。
-- 下一步：review 并集成 PR #20；另行完成依赖许可证审查。不要在此任务内公开仓库或创建 release。
+- 下一步：review 并集成 PR #20；如果后续要把构建产物或依赖一起再分发，再针对实际分发内容完成逐包许可证文本与通知审查。不要在此任务内公开仓库或创建 release。
