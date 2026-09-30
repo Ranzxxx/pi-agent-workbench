@@ -4,7 +4,7 @@
 
 - 状态：`done`
 - 负责人：Codex（实现与文档集成）
-- 分支或 worktree：`task/002-review-hardening`，`/home/lzs/Projects/pi`；当前 checkout 由本任务独占，无并行写入者。
+- 分支或 worktree：`task/002-review-hardening`，仓库根目录的独占 checkout；当前 checkout 由本任务独占，无并行写入者。
 - 基线提交：`dd82a11a90676691121c2617495112563f844c6c`
 - 依赖任务：TASK-001（已通过 PR #1 集成）
 - 提交授权：无；本轮不创建 commit、不推送、不合并。

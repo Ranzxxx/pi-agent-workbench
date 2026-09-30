@@ -4,7 +4,7 @@
 
 - 状态：`done`
 - 负责人：Codex 主 Agent
-- 实施分支：`codex/task-008-v01-closeout`；合并状态同步分支：`codex/task-008-integration-record`；`/home/lzs/Projects/pi`
+- 实施分支：`codex/task-008-v01-closeout`；合并状态同步分支：`codex/task-008-integration-record`；仓库根目录的独占 checkout
 - 基线提交：`0c6d3ff86645cfe70be8cf96144158ecfe30cecb`
 - 依赖任务：TASK-007（已完成并合并）
 - 提交/推送授权：用户于 2026-09-29 明确授权本地提交、推送、创建 PR 并合并。

@@ -4,7 +4,7 @@
 
 - 状态：`done`（实现、本地离线验证、PR 审查与 GitHub 集成都已完成）
 - 负责人：Codex（本任务独占写入者）
-- 分支或 worktree：`task/007-v01-review-fixes`，工作区 `/home/lzs/Projects/pi`
+- 分支或 worktree：`task/007-v01-review-fixes`，仓库根目录的独占 checkout
 - 基线提交：Review 基线 `7aebe6c9ca9751c5450340ef6d4870fc45aed64f`（当时 `main`）；功能实现基线 `a726c26 → 1f031d9`；当前 `main` 为合并提交 `cede3fd112c4291e7597ac02d104a70d5267629e`
 - 开始实施时已有修改：`doc/plan.md`、`doc/tasks/README.md` 为前轮未提交修改，`doc/tasks/007-v01-review-fixes.md` 为前轮未跟踪的新任务卡；均由本任务沿用，不算作代码修复
 - 依赖任务：TASK-006（已集成）；本任务基于完成后的独立 Review

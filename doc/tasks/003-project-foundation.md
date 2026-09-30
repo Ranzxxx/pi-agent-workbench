@@ -4,7 +4,7 @@
 
 - 状态：`done`（PR #3 已集成；GitHub Actions 在最终任务分支提交上全绿）
 - 负责人：Codex（唯一写入者与集成者）
-- 分支或 worktree：`task/003-project-foundation`；`/home/lzs/Projects/pi` 独占 checkout
+- 分支或 worktree：`task/003-project-foundation`；仓库根目录的独占 checkout
 - 基线提交：`58d4a7886048581bcb6dc1b6b07ed7ab5d587f20`
 - 依赖任务：TASK-002 审查并集成；不要求 TASK-001 干净安装验收预先通过，本卡负责补齐该证据。
 - 提交/推送：用户已在前续轮次提交 `daf7176` 并推送；未由 Codex 执行。
