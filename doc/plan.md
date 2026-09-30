@@ -2,8 +2,8 @@
 
 ## 当前状态与事实来源
 
-- 最近更新：2026-09-29。
-- 当前阶段：TASK-005 的固定样本在线评测通过初始质量门（事实召回 0.80、引用有效性与证据支持均 1.00、无不支持断言），不代表跨仓库泛化保证。TASK-006 的通用工作台、API/SSE 和首个只读仓库分析能力已集成；TASK-007 修复的 9 项 Review 问题已由 PR #17 合并。TASK-008 的 v0.1 收尾经 PR #18 合并，GitHub Actions Offline checks #53 通过，状态为 done。真实 socket 断线、完整浏览器交互和在线成功运行完整 ID/仓库 SHA/账单仍是已知限制。详细状态以[任务索引](tasks/README.md)和对应任务卡为准。
+- 最近更新：2026-09-30。
+- 当前阶段：TASK-005 的固定样本在线评测通过初始质量门（事实召回 0.80、引用有效性与证据支持均 1.00、无不支持断言），不代表跨仓库泛化保证。TASK-006 的通用工作台、API/SSE 和首个只读仓库分析能力已集成；TASK-007 修复的 9 项 Review 问题已由 PR #17 合并。TASK-008 的 v0.1 收尾经 PR #18 合并，GitHub Actions Offline checks #53 通过，状态为 done。TASK-009 的发布准备经 PR #20 合并，发布状态同步经 PR #21 合并至 `main`（`4a0cb96`）。v0.1.0 GitHub Release 已于 2026-09-30 发布，仓库当前为 public；`v0.1.0` tag 指向 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`，与 `main` 当前 HEAD 相同，tag push 检查 #76 通过。真实 socket 断线、完整浏览器交互和在线成功运行完整 ID/仓库 SHA/账单仍是已知限制。详细状态以[任务索引](tasks/README.md)和对应任务卡为准。
 - TASK-001 的代码经 PR #1 合并到 `dd82a11`；复审补强已在 PR #2 合并；TASK-003 补齐独立干净安装证据，状态恢复 done。
 - TASK-002 已通过 PR #2 合并到 `58d4a78`，状态 done；TASK-003 已通过 PR #3 集成，且用户确认远程 CI 全绿，状态 done。当时 TASK-002/003 的范围不包含 API 或 Web；相关工作由后续 TASK-006 实施。
 - 任务的详细状态、验证和提交以任务卡为准；[任务索引](tasks/README.md)仅作摘要。
@@ -211,5 +211,6 @@ v0.2 阶段划分为：获取快照 → 收集证据 → 分析 → 校验 → �
 - 2026-09-28：TASK-006 经 PR #14 合并（GitHub Actions #39 成功），状态记录经 PR #15 合并（GitHub Actions #42 成功）；本地 `main` 已同步，TASK-006 状态为 `done`。真实 socket 断线重连及在线运行完整元数据仍是已知限制。
 - 2026-09-29：TASK-008 完成 v0.1 收尾状态同步和聚焦检查，Node.js 24.21.0/npm 11.9.0 下 7/7 workspace 类型检查、workspace 79 项测试、Web SSR 1 项测试、Web 生产构建和 `git diff --check` 均通过。沙箱对 tsx IPC 与 Next.js 子进程有限制，获准在沙箱外重跑后通过。
 - 2026-09-29：TASK-008 经 [PR #18](https://github.com/Ranzxxx/pi-agent-workbench/pull/18) squash 合并至 `main`（`f31681bb29f23c68a46bda29fad97b04f88ae190`）；GitHub Actions [Offline checks #53](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36571628811) 全部通过，任务状态为 `done`。
+- 2026-09-30：TASK-009 发布准备经 [PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20) 合并；后续状态同步经 [PR #21](https://github.com/Ranzxxx/pi-agent-workbench/pull/21) 合并至 `main`（`4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`）。用户随后发布 [v0.1.0 GitHub Release](https://github.com/Ranzxxx/pi-agent-workbench/releases/tag/v0.1.0) 并将仓库设为 public；`v0.1.0` tag 和 `main` 均指向该提交，tag push 的 [Offline checks #76](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36669352573) 通过。
 
-下一步：根据实际使用体验和已记录的验证限制决定是否需要新的、有明确边界的任务；当前没有预先承诺 TASK-009 或后续产品功能。TASK-008 不新增产品功能、不做完整 socket 断线端到端验收，也不授权付费在线模型调用。真实 socket、额外在线质量样本及真实运行元数据仍应作为已知限制如实记录；不要把单次在线样本视为跨仓库泛化保证。
+下一步：完成 TASK-009 发布状态文档同步的 review 与集成，然后按已记录的 v0.2 路线建立规划任务并细化验收边界。真实 socket、额外在线质量样本及真实运行元数据仍应作为已知限制如实记录；不要把单次在线样本视为跨仓库泛化保证。
