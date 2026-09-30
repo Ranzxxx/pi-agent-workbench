@@ -2,13 +2,15 @@
 
 ## 元数据
 
-- 状态：`done`
+- 状态：`review`
 - 负责人：Codex 主 Agent
 - 分支或 worktree：`codex/task-009-v01-release-readiness`，仓库根目录的独占 checkout
 - 基线提交：`fd2fb7c1f932dffb453e111e90ff0f4478cdeaa1`
+- 后续发布状态同步工作分支：`codex/task-009-release-state-sync`，基线 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`
+- 后续同步允许路径：`doc/plan.md`、`doc/tasks/README.md`、`doc/tasks/009-v01-release-readiness.md`
 - 依赖任务：TASK-008（已完成并合并）
 - 提交/推送授权：用户于 2026-09-30 要求完成 v0.1.0 README 发布准备 PR 和发布前审计。
-- 公开仓库、推送 release tag、创建 GitHub Release：本任务不执行。
+- TASK-009 初始发布准备范围不执行公开仓库、推送 release tag 或创建 GitHub Release；用户之后自行完成这些操作，核验结果见“发布后状态同步”。
 - 在线模型授权：无；不得发起付费调用。
 
 ## 背景与目标
@@ -54,7 +56,7 @@
 - [x] MIT 许可证、提交身份和 SDK 来源已检查；用户已确认自有代码均有权按 MIT 发布。
 - [x] 用户要求的类型检查、测试、生产构建、spike 与差异检查均记录真实结果。
 - [x] 当前跟踪文件中的本机绝对路径已替换为仓库相对或通用描述；旧 Git 历史按用户决定保留。
-- [x] PR #20 已合并至 `main`（merge commit `2c1145ebf211981745198d0e20c27ec0a57d511b`）；此任务未切换仓库可见性、未发布 tag/Release。
+- [x] 发布准备经 PR #20 合并至 `main`（merge commit `2c1145ebf211981745198d0e20c27ec0a57d511b`）；TASK-009 后续状态经 PR #21 合并（merge commit `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`）。用户完成发布与可见性变更的结果见“发布后状态同步”。
 - [x] 用户确认公开完整模型评测记录；计划和 TASK-005 中现有完整记录予以保留。
 
 ## 验证命令与证据
@@ -82,7 +84,7 @@ git diff --check
 
 ## 发布前审计结果
 
-- GitHub 仓库当前为 private；打开 PR 前有 19 个远端分支，PR #20 创建后为 20 个，本地远端跟踪引用与 GitHub 分支名一致。最新本地快照有 461 个可达 Git 对象（约 2.41 MB blob 内容）。
+- 预发布审计时 GitHub 仓库为 private；打开 PR 前有 19 个远端分支，PR #20 创建后为 20 个，本地远端跟踪引用与 GitHub 分支名一致。最新本地快照有 461 个可达 Git 对象（约 2.41 MB blob 内容）。
 - 自定义模式扫描未发现 GitHub/npm/provider token、私钥标记、JWT、真实凭据赋值或含凭据 URL。扫描器只做有限模式匹配；环境中没有安装 Gitleaks 或 TruffleHog，不能将结果称为对所有秘密的证明。
 - 邮箱模式只匹配到 `packages/tools/tests/public-github-snapshot.test.ts` 中用于拒绝 user-info URL 的合成恶意 URL；没有发现真实邮箱。数字/电话启发式命中来自 SVG 坐标、版本、动作运行号、哈希和费用/Token 测试数据，复核为非电话号码。唯一提交者邮箱使用 GitHub noreply 地址。
 - PR 创建前取得的 59 次 GitHub Actions 运行均为成功，已逐一检查其 job 日志中的令牌、凭据、私钥、JWT、邮箱和凭据 URL 模式，未发现命中。PR checks #61/#63/#65/#67 在先前 PR head 上通过，日志扫描也无上述模式命中。PR 文档补充提交 `015d72240899c3a3bceafc401a0f838372f9f812` 未返回新的 PR workflow；合并提交的 combined status 也为空。push 触发的 PR 分支日志未能通过当前 GitHub Actions 接口单独取得，故不声称覆盖这些新增日志。CI workflow 不配置真实模型凭据。
@@ -92,19 +94,30 @@ git diff --check
 - 依赖安装仍会按 `package-lock.json` 拉取第三方包，第三方许可证不由根 MIT 覆盖。当前锁文件中，`next@16.3.6` 声明可选依赖 `sharp@0.35.5`；Sharp 的可选平台条目涉及 10 个 `LGPL-3.0-or-later` 元数据项、3 个 `Apache-2.0 AND LGPL-3.0-or-later` 项和 1 个 `Apache-2.0 AND LGPL-3.0-or-later AND MIT` 项，另有 `caniuse-lite@1.0.30001812` 的 `CC-BY-4.0` 元数据。七个本地 workspace package 的清单未声明 `license` 字段（lock 中因 workspace 链接表示重复为 14 项）；`README` 和仓库根 LICENSE 表明的是项目自身 MIT 声明。以上是锁文件和已安装 package metadata 的盘点，未逐一核对每个归档中的完整许可证文本、通知要求、兼容性或发布后二进制再分发义务；不能仅凭 SPDX 字段得出法律结论。
 - [项目计划](../plan.md)和 [TASK-005 任务卡](005-public-repository.md)包含真实模型评测研究记录：provider/model 与提示版本、固定样本、运行标识、质量指标、Token 数和估算费用。用户已明确选择公开完整记录；相关内容保留，其中固定单样本结果不应表述为跨仓库泛化保证。
 
+## 发布后状态同步（2026-09-30）
+
+通过 GitHub 插件读取仓库、Release、tag、main 提交和 Actions 状态；本次文档同步基线为 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`。核验结果：
+
+- 仓库可见性为 `public`。
+- [v0.1.0 GitHub Release](https://github.com/Ranzxxx/pi-agent-workbench/releases/tag/v0.1.0) 已发布；`draft=false`、`prerelease=false`，无额外上传资产。
+- `refs/tags/v0.1.0` 直接指向提交 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`；该提交同时是 `main` 当前 HEAD，也是 PR #21 的集成提交。
+- Release 发布时间为 `2026-09-30T04:33:07Z`。主分支 push 检查 [#75](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36668572559) 与 tag push 检查 [#76](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36669352573) 均成功。
+- 对 tag 检查 #76 的 job 日志做有限模式扫描，GitHub/npm/provider token、私钥标记、JWT、凭据赋值、凭据 URL 和邮箱模式均未命中。此扫描不证明不存在任何形式的秘密；更早 Actions 日志的审计边界仍见“发布前审计结果”。
+- 发布后仓库列出 21 个分支（含 `main`）；旧任务分支和历史按用户选择保留，因此公开仓库会显示这些分支及旧提交历史。
+
 ## 决策、冲突与范围变化
 
-- 用户要求先做 README 发布准备和发布前审计；实际切换 Public、创建 release tag 和发布 Release 仍须单独确认。
+- 用户最初要求先做 README 发布准备和发布前审计；本任务初始范围未执行公开仓库、创建 tag 或发布 Release。用户之后选择自行完成发布，并于 2026-09-30 完成；当前可核验状态详见“发布后状态同步”。
 - 用户于 2026-09-30 确认拥有全部自有代码按 MIT 发布的权利，并选择公开完整模型评测记录。
 - 用户选择只清理当前跟踪文件、不改写 Git 历史。该选择避免全面改写造成多分支提交 SHA 变化，并接受旧提交仍含本机绝对路径。
 
 ## 交接
 
-- 当前状态：`done`；PR #20 已由用户合并至 `main`，合并提交为 `2c1145ebf211981745198d0e20c27ec0a57d511b`。
-- 完成内容：校正 TASK-007/TASK-008 状态；补全 v0.1.0 README 范围与限制；审计文件、当前全部远端分支的可达历史和 Actions 日志；完成固定工具链本地检查和依赖许可证元数据盘点；PR #20 已集成。
+- 当前状态：`review`；发布准备 PR #20 已合并至 `main`（`2c1145ebf211981745198d0e20c27ec0a57d511b`），TASK-009 集成状态 PR #21 已合并（`4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`）；本次发布后文档同步尚未提交。
+- 完成内容：校正 TASK-007/TASK-008 状态；补全 v0.1.0 README 范围与限制；审计文件、可达历史和 Actions 日志；完成固定工具链本地检查和依赖许可证元数据盘点；核验 v0.1.0 Release、tag、public 可见性、发布提交和 tag CI。
 - 修改路径：README、项目协作指引、计划、旧任务卡和任务索引；具体允许路径见本卡范围清单。
 - 实际验证：见“验证命令与证据”；本地各项命令结果均已记录。
-- 风险与未验证：密钥扫描是有限模式扫描；新增 push 触发的 Actions 日志未直接检查；依赖许可证盘点只核对锁文件及已安装 package metadata，未完成逐包许可证文本、通知和再分发兼容性审查；旧 Git 历史继续包含本机绝对路径；没有检查未公开的本地 `.env` 内容。
-- 提交 SHA / PR：初始文档提交 `a9a37e4a457381106aa8704f06b86dc77f8fd6c7`；依赖盘点提交 `015d72240899c3a3bceafc401a0f838372f9f812`；[PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20) 已于 2026-09-30 合并，merge commit `2c1145ebf211981745198d0e20c27ec0a57d511b`。
-- 已停止写入：是；TASK-009 文档准备和发布前审计已合并。
-- 下一步：单独完成 v0.1.0 的标签与 GitHub Release、公开前检查和仓库可见性变更；若未来随应用分发构建产物或依赖，再针对实际分发内容完成逐包许可证文本与通知审查。
+- 风险与未验证：密钥扫描是有限模式扫描；tag push #76 已完成有限模式日志扫描，但不构成任意秘密的证明；依赖许可证盘点只核对锁文件及已安装 package metadata，未完成逐包许可证文本、通知和再分发兼容性审查；旧 Git 历史继续包含本机绝对路径；没有检查未公开的本地 `.env` 内容。
+- 提交 SHA / PR：初始文档提交 `a9a37e4a457381106aa8704f06b86dc77f8fd6c7`；依赖盘点提交 `015d72240899c3a3bceafc401a0f838372f9f812`；[PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20) 合并至 `2c1145ebf211981745198d0e20c27ec0a57d511b`；状态同步 [PR #21](https://github.com/Ranzxxx/pi-agent-workbench/pull/21) 合并至 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`。当前发布后状态同步位于 `codex/task-009-release-state-sync`，基线为 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`，尚无提交 SHA。
+- 已停止写入：否；发布事实已同步至计划、任务索引和本任务卡，等待 review 与集成。
+- 下一步：review 并集成本次发布后状态同步；之后建立 v0.2 规划任务。若未来随应用分发构建产物或依赖，再针对实际分发内容完成逐包许可证文本与通知审查。
