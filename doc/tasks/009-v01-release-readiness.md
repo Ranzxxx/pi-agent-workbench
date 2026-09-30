@@ -4,7 +4,7 @@
 
 - 状态：`review`
 - 负责人：Codex 主 Agent
-- 分支或 worktree：`codex/task-009-v01-release-readiness`，`/home/lzs/Projects/pi`
+- 分支或 worktree：`codex/task-009-v01-release-readiness`，仓库根目录的独占 checkout
 - 基线提交：`fd2fb7c1f932dffb453e111e90ff0f4478cdeaa1`
 - 依赖任务：TASK-008（已完成并合并）
 - 提交/推送授权：用户于 2026-09-30 要求完成 v0.1.0 README 发布准备 PR 和发布前审计。
@@ -21,15 +21,24 @@
 - 检查 MIT 许可证、仓库文件、可达 Git 历史和 GitHub Actions 运行记录中的密钥、个人数据及私有研究资料。
 - 记录第三方代码来源和许可证风险；代码审计不能替代代码贡献者或权利人的授权确认。
 - 运行 `npm run check`、`npm test`、`npm run build`、`npm run spike` 和 `git diff --check`，如实记录结果。
+- 在当前跟踪文件中删除本机绝对 home 路径，改用仓库相对路径或通用工作区描述；按用户选择保留已有 Git 历史。
 - 不修改生产代码、依赖、锁文件或发布版本；不公开仓库、不创建 tag/Release、不进行 npm 发布。
 
 ## 允许路径与依赖授权
 
 - `README.md`
+- `AGENTS.md`
+- `doc/plan.md`
+- `doc/tasks/001-pi-sdk-spike.md`
+- `doc/tasks/002-review-hardening.md`
+- `doc/tasks/003-project-foundation.md`
+- `doc/tasks/005-public-repository.md`
+- `doc/tasks/007-v01-review-fixes.md`
+- `doc/tasks/008-v01-closeout.md`
 - `doc/tasks/README.md`
 - `doc/tasks/009-v01-release-readiness.md`
 
-本任务唯一写入者为 Codex 主 Agent。任务索引仅同步本任务状态；计划文件仅在 v0.1.0 实际发布这一里程碑发生后更新。
+本任务唯一写入者为 Codex 主 Agent。用户于 2026-09-30 将范围扩展为清理当前跟踪文件中的本机绝对路径，并确认保留已推送历史；完整模型评测记录按用户选择保留公开。计划文件只做路径脱敏，不更新里程碑。
 
 ## 输入与前置条件
 
@@ -42,10 +51,11 @@
 
 - [x] README 清楚说明 v0.1.0 候选包含内容、工具链、离线默认模式、在线模式费用/密钥要求和未验证限制。
 - [x] 发布前源文件、可达 Git 历史和 GitHub Actions 日志完成密钥/敏感信息模式扫描，并记录局限及结果。
-- [x] MIT 许可证、提交身份和 SDK 来源已检查；代码证据无法确认的所有权事项留给用户确认。
+- [x] MIT 许可证、提交身份和 SDK 来源已检查；用户已确认自有代码均有权按 MIT 发布。
 - [x] 用户要求的类型检查、测试、生产构建、spike 与差异检查均记录真实结果。
+- [x] 当前跟踪文件中的本机绝对路径已替换为仓库相对或通用描述；旧 Git 历史按用户决定保留。
 - [ ] PR #20 获得 review 并集成；此任务不切换仓库可见性、不发布 tag/Release。
-- [ ] 用户确认自有代码可按 MIT 发布，并决定是否公开现有模型评测运行与成本元数据。
+- [x] 用户确认公开完整模型评测记录；计划和 TASK-005 中现有完整记录予以保留。
 
 ## 验证命令与证据
 
@@ -71,28 +81,28 @@ git diff --check
 
 ## 发布前审计结果
 
-- GitHub 仓库当前为 private；API 返回 19 个远端分支，本地远端跟踪引用也有 19 个且名称一致。扫描所有当前可达分支的 448 个 Git 对象（约 2.47 MB blob 内容）和提交消息。
+- GitHub 仓库当前为 private；打开 PR 前有 19 个远端分支，PR #20 创建后为 20 个，本地远端跟踪引用与 GitHub 分支名一致。最新本地快照有 461 个可达 Git 对象（约 2.41 MB blob 内容）。
 - 自定义模式扫描未发现 GitHub/npm/provider token、私钥标记、JWT、真实凭据赋值或含凭据 URL。扫描器只做有限模式匹配；环境中没有安装 Gitleaks 或 TruffleHog，不能将结果称为对所有秘密的证明。
 - 邮箱模式只匹配到 `packages/tools/tests/public-github-snapshot.test.ts` 中用于拒绝 user-info URL 的合成恶意 URL；没有发现真实邮箱。数字/电话启发式命中来自 SVG 坐标、版本、动作运行号、哈希和费用/Token 测试数据，复核为非电话号码。唯一提交者邮箱使用 GitHub noreply 地址。
-- 19 个分支的全部 59 次 GitHub Actions 运行均为成功；已逐一检查其 job 日志中的令牌、凭据、私钥、JWT、邮箱和凭据 URL 模式，未发现命中。CI workflow 不配置真实模型凭据。
+- PR 创建前取得的 59 次 GitHub Actions 运行均为成功，已逐一检查其 job 日志中的令牌、凭据、私钥、JWT、邮箱和凭据 URL 模式，未发现命中。PR checks #61/#63 通过，日志扫描也无上述模式命中。push 触发的两份新日志未能通过当前 GitHub Actions 接口单独取得，故未声称覆盖这两份新增日志。CI workflow 不配置真实模型凭据。
 - `doc/internal/`、`.env`、运行 artifacts 和日志不在任何可达 Git 历史路径中；根 `.gitignore` 排除这些本地数据。工作区有一个被忽略且未跟踪的 `.env` 文件；未读取其内容，也不纳入本次发布内容。
-- 当前文件和可达历史中的若干项目文档含有绝对本地路径 `/home/lzs/...`，可暴露本机用户名/目录结构。命中包括 `AGENTS.md`、`doc/plan.md`、`doc/multi-agent-workflow.md` 及多张旧任务卡；这些路径在当前主线和历史提交中均存在。本任务不改旧文件或重写历史，公开前需用户决定是否接受，或另开清理任务。
-- 根 `LICENSE` 为 MIT，README 声明项目采用 MIT；`pi/` 参考源码没有被跟踪，PI SDK 以依赖包使用。仓库扫描不能判断是否存在雇佣关系、先前合同或其他权利限制，也没有执行完整的依赖许可证兼容性审查；公开前需代码权利人确认授权。
-- [项目计划](../plan.md)和 [TASK-005 任务卡](005-public-repository.md)包含已提交的真实模型评测研究记录：provider/model 与提示版本、固定样本、运行标识、质量指标、Token 数和估算费用。它们不属于 `doc/internal/`，也不是密钥；是否作为公开研究记录披露需用户决定。此项确认前不应切换仓库为 Public。
+- 已在 9 个当前跟踪文件中定位本机绝对 home 路径，并替换为仓库相对路径或通用工作区描述。当前工作树 `rg` 扫描无此类路径命中。按用户选择不改写历史；旧提交和未更新的既有远端分支仍含这些路径，修改合并后旧提交也继续可达。
+- 根 `LICENSE` 为 MIT，README 声明项目采用 MIT；`pi/` 参考源码没有被跟踪，PI SDK 以依赖包使用。用户已确认自有代码均有权按 MIT 发布。`package-lock.json` 中 372 个依赖条目的许可证元数据包含 14 个 LGPL 条目、1 个 CC-BY-4.0 条目，另有 7 个 workspace 条目未声明许可证；清单包括平台可选包，尚未逐包核验许可证文本、实际分发形态和兼容性，不能仅凭 SPDX 字段得出法律结论。
+- [项目计划](../plan.md)和 [TASK-005 任务卡](005-public-repository.md)包含真实模型评测研究记录：provider/model 与提示版本、固定样本、运行标识、质量指标、Token 数和估算费用。用户已明确选择公开完整记录；相关内容保留，其中固定单样本结果不应表述为跨仓库泛化保证。
 
 ## 决策、冲突与范围变化
 
 - 用户要求先做 README 发布准备和发布前审计；实际切换 Public、创建 release tag 和发布 Release 仍须单独确认。
-- 项目 README/许可证可以核对文本，但 Codex 无法仅凭 Git 历史判定用户是否拥有全部自有代码的开源授权权利；发布前需要权利人确认。
-- 发现历史及现有项目文档暴露本地 `/home/lzs/...` 路径。本轮范围不包含旧文档脱敏或 Git 历史重写；公开前需由用户决定清理范围和处理方式。
+- 用户于 2026-09-30 确认拥有全部自有代码按 MIT 发布的权利，并选择公开完整模型评测记录。
+- 用户选择只清理当前跟踪文件、不改写 Git 历史。该选择避免全面改写造成多分支提交 SHA 变化，并接受旧提交仍含本机绝对路径。
 
 ## 交接
 
-- 当前状态：`review`；README 与聚焦审计已完成，待 PR 审查及用户确认公开权利和研究元数据披露。
+- 当前状态：`review`；收到用户关于 MIT 权属、评测记录公开范围和历史路径处理的决定，已清理当前跟踪文件中的本机路径并更新 PR #20。
 - 完成内容：校正 TASK-007/TASK-008 状态；补全 v0.1.0 README 范围与限制；审计文件、当前全部远端分支的可达历史和 Actions 日志；完成固定工具链本地检查。
-- 修改路径：`README.md`、`doc/tasks/README.md`、`doc/tasks/009-v01-release-readiness.md`。
+- 修改路径：README、项目协作指引、计划、旧任务卡和任务索引；具体允许路径见本卡范围清单。
 - 实际验证：见“验证命令与证据”；本地各项命令结果均已记录。
-- 风险与未验证：密钥扫描是有限模式扫描；MIT 权利归属、已提交模型评测研究元数据的公开意愿、含本地 `/home/lzs/...` 路径的旧文档/历史是否清理待用户决定；没有检查未公开的本地 `.env` 内容。
-- 提交 SHA / PR：`a9a37e4a457381106aa8704f06b86dc77f8fd6c7`；[PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20)，当前 open、未合并。
-- 已停止写入：是；本轮差异已整理，等待审查和必要的用户确认。
-- 下一步：等待 PR #20 review 与用户决定是否公开模型评测元数据、旧文档本地路径，并确认 MIT 权利归属。不要在此任务内公开仓库或创建 release。
+- 风险与未验证：密钥扫描是有限模式扫描；新增 push 触发的 Actions 日志未直接检查；依赖许可证兼容性未完整审查；旧 Git 历史继续包含本机绝对路径；没有检查未公开的本地 `.env` 内容。
+- 提交 SHA / PR：初始文档提交 `a9a37e4a457381106aa8704f06b86dc77f8fd6c7`；[PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20)，当前 open、未合并，含后续任务记录与路径清理提交。
+- 已停止写入：是；当前差异已整理，等待 PR review。
+- 下一步：review 并集成 PR #20；另行完成依赖许可证审查。不要在此任务内公开仓库或创建 release。

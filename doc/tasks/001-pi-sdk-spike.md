@@ -27,7 +27,7 @@
 - 不搭建 Next.js、Fastify 或正式 monorepo。
 - 不实现 GitHub 技术尽调流程。
 - 不实现数据库、任务恢复、子 Agent、沙箱或长期记忆。
-- 不修改 `/home/lzs/Projects/pi/pi` 中的 PI 源码。
+- 不修改仓库根目录 `pi/` 中的 PI 源码。
 - 不默认调用付费模型。
 
 ## 允许修改的路径
@@ -61,7 +61,7 @@
 初始化由项目负责人在本地执行；依赖安装完成后运行：
 
 ```bash
-cd /home/lzs/Projects/pi/spikes/pi-sdk
+cd spikes/pi-sdk
 npm run check
 npm test
 npm start
@@ -71,7 +71,7 @@ npm start
 
 ## 决策与范围变化
 
-- 已恢复 `/home/lzs/Projects/pi/pi` 作为只读 PI 源码参考；该目录被根 `.gitignore` 排除，不属于本项目提交范围。
+- 已恢复仓库根目录 `pi/` 作为只读 PI 源码参考；该目录被根 `.gitignore` 排除，不属于本项目提交范围。
 - 当前使用 PI SDK `0.86.1` 源码文档和示例进行 API 验证；技术验证程序仍需放在 `spikes/pi-sdk/**`。
 - 2026-09-21 复审：原检查接受任意 agent_end，不能证明错误/取消正确；认证与资源也未显式隔离。改由 TASK-002 补强，不改写原 PR 历史。
 - TASK-003 可在 TASK-002 集成后开始，不依赖本卡干净安装提前完成；由它补齐原验收缺口。
