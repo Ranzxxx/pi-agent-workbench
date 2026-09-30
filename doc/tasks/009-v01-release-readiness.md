@@ -2,11 +2,11 @@
 
 ## 元数据
 
-- 状态：`review`
+- 状态：`done`
 - 负责人：Codex 主 Agent
 - 分支或 worktree：`codex/task-009-v01-release-readiness`，仓库根目录的独占 checkout
 - 基线提交：`fd2fb7c1f932dffb453e111e90ff0f4478cdeaa1`
-- 后续发布状态同步工作分支：`codex/task-009-release-state-sync`，基线 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`
+- 后续发布状态同步工作分支：`codex/task-009-release-state-sync`，提交 `133623eb3128bd3e67560de1750c6ef0b5206897` 经 PR #22 集成；合并提交 `d8ec1896d6cd14893fe20dd067a9200807292296`
 - 后续同步允许路径：`doc/plan.md`、`doc/tasks/README.md`、`doc/tasks/009-v01-release-readiness.md`
 - 依赖任务：TASK-008（已完成并合并）
 - 提交/推送授权：用户于 2026-09-30 要求完成 v0.1.0 README 发布准备 PR 和发布前审计。
@@ -57,6 +57,7 @@
 - [x] 用户要求的类型检查、测试、生产构建、spike 与差异检查均记录真实结果。
 - [x] 当前跟踪文件中的本机绝对路径已替换为仓库相对或通用描述；旧 Git 历史按用户决定保留。
 - [x] 发布准备经 PR #20 合并至 `main`（merge commit `2c1145ebf211981745198d0e20c27ec0a57d511b`）；TASK-009 后续状态经 PR #21 合并（merge commit `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`）。用户完成发布与可见性变更的结果见“发布后状态同步”。
+- [x] 发布事实同步经 PR #22 合并至 `main`（merge commit `d8ec1896d6cd14893fe20dd067a9200807292296`）；PR checks #78 与合并后 Offline checks #79 均通过。
 - [x] 用户确认公开完整模型评测记录；计划和 TASK-005 中现有完整记录予以保留。
 
 ## 验证命令与证据
@@ -113,11 +114,11 @@ git diff --check
 
 ## 交接
 
-- 当前状态：`review`；发布准备 PR #20 已合并至 `main`（`2c1145ebf211981745198d0e20c27ec0a57d511b`），TASK-009 集成状态 PR #21 已合并（`4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`）；本次发布后文档同步尚未提交。
+- 当前状态：`done`；发布准备 PR #20、集成状态 PR #21、发布事实同步 PR #22 均已合并。PR #22 squash merge commit 为 `d8ec1896d6cd14893fe20dd067a9200807292296`。
 - 完成内容：校正 TASK-007/TASK-008 状态；补全 v0.1.0 README 范围与限制；审计文件、可达历史和 Actions 日志；完成固定工具链本地检查和依赖许可证元数据盘点；核验 v0.1.0 Release、tag、public 可见性、发布提交和 tag CI。
 - 修改路径：README、项目协作指引、计划、旧任务卡和任务索引；具体允许路径见本卡范围清单。
 - 实际验证：见“验证命令与证据”；本地各项命令结果均已记录。
 - 风险与未验证：密钥扫描是有限模式扫描；tag push #76 已完成有限模式日志扫描，但不构成任意秘密的证明；依赖许可证盘点只核对锁文件及已安装 package metadata，未完成逐包许可证文本、通知和再分发兼容性审查；旧 Git 历史继续包含本机绝对路径；没有检查未公开的本地 `.env` 内容。
-- 提交 SHA / PR：初始文档提交 `a9a37e4a457381106aa8704f06b86dc77f8fd6c7`；依赖盘点提交 `015d72240899c3a3bceafc401a0f838372f9f812`；[PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20) 合并至 `2c1145ebf211981745198d0e20c27ec0a57d511b`；状态同步 [PR #21](https://github.com/Ranzxxx/pi-agent-workbench/pull/21) 合并至 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`。当前发布后状态同步位于 `codex/task-009-release-state-sync`，基线为 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`，尚无提交 SHA。
-- 已停止写入：否；发布事实已同步至计划、任务索引和本任务卡，等待 review 与集成。
-- 下一步：review 并集成本次发布后状态同步；之后建立 v0.2 规划任务。若未来随应用分发构建产物或依赖，再针对实际分发内容完成逐包许可证文本与通知审查。
+- 提交 SHA / PR：初始文档提交 `a9a37e4a457381106aa8704f06b86dc77f8fd6c7`；依赖盘点提交 `015d72240899c3a3bceafc401a0f838372f9f812`；[PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20) 合并至 `2c1145ebf211981745198d0e20c27ec0a57d511b`；状态同步 [PR #21](https://github.com/Ranzxxx/pi-agent-workbench/pull/21) 合并至 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`；发布事实同步 [PR #22](https://github.com/Ranzxxx/pi-agent-workbench/pull/22) 合并至 `d8ec1896d6cd14893fe20dd067a9200807292296`。
+- 已停止写入：是；发布准备、发布事实核验和状态同步均已集成。
+- 下一步：建立 v0.2 规划任务；若未来随应用分发构建产物或依赖，再针对实际分发内容完成逐包许可证文本与通知审查。

@@ -20,11 +20,11 @@ backlog（待开始）→ in_progress（实施）→ review（待验收/集成�
 | [TASK-006 API、SSE 与通用 Agent 工作台基础界面](006-web-workbench.md) | done | 主 Agent | PR #14 已合并至 main；GitHub Actions #39 成功；本地 main 已快进同步。仍保留真实 socket 断线重连未端到端模拟等限制 |
 | [TASK-007 v0.1 Review 问题修复与回归验收](007-v01-review-fixes.md) | done | Codex | PR #17 已 squash 合并至 `main`（`cede3fd`）；浏览器完整交互和固定工具链仍有任务卡记录的后补验证项 |
 | [TASK-008 v0.1 收尾与聚焦验证](008-v01-closeout.md) | done | Codex 主 Agent | PR #18 已 squash 合并至 `main`（`f31681b`）；GitHub Actions Offline checks #53 全部通过 |
-| [TASK-009 v0.1.0 开源发布准备](009-v01-release-readiness.md) | review | Codex 主 Agent | 发布准备 PR #20、发布状态 PR #21 已合并；v0.1.0 已发布且仓库为 public；本次发布事实同步待 review/集成 |
+| [TASK-009 v0.1.0 开源发布准备](009-v01-release-readiness.md) | done | Codex 主 Agent | PR #20/#21/#22 已合并；v0.1.0 已发布，仓库为 public；合并后 CI #79 通过 |
 
-TASK-007 已完成 v0.1 Review 问题修复并集成；TASK-008 的 v0.1 收尾和聚焦检查已完成并经 PR #18 集成。TASK-009 已补全 v0.1.0 README 并完成发布审计；用户确认自有代码可按 MIT 发布，并选择公开完整模型评测记录。PR #20 合并发布准备，PR #21 合并 TASK-009 集成状态。用户随后于 2026-09-30 发布 [v0.1.0 Release](https://github.com/Ranzxxx/pi-agent-workbench/releases/tag/v0.1.0) 并将仓库设为 public；tag 和 `main` 指向 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`，tag push 的 GitHub Actions #76 通过。旧提交历史按用户选择保留，当前跟踪文件中的本机路径已清理。依赖许可证兼容性尚未逐包审查。TASK-005 的在线质量结果来自一个固定样本，不构成跨仓库泛化保证。真实 socket 断线重连和真实在线运行完整元数据仍是已有验证限制；相关任务没有把这些限制误记为通过。详细修复与回归记录见 [TASK-007 任务卡](007-v01-review-fixes.md)，v0.1 收尾范围见 [TASK-008 任务卡](008-v01-closeout.md)，发布准备与发布后核验见 [TASK-009 任务卡](009-v01-release-readiness.md)。
+TASK-007 已完成 v0.1 Review 问题修复并集成；TASK-008 的 v0.1 收尾和聚焦检查已完成并经 PR #18 集成。TASK-009 已补全 v0.1.0 README 并完成发布审计；用户确认自有代码可按 MIT 发布，并选择公开完整模型评测记录。PR #20 合并发布准备，PR #21 合并 TASK-009 集成状态，PR #22 合并发布事实同步。用户于 2026-09-30 发布 [v0.1.0 Release](https://github.com/Ranzxxx/pi-agent-workbench/releases/tag/v0.1.0) 并将仓库设为 public；tag 和 `main` 指向 `4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`，tag push 的 GitHub Actions #76 和发布事实同步合并后的 #79 均通过。旧提交历史按用户选择保留，当前跟踪文件中的本机路径已清理。依赖许可证兼容性尚未逐包审查。TASK-005 的在线质量结果来自一个固定样本，不构成跨仓库泛化保证。真实 socket 断线重连和真实在线运行完整元数据仍是已有验证限制；相关任务没有把这些限制误记为通过。详细修复与回归记录见 [TASK-007 任务卡](007-v01-review-fixes.md)，v0.1 收尾范围见 [TASK-008 任务卡](008-v01-closeout.md)，发布准备与发布后核验见 [TASK-009 任务卡](009-v01-release-readiness.md)。
 
-TASK-009 发布状态同步在分支 `codex/task-009-release-state-sync`、基线 `4a0cb96` 上进行；当前只有上述三个文档路径有待审查改动，尚未提交。当前没有开始中的产品实现任务；下一步为建立 v0.2 规划任务。
+当前没有进行中的任务。下一步为建立 v0.2 规划任务。
 
 ## 创建与交接
 

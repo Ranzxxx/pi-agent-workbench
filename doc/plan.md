@@ -212,5 +212,6 @@ v0.2 阶段划分为：获取快照 → 收集证据 → 分析 → 校验 → �
 - 2026-09-29：TASK-008 完成 v0.1 收尾状态同步和聚焦检查，Node.js 24.21.0/npm 11.9.0 下 7/7 workspace 类型检查、workspace 79 项测试、Web SSR 1 项测试、Web 生产构建和 `git diff --check` 均通过。沙箱对 tsx IPC 与 Next.js 子进程有限制，获准在沙箱外重跑后通过。
 - 2026-09-29：TASK-008 经 [PR #18](https://github.com/Ranzxxx/pi-agent-workbench/pull/18) squash 合并至 `main`（`f31681bb29f23c68a46bda29fad97b04f88ae190`）；GitHub Actions [Offline checks #53](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36571628811) 全部通过，任务状态为 `done`。
 - 2026-09-30：TASK-009 发布准备经 [PR #20](https://github.com/Ranzxxx/pi-agent-workbench/pull/20) 合并；后续状态同步经 [PR #21](https://github.com/Ranzxxx/pi-agent-workbench/pull/21) 合并至 `main`（`4a0cb96fd89f8e9d2a0dd9601a6b10a52c3db941`）。用户随后发布 [v0.1.0 GitHub Release](https://github.com/Ranzxxx/pi-agent-workbench/releases/tag/v0.1.0) 并将仓库设为 public；`v0.1.0` tag 和 `main` 均指向该提交，tag push 的 [Offline checks #76](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36669352573) 通过。
+- 2026-09-30：发布事实文档同步经 [PR #22](https://github.com/Ranzxxx/pi-agent-workbench/pull/22) squash 合并至 `main`（`d8ec1896d6cd14893fe20dd067a9200807292296`）；PR checks #78 和合并后 [Offline checks #79](https://github.com/Ranzxxx/pi-agent-workbench/actions/runs/36671500659) 均通过。TASK-009 状态现为 `done`。
 
-下一步：完成 TASK-009 发布状态文档同步的 review 与集成，然后按已记录的 v0.2 路线建立规划任务并细化验收边界。真实 socket、额外在线质量样本及真实运行元数据仍应作为已知限制如实记录；不要把单次在线样本视为跨仓库泛化保证。
+下一步：按已记录的 v0.2 路线建立规划任务并细化验收边界。真实 socket、额外在线质量样本及真实运行元数据仍应作为已知限制如实记录；不要把单次在线样本视为跨仓库泛化保证。
