@@ -4,11 +4,11 @@
 
 **现已提供本地 Web/API 工作台、默认离线模拟的普通多轮对话、显式 `@仓库分析` 能力、SSE 运行事件和受限报告产物访问。公开 GitHub 分析复用现有只读流水线；在线模式必须在服务端显式配置 `WORKBENCH_MODE=online` 和 DeepSeek API Key。内存对话与运行在服务重启后清空，当前全进程最多一个活动运行。**
 
-v0.1.0 候选包含本地 Web/API 工作台、默认离线模拟的多轮对话、显式 `@仓库分析` 能力、SSE 运行事件和受限报告产物访问。正式 workspace 要求 Node.js **24.21.0** 与 npm **11.9.0**。离线模式不调用真实模型；在线分析须在服务端配置 `WORKBENCH_MODE=online` 和 `DEEPSEEK_API_KEY`，GitHub 元数据访问可选配置只读 `GITHUB_TOKEN`，真实模型请求可能产生费用。
+v0.1.0 包含本地 Web/API 工作台、默认离线模拟的多轮对话、显式 `@仓库分析` 能力、SSE 运行事件和受限报告产物访问。正式 workspace 要求 Node.js **24.21.0** 与 npm **11.9.0**。离线模式不调用真实模型；在线分析须在服务端配置 `WORKBENCH_MODE=online` 和 `DEEPSEEK_API_KEY`，GitHub 元数据访问可选配置只读 `GITHUB_TOKEN`，真实模型请求可能产生费用。
 
-这是一份早期开发阶段的源码版本。服务进程全局最多一个活动运行；对话与运行数据只保存在内存中，进程重启后清空。真实 socket 断线重连端到端、完整浏览器交互和在线运行元数据尚未全部验证；当前也没有登录、持久化存储、多 Agent 或独立部署包。使用范围与证据见 [TASK-008](doc/tasks/008-v01-closeout.md)。
+这是一份早期开发阶段的源码版本。服务进程全局最多一个活动运行；对话与运行数据只保存在内存中，进程重启后清空。真实 socket 断线重连端到端、完整浏览器交互和在线运行元数据尚未全部验证；当前也没有登录、持久化存储、多 Agent 或独立部署包。项目计划、任务卡和详细验证记录保存在维护者本地，不随公开仓库发布。
 
-[TASK-007](doc/tasks/007-v01-review-fixes.md) 的 Review 修复和 [TASK-008](doc/tasks/008-v01-closeout.md) 的 v0.1 收尾均已完成并合并。仓库分析的取消会等待底层执行真正退出后才释放全局运行名额；同一会话中的历史运行及其报告可以在 Web 端重新选择，失败或取消时也可查看已登记的部分产物。各项检查和限制以任务卡记录为准。
+当前版本已完成基础 Review 和收尾工作。仓库分析的取消会等待底层执行真正退出后才释放全局运行名额；同一会话中的历史运行及其报告可以在 Web 端重新选择，失败或取消时也可查看已登记的部分产物。更详细的内部验证记录不随公开仓库发布。
 
 ## 安装与验证
 
@@ -33,7 +33,7 @@ npm run demo:offline
 
 在线 `@仓库分析` 需要先解析 GitHub 分支/标签到固定提交；若遇到 GitHub 匿名 API 限额，可在 `.env` 另设可选只读 `GITHUB_TOKEN`。它只供服务端访问 `api.github.com` 的仓库元数据和 ref，不传给浏览器或 `codeload.github.com`，不要提交 `.env`。
 
-CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 workspace 和独立 spike 的干净安装与检查。具体已执行证据及远程 CI 状态见 [TASK-003](doc/tasks/003-project-foundation.md)。
+CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 workspace 和独立 spike 的干净安装与检查。
 
 ## 当前模块
 
@@ -53,9 +53,9 @@ CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 wo
 
 运行记录只在当前服务进程内保存。新一轮对话不会覆盖旧报告入口：在当前会话的“运行记录”中选择旧能力运行，即可打开其报告与已登记产物；刷新页面后会默认选择最新运行，但仍可切回旧运行。仓库分析的 `events.jsonl` 保存可解析的归档完成事件，指向 `report.json` 和 `report.md`；日志及 manifest 不能引用自身哈希，完整的四项产物哈希由运行结果和 manifest 分别提供。普通提示按 UTF-8 32 KiB 上限在提交时校验，超限会返回 `invalid_request`，不会消耗模型调用。
 
-## 第一版目标
+## 当前能力范围
 
-- 建立可增加已注册任务能力的通用工作台基础；未知任务类型必须拒绝，通用界面不代表可执行任意提示词或工具。
+- 提供可增加已注册能力的通用工作台基础；未知任务类型必须拒绝，通用界面不代表可执行任意提示词或工具。
 - 从独立能力栏目发现已注册能力，或在通用输入框中使用 `@名称` 调用；主界面不固定绑定某项能力的表单。
 - 公开 GitHub 仓库固定 SHA，限制文件和获取范围。
 - 单 Agent 通过只读工具收集证据，不安装或执行目标仓库代码。
@@ -63,29 +63,25 @@ CI 配置见 [.github/workflows/ci.yml](.github/workflows/ci.yml)，执行根 wo
 - 展示运行事件、证据和产物，支持取消。
 - 离线自动测试与单独授权的在线模型评测。
 
-`npm run demo:offline` 使用 `fixtures/synthetic-ts-repo`，写入被 Git 忽略的 `artifacts/TASK-004/`。它不会连接网络、读取 API Key、安装或执行 fixture 中的脚本；评测基于预先维护的合成 golden facts，证据支持与无依据断言由人工标注。公开仓库分析入口会获取固定 SHA 快照并生成证据报告；在线评测 CLI 通过单独命令显式启用。一次固定样本的真实模型评测和人工评分已通过质量门，但样本不足以证明模型在其他仓库上的表现。工作台默认离线模式只连接 faux provider 与合成仓库；在浏览器可验证正常对话、取消、能力报告查看和 API 的重连回放。对话、会话上下文、运行和幂等表只存在于当前进程，重启后不可恢复；服务进程全局最多运行一个 Agent。当前只注册公开仓库分析一种能力；不支持登录、多 Agent、Docker 执行、RAG 或长期记忆。
+`npm run demo:offline` 使用 `fixtures/synthetic-ts-repo`，写入被 Git 忽略的本地 `artifacts/` 目录。它不会连接网络、读取 API Key、安装或执行 fixture 中的脚本；评测基于预先维护的合成 golden facts，证据支持与无依据断言由人工标注。公开仓库分析入口会获取固定 SHA 快照并生成证据报告；在线评测 CLI 通过单独命令显式启用。一次固定样本的真实模型评测和人工评分已通过质量门，但样本不足以证明模型在其他仓库上的表现。工作台默认离线模式只连接 faux provider 与合成仓库；在浏览器可验证正常对话、取消、能力报告查看和 API 的重连回放。对话、会话上下文、运行和幂等表只存在于当前进程，重启后不可恢复；服务进程全局最多运行一个 Agent。当前只注册公开仓库分析一种能力；不支持登录、多 Agent、Docker 执行、RAG 或长期记忆。
 
 ### 在线模型评测
 
 `@pi-workbench/reporting` 提供 `eval:public` CLI。离线模式用于查看帮助和评分既有运行；真实调用须在项目根目录本地配置 `.env` 中的 `DEEPSEEK_API_KEY`，并显式传入 `--online` 与 `--max-cost-cny`。应用侧 Token、时长和费用阈值按 provider 返回的 usage 事后核算，是软预算而非服务端硬限额。真实凭据和运行产物不得提交。
 
-### TASK-005 公开仓库分析入口
+### 公开仓库分析入口
 
 从 `@pi-workbench/reporting` 导入 `runPublicRepositoryAnalysis`。调用方必须显式提供 PI provider、model、credentials、价格表和运行预算；适配层不会加载个人 PI 配置，也不会自动开启网络模型。分支或 tag ref 会先解析为完整 SHA；完整 SHA 输入直接获取该不可变版本。Agent 只能列举、读取、检索快照和登记证据，仓库文件（包括 AGENTS.md）均按数据处理，不安装或执行源码。
 
 必需的调用参数包括 repository（公开 GitHub HTTPS URL 与可选 ref）、cacheDirectory、outputDirectory、credentials、provider、model、budget 和 pricing。成功时返回结构化结果、SHA 快照信息、产物路径以及 report.json、report.md、manifest.json 和 events.jsonl 的校验引用。入口实现见 [public-runner.ts](packages/reporting/src/public-runner.ts)。
 
-TASK-005 的首个评测样例固定为 sindresorhus/slugify@7c318bd1aa4b4affab29761f15a9604323fe2a3b，许可为 MIT；人工必答事实见 [public-repository-facts.json](evals/public-repository-facts.json)。真实仓库到报告已通过 faux provider 验证，不代表真实模型质量。真实模型评测需另行明确模型、价格、Token/成本上限并授权。
+首个评测样例固定为 sindresorhus/slugify@7c318bd1aa4b4affab29761f15a9604323fe2a3b，许可为 MIT；人工必答事实见 [public-repository-facts.json](evals/public-repository-facts.json)。真实仓库到报告已通过 faux provider 验证，不代表真实模型质量。真实模型评测需另行明确模型、价格、Token/成本上限并授权。
 
 ## 开发与协作
 
-- [项目计划](doc/plan.md)
-- [任务索引](doc/tasks/README.md)
-- [PI SDK 集成决策](doc/decisions/001-pi-sdk-integration.md)
-- [协作与交接流程](doc/multi-agent-workflow.md)
-- [仓库规则](AGENTS.md)
+项目计划、任务记录和内部协作说明只在维护者本地保存，不纳入公开仓库。仓库规则见 [AGENTS.md](AGENTS.md)。
 
-先读任务卡再修改，默认一个任务分支和一个写入者。Issue 可选；PR 记录问题、验证与限制。提交前检查差异，不提交模型凭据、本地运行数据或私有笔记。SDK 源码参考目录不是启动前置条件。
+维护者在本地按任务记录协作，默认一个任务分支和一个写入者。Issue 可选；PR 记录问题、验证与限制。提交前检查差异，不提交模型凭据、本地运行数据或私有笔记。SDK 源码参考目录不是启动前置条件。
 
 ## 依赖与许可证
 

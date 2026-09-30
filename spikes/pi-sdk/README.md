@@ -52,6 +52,6 @@ npm run spike
 - `src/checks.ts`：七个行为场景。
 - `src/assertions.ts`：被正常及负向样例共同调用的严格断言。
 - `tests/spike.test.ts`：回归测试。
-- [ADR-001](../../doc/decisions/001-pi-sdk-integration.md)：观察结果和未来适配层约束。
+- PI SDK 的观察结果和未来适配层约束由维护者在本地规划文档中维护，不纳入公开仓库。
 
-真实模型质量与费用尚未验证。干净安装与 Node.js 24 的实际验证记录见 [TASK-003](../../doc/tasks/003-project-foundation.md)。
+真实模型质量与费用尚未验证。干净安装与 Node.js 24 的验证记录由维护者在本地维护。
