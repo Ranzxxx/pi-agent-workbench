@@ -24,6 +24,12 @@ artifacts/
 # Private engineering notes; do not publish to GitHub
 doc/internal/
 
+# Local-only project planning and execution records
+/doc/plan.md
+/doc/tasks/
+/doc/decisions/
+/doc/multi-agent-workflow.md
+
 # Editor and operating-system files
 .DS_Store
 .idea/

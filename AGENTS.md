@@ -61,4 +61,4 @@
 
 任务完成或暂停时记录状态、完成/未完成内容、修改路径、验证命令和结果、已知问题、未验证事项、提交 SHA（无则写明）、下一位 Agent 的第一个动作。同步任务索引，只有里程碑变化才更新计划。
 
-详细流程与提示词见 [doc/multi-agent-workflow.md](doc/multi-agent-workflow.md)。
+详细流程与提示词由维护者在本地 `doc/multi-agent-workflow.md` 中维护，不随公开仓库发布。
