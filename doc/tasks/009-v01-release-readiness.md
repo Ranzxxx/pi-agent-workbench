@@ -78,13 +78,14 @@ git diff --check
 - `npm run build`：Web 生产构建通过。沙箱内首次运行无法解析 TypeScript `--showConfig` 输出；沙箱外同一固定工具链重跑通过。
 - `npm run spike`：离线 spike 通过。沙箱内首次启动因 tsx IPC 管道返回 `EPERM`；沙箱外重跑通过。
 - `git diff --check`：通过。构建生成的 `apps/web/next-env.d.ts` 已恢复；没有保留允许路径以外的变更。
+- 工作树 home-path 扫描：无命中（退出码 1 表示未匹配）；该检查不扫描 Git 历史，历史路径按用户决定保留。
 
 ## 发布前审计结果
 
 - GitHub 仓库当前为 private；打开 PR 前有 19 个远端分支，PR #20 创建后为 20 个，本地远端跟踪引用与 GitHub 分支名一致。最新本地快照有 461 个可达 Git 对象（约 2.41 MB blob 内容）。
 - 自定义模式扫描未发现 GitHub/npm/provider token、私钥标记、JWT、真实凭据赋值或含凭据 URL。扫描器只做有限模式匹配；环境中没有安装 Gitleaks 或 TruffleHog，不能将结果称为对所有秘密的证明。
 - 邮箱模式只匹配到 `packages/tools/tests/public-github-snapshot.test.ts` 中用于拒绝 user-info URL 的合成恶意 URL；没有发现真实邮箱。数字/电话启发式命中来自 SVG 坐标、版本、动作运行号、哈希和费用/Token 测试数据，复核为非电话号码。唯一提交者邮箱使用 GitHub noreply 地址。
-- PR 创建前取得的 59 次 GitHub Actions 运行均为成功，已逐一检查其 job 日志中的令牌、凭据、私钥、JWT、邮箱和凭据 URL 模式，未发现命中。PR checks #61/#63 通过，日志扫描也无上述模式命中。push 触发的两份新日志未能通过当前 GitHub Actions 接口单独取得，故未声称覆盖这两份新增日志。CI workflow 不配置真实模型凭据。
+- PR 创建前取得的 59 次 GitHub Actions 运行均为成功，已逐一检查其 job 日志中的令牌、凭据、私钥、JWT、邮箱和凭据 URL 模式，未发现命中。PR checks #61/#63/#65 通过，日志扫描也无上述模式命中。push 触发的 PR 分支日志未能通过当前 GitHub Actions 接口单独取得，故不声称覆盖这些新增日志。CI workflow 不配置真实模型凭据。
 - `doc/internal/`、`.env`、运行 artifacts 和日志不在任何可达 Git 历史路径中；根 `.gitignore` 排除这些本地数据。工作区有一个被忽略且未跟踪的 `.env` 文件；未读取其内容，也不纳入本次发布内容。
 - 已在 9 个当前跟踪文件中定位本机绝对 home 路径，并替换为仓库相对路径或通用工作区描述。当前工作树 `rg` 扫描无此类路径命中。按用户选择不改写历史；旧提交和未更新的既有远端分支仍含这些路径，修改合并后旧提交也继续可达。
 - 根 `LICENSE` 为 MIT，README 声明项目采用 MIT；`pi/` 参考源码没有被跟踪，PI SDK 以依赖包使用。用户已确认自有代码均有权按 MIT 发布。`package-lock.json` 中 372 个依赖条目的许可证元数据包含 14 个 LGPL 条目、1 个 CC-BY-4.0 条目，另有 7 个 workspace 条目未声明许可证；清单包括平台可选包，尚未逐包核验许可证文本、实际分发形态和兼容性，不能仅凭 SPDX 字段得出法律结论。
