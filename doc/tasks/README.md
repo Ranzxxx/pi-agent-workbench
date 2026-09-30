@@ -20,8 +20,9 @@ backlog（待开始）→ in_progress（实施）→ review（待验收/集成�
 | [TASK-006 API、SSE 与通用 Agent 工作台基础界面](006-web-workbench.md) | done | 主 Agent | PR #14 已合并至 main；GitHub Actions #39 成功；本地 main 已快进同步。仍保留真实 socket 断线重连未端到端模拟等限制 |
 | [TASK-007 v0.1 Review 问题修复与回归验收](007-v01-review-fixes.md) | done | Codex | PR #17 已 squash 合并至 `main`（`cede3fd`）；浏览器完整交互和固定工具链仍有任务卡记录的后补验证项 |
 | [TASK-008 v0.1 收尾与聚焦验证](008-v01-closeout.md) | done | Codex 主 Agent | PR #18 已 squash 合并至 `main`（`f31681b`）；GitHub Actions Offline checks #53 全部通过 |
+| [TASK-009 v0.1.0 开源发布准备](009-v01-release-readiness.md) | review | Codex 主 Agent | README 与审计完成；等 PR review、用户确认 MIT 权属和评测元数据披露意愿 |
 
-TASK-007 已完成 v0.1 Review 问题修复并集成；TASK-008 的 v0.1 收尾和聚焦检查已完成并经 PR #18 集成。当前没有预先决定 TASK-009 或后续产品功能。TASK-005 的在线质量结果来自一个固定样本，不构成跨仓库泛化保证。真实 socket 断线重连和真实在线运行完整元数据仍是已有验证限制；本任务没有把这些限制误记为通过。详细修复与回归记录见 [TASK-007 任务卡](007-v01-review-fixes.md)，本轮收尾范围见 [TASK-008 任务卡](008-v01-closeout.md)。
+TASK-007 已完成 v0.1 Review 问题修复并集成；TASK-008 的 v0.1 收尾和聚焦检查已完成并经 PR #18 集成。TASK-009 已补全 v0.1.0 README 并审计当前分支、Git 历史与 Actions 日志，正在 review。公开前仍需确认 MIT 授权权利、TASK-005 模型评测元数据披露意愿，以及旧文档中的本地绝对路径是否清理。TASK-005 的在线质量结果来自一个固定样本，不构成跨仓库泛化保证。真实 socket 断线重连和真实在线运行完整元数据仍是已有验证限制；相关任务没有把这些限制误记为通过。详细修复与回归记录见 [TASK-007 任务卡](007-v01-review-fixes.md)，v0.1 收尾范围见 [TASK-008 任务卡](008-v01-closeout.md)，发布准备范围见 [TASK-009 任务卡](009-v01-release-readiness.md)。
 
 ## 创建与交接
 
