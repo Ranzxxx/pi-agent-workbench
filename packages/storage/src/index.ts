@@ -49,6 +49,15 @@ export interface ProjectRecord {
   id: string; displayName: string; canonicalRoot: string; directoryIdentity: string | null;
   validationState: "valid" | "missing" | "needs_review"; createdAt: string; lastAccessedAt: string;
 }
+export interface AttachmentRecord {
+  id: string; conversationId: string; objectSha256: string; fileName: string; relativePath: string;
+  byteSize: number; mediaType: "text/plain; charset=utf-8"; createdAt: string;
+}
+export interface ProjectRulesRecord {
+  projectId: string; sourcePath: string; sourceSha256: string; sourceVersion: string; content: string;
+  acceptedAt: string; revokedAt: string | null;
+}
+export interface GarbageRecord { kind: "attachment_object" | "run_artifacts"; objectRef: string; attempts: number; }
 export interface ConversationRecord {
   id: string; projectId: string | null; piSessionId: string | null; title: string;
   status: "active" | "archived" | "recovery_required"; createdAt: string; updatedAt: string;
@@ -99,6 +108,9 @@ interface Context {
 
 export class Storage {
   readonly projects: ProjectRepository;
+  readonly attachments: AttachmentRepository;
+  readonly projectRules: ProjectRulesRepository;
+  readonly garbage: GarbageRepository;
   readonly conversations: ConversationRepository;
   readonly messages: MessageRepository;
   readonly snapshots: SessionSnapshotRepository;
@@ -118,6 +130,9 @@ export class Storage {
     this.path = path;
     this.readOnly = readOnly;
     this.projects = new ProjectRepository(context);
+    this.attachments = new AttachmentRepository(context);
+    this.projectRules = new ProjectRulesRepository(context);
+    this.garbage = new GarbageRepository(context);
     this.conversations = new ConversationRepository(context);
     this.messages = new MessageRepository(context);
     this.snapshots = new SessionSnapshotRepository(context);
@@ -253,6 +268,123 @@ export class ProjectRepository {
     const result = this.context.atomic((db) => db.prepare("UPDATE projects SET last_accessed_at = ? WHERE id = ?").run(lastAccessedAt, id));
     if (result.changes !== 1) throw new StorageError("not_found", "Project was not found");
   }
+  updateValidation(id: string, validationState: ProjectRecord["validationState"], directoryIdentity: string | null): ProjectRecord {
+    const result = this.context.atomic((db) => db.prepare("UPDATE projects SET validation_state = ?, directory_identity = ? WHERE id = ?")
+      .run(validationState, directoryIdentity, id));
+    if (result.changes !== 1) throw new StorageError("not_found", "Project was not found");
+    return this.get(id)!;
+  }
+}
+
+export class AttachmentRepository {
+  constructor(private readonly context: Context) {}
+  add(input: Omit<AttachmentRecord, "createdAt"> & { createdAt?: string }): AttachmentRecord {
+    assertId(input.id, "Attachment id"); assertId(input.conversationId, "Conversation id");
+    if (!/^[a-f0-9]{64}$/u.test(input.objectSha256)) throw new StorageError("invalid_input", "Attachment object hash is invalid");
+    if (!input.fileName.trim() || input.fileName.length > 512 || !input.relativePath.trim() || input.relativePath.length > 4096) throw new StorageError("invalid_input", "Attachment name is invalid");
+    if (!Number.isSafeInteger(input.byteSize) || input.byteSize < 0 || input.byteSize > 20 * 1024 * 1024) throw new StorageError("invalid_input", "Attachment size is invalid");
+    const createdAt = input.createdAt ?? new Date().toISOString(); assertTimestamp(createdAt);
+    this.context.atomic((db) => {
+      const queued = db.prepare("SELECT status FROM garbage_queue WHERE kind = 'attachment_object' AND object_ref = ?").get(input.objectSha256) as { status: string } | undefined;
+      if (queued?.status === "deleting") throw new StorageError("conflict", "Attachment object is being reclaimed; retry the import");
+      if (queued) db.prepare("DELETE FROM garbage_queue WHERE kind = 'attachment_object' AND object_ref = ?").run(input.objectSha256);
+      db.prepare("INSERT INTO attachment_objects(sha256, byte_size, created_at) VALUES (?, ?, ?) ON CONFLICT(sha256) DO NOTHING")
+        .run(input.objectSha256, input.byteSize, createdAt);
+      const object = db.prepare("SELECT byte_size FROM attachment_objects WHERE sha256 = ?").get(input.objectSha256) as { byte_size: number } | undefined;
+      if (!object || object.byte_size !== input.byteSize) throw new StorageError("conflict", "Attachment object metadata does not match");
+      db.prepare(`INSERT INTO attachments(id, conversation_id, object_sha256, file_name, relative_path, byte_size, media_type, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(input.id, input.conversationId, input.objectSha256, input.fileName, input.relativePath, input.byteSize, input.mediaType, createdAt);
+    });
+    return this.get(input.id)!;
+  }
+  addMany(inputs: Array<Omit<AttachmentRecord, "createdAt"> & { createdAt?: string }>): AttachmentRecord[] {
+    const ids: string[] = [];
+    this.context.atomic(() => { for (const input of inputs) ids.push(this.add(input).id); });
+    return ids.map((id) => this.get(id)!);
+  }
+  get(id: string): AttachmentRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM attachments WHERE id = ?").get(id) as AttachmentRow | undefined;
+    return row && mapAttachment(row);
+  }
+  getForConversation(id: string, conversationId: string): AttachmentRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM attachments WHERE id = ? AND conversation_id = ?").get(id, conversationId) as AttachmentRow | undefined;
+    return row && mapAttachment(row);
+  }
+  list(conversationId: string): AttachmentRecord[] {
+    return (this.context.db.prepare("SELECT * FROM attachments WHERE conversation_id = ? ORDER BY created_at, id").all(conversationId) as AttachmentRow[]).map(mapAttachment);
+  }
+  referenceCount(sha256: string): number {
+    return numberFrom(this.context.db.prepare("SELECT COUNT(*) AS count FROM attachments WHERE object_sha256 = ?").get(sha256), "count");
+  }
+}
+
+export class ProjectRulesRepository {
+  constructor(private readonly context: Context) {}
+  get(projectId: string): ProjectRulesRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM project_rules WHERE project_id = ?").get(projectId) as ProjectRulesRow | undefined;
+    return row && mapProjectRules(row);
+  }
+  accept(input: ProjectRulesRecord): ProjectRulesRecord {
+    assertId(input.projectId, "Project id");
+    if (!/^[a-f0-9]{64}$/u.test(input.sourceSha256) || input.content.length > 65_536 || !input.sourcePath || !input.sourceVersion) throw new StorageError("invalid_input", "Project rules record is invalid");
+    assertTimestamp(input.acceptedAt);
+    if (input.revokedAt) assertTimestamp(input.revokedAt);
+    this.context.atomic((db) => db.prepare(`INSERT INTO project_rules(project_id, source_path, source_sha256, source_version, content, accepted_at, revoked_at)
+      VALUES (?, ?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(project_id) DO UPDATE SET source_path=excluded.source_path, source_sha256=excluded.source_sha256,
+      source_version=excluded.source_version, content=excluded.content, accepted_at=excluded.accepted_at, revoked_at=NULL`)
+      .run(input.projectId, input.sourcePath, input.sourceSha256, input.sourceVersion, input.content, input.acceptedAt));
+    return this.get(input.projectId)!;
+  }
+  revoke(projectId: string, revokedAt = new Date().toISOString()): ProjectRulesRecord {
+    assertTimestamp(revokedAt);
+    const result = this.context.atomic((db) => db.prepare("UPDATE project_rules SET revoked_at = ? WHERE project_id = ? AND revoked_at IS NULL").run(revokedAt, projectId));
+    if (result.changes !== 1) throw new StorageError("not_found", "Active project rules were not found");
+    return this.get(projectId)!;
+  }
+}
+
+export class GarbageRepository {
+  constructor(private readonly context: Context) {}
+  list(limit = 100): GarbageRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new TypeError("Garbage queue limit is invalid");
+    const rows = this.context.db.prepare("SELECT kind, object_ref, attempts FROM garbage_queue ORDER BY queued_at, kind, object_ref LIMIT ?").all(limit) as GarbageRow[];
+    return rows.map((row) => ({ kind: row.kind, objectRef: row.object_ref, attempts: row.attempts }));
+  }
+  enqueue(item: Pick<GarbageRecord, "kind" | "objectRef">): void {
+    if (item.kind === "attachment_object" && !/^[a-f0-9]{64}$/u.test(item.objectRef)) throw new StorageError("invalid_input", "Attachment object reference is invalid");
+    if (item.kind === "run_artifacts") assertId(item.objectRef, "Run id");
+    this.context.atomic((db) => db.prepare("INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES (?, ?, ?) ON CONFLICT(kind, object_ref) DO NOTHING")
+      .run(item.kind, item.objectRef, new Date().toISOString()));
+  }
+  claim(item: Pick<GarbageRecord, "kind" | "objectRef">): boolean {
+    return this.context.atomic((db) => {
+      const row = db.prepare("SELECT status FROM garbage_queue WHERE kind = ? AND object_ref = ?").get(item.kind, item.objectRef) as { status: string } | undefined;
+      if (!row) return false;
+      if (item.kind === "attachment_object") {
+        const refs = numberFrom(db.prepare("SELECT COUNT(*) AS count FROM attachments WHERE object_sha256 = ?").get(item.objectRef), "count");
+        if (refs > 0) { db.prepare("DELETE FROM garbage_queue WHERE kind = ? AND object_ref = ?").run(item.kind, item.objectRef); return false; }
+      }
+      if (row.status !== "pending") return false;
+      return db.prepare("UPDATE garbage_queue SET status = 'deleting' WHERE kind = ? AND object_ref = ? AND status = 'pending'").run(item.kind, item.objectRef).changes === 1;
+    });
+  }
+  resetClaims(): void { this.context.atomic((db) => db.prepare("UPDATE garbage_queue SET status = 'pending' WHERE status = 'deleting'").run()); }
+  complete(item: Pick<GarbageRecord, "kind" | "objectRef">): void {
+    this.context.atomic((db) => {
+      if (item.kind === "attachment_object") {
+        const refs = numberFrom(db.prepare("SELECT COUNT(*) AS count FROM attachments WHERE object_sha256 = ?").get(item.objectRef), "count");
+        if (refs > 0) { db.prepare("DELETE FROM garbage_queue WHERE kind = ? AND object_ref = ?").run(item.kind, item.objectRef); return; }
+        db.prepare("DELETE FROM attachment_objects WHERE sha256 = ?").run(item.objectRef);
+      }
+      db.prepare("DELETE FROM garbage_queue WHERE kind = ? AND object_ref = ?").run(item.kind, item.objectRef);
+    });
+  }
+  fail(item: Pick<GarbageRecord, "kind" | "objectRef">, error: string): void {
+    this.context.atomic((db) => db.prepare("UPDATE garbage_queue SET status = 'pending', attempts = attempts + 1, last_error = ? WHERE kind = ? AND object_ref = ?")
+      .run(error.slice(0, 512), item.kind, item.objectRef));
+  }
 }
 
 export class ConversationRepository {
@@ -311,6 +443,18 @@ export class ConversationRepository {
       if (slot) throw new StorageError("active_task", "Conversation worker exit has not been confirmed");
       const worker = db.prepare("SELECT status FROM worker_identity WHERE singleton = 1").get() as { status: string } | undefined;
       if (worker && (worker.status === "stopping" || worker.status === "uncertain")) throw new StorageError("active_task", "Worker exit has not been confirmed");
+
+      const objectHashes = db.prepare("SELECT DISTINCT object_sha256 FROM attachments WHERE conversation_id = ?").all(id) as Array<{ object_sha256: string }>;
+      const runIds = db.prepare("SELECT id FROM runs WHERE conversation_id = ?").all(id) as Array<{ id: string }>;
+      const queuedAt = new Date().toISOString();
+      db.prepare("DELETE FROM attachments WHERE conversation_id = ?").run(id);
+      for (const { object_sha256 } of objectHashes) {
+        const refs = numberFrom(db.prepare("SELECT COUNT(*) AS count FROM attachments WHERE object_sha256 = ?").get(object_sha256), "count");
+        if (refs === 0) db.prepare(`INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES ('attachment_object', ?, ?)
+          ON CONFLICT(kind, object_ref) DO NOTHING`).run(object_sha256, queuedAt);
+      }
+      for (const { id: runId } of runIds) db.prepare(`INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES ('run_artifacts', ?, ?)
+        ON CONFLICT(kind, object_ref) DO NOTHING`).run(runId, queuedAt);
 
       db.prepare("DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?)").run(id);
       db.prepare("DELETE FROM checkpoints WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?)").run(id);
@@ -882,6 +1026,9 @@ function isTerminalRunStatus(status: V2RunStatus): boolean {
 }
 
 type ProjectRow = { id: string; display_name: string; canonical_root: string; directory_identity: string | null; validation_state: ProjectRecord["validationState"]; created_at: string; last_accessed_at: string };
+type AttachmentRow = { id: string; conversation_id: string; object_sha256: string; file_name: string; relative_path: string; byte_size: number; media_type: AttachmentRecord["mediaType"]; created_at: string };
+type ProjectRulesRow = { project_id: string; source_path: string; source_sha256: string; source_version: string; content: string; accepted_at: string; revoked_at: string | null };
+type GarbageRow = { kind: GarbageRecord["kind"]; object_ref: string; attempts: number };
 type ConversationRow = { id: string; project_id: string | null; pi_session_id: string | null; title: string; status: ConversationRecord["status"]; created_at: string; updated_at: string };
 type MessageRow = { id: string; conversation_id: string; run_id: string | null; sequence: number; role: MessageRecord["role"]; content: string; source: MessageRecord["source"]; extension_id: string | null; attachment_refs_json: string; created_at: string };
 type SnapshotRow = { id: string; conversation_id: string; version: number; sdk_version: string; format_version: string; snapshot_json: string; summary: string | null; created_at: string };
@@ -896,6 +1043,14 @@ type WorkerIdentityRow = { boot_id: string; pid: number; process_start: string; 
 function mapProject(row: ProjectRow): ProjectRecord {
   return { id: row.id, displayName: row.display_name, canonicalRoot: row.canonical_root, directoryIdentity: row.directory_identity,
     validationState: row.validation_state, createdAt: row.created_at, lastAccessedAt: row.last_accessed_at };
+}
+function mapAttachment(row: AttachmentRow): AttachmentRecord {
+  return { id: row.id, conversationId: row.conversation_id, objectSha256: row.object_sha256, fileName: row.file_name,
+    relativePath: row.relative_path, byteSize: row.byte_size, mediaType: row.media_type, createdAt: row.created_at };
+}
+function mapProjectRules(row: ProjectRulesRow): ProjectRulesRecord {
+  return { projectId: row.project_id, sourcePath: row.source_path, sourceSha256: row.source_sha256,
+    sourceVersion: row.source_version, content: row.content, acceptedAt: row.accepted_at, revokedAt: row.revoked_at };
 }
 function mapConversation(row: ConversationRow): ConversationRecord {
   return { id: row.id, projectId: row.project_id, piSessionId: row.pi_session_id, title: row.title,
