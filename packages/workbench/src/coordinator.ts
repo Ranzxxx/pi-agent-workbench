@@ -275,11 +275,11 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
         ...(options.apiKey ? { apiKey: options.apiKey } : {}), ...(options.githubToken ? { githubToken: options.githubToken } : {}),
         ...(options.workerStartupTimeoutMs ? { startupTimeoutMs: options.workerStartupTimeoutMs } : {}),
       });
-      worker = candidate;
       const processStart = await procStart(candidate.pid);
       if (!processStart) throw new Error("Worker process identity could not be verified");
       const startedAt = now();
       storage.workerIdentity.save({ bootId: candidate.bootId, pid: candidate.pid, processStart, status: "idle", startedAt, heartbeatAt: startedAt });
+      worker = candidate;
     } catch {
       workerUnavailable = true;
       if (candidate && await candidate.shutdown()) worker = undefined;
