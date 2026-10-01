@@ -1,354 +1,325 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
-import { InMemoryCredentialStore } from "@pi-workbench/agent-runtime";
+import { DatabaseSync } from "node:sqlite";
+import { openStorage, resolveDatabasePath, StorageError } from "@pi-workbench/storage";
 import { createWorkbenchApp } from "../src/app.js";
-import { createFakeChatConfiguration, type ModelConfiguration } from "../src/model-config.js";
-import type { WorkbenchRun } from "@pi-workbench/protocol";
+import type { V2Conversation, V2Run } from "@pi-workbench/protocol";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
-}
-async function temporaryRoot(): Promise<string> { return mkdtemp(path.join(os.tmpdir(), "pi-workbench-task006-")); }
-async function waitForRun(app: Awaited<ReturnType<typeof createWorkbenchApp>>, runId: string): Promise<WorkbenchRun> {
-  for (let attempt = 0; attempt < 300; attempt++) {
-    const response = await app.inject({ method: "GET", url: `/api/v1/runs/${runId}` });
-    assert.equal(response.statusCode, 200);
-    const run = response.json<WorkbenchRun>();
-    if (["completed", "failed", "cancelled"].includes(run.status)) return run;
-    await sleep(10);
-  }
-  throw new Error(`Run ${runId} did not reach a terminal state`);
-}
-async function createConversation(app: Awaited<ReturnType<typeof createWorkbenchApp>>): Promise<string> {
-  const response = await app.inject({ method: "POST", url: "/api/v1/conversations", payload: {} });
-  assert.equal(response.statusCode, 201);
-  return response.json<{ conversationId: string }>().conversationId;
-}
-async function submit(app: Awaited<ReturnType<typeof createWorkbenchApp>>, conversationId: string, input: unknown, idem = crypto.randomUUID()) {
-  return app.inject({
-    method: "POST", url: `/api/v1/conversations/${conversationId}/runs`,
-    headers: { "idempotency-key": idem }, payload: { schemaVersion: 1, input },
-  });
-}
-
-await test("Fastify parser errors use the versioned API error envelope", async (t) => {
-  const app = await createWorkbenchApp({ mode: "fake" });
-  t.after(async () => { await app.close(); });
-  const response = await app.inject({
-    method: "POST", url: "/api/v1/conversations",
-    headers: { "content-type": "application/json" }, payload: "not-json",
-  });
-  assert.equal(response.statusCode, 400);
-  assert.deepEqual(Object.keys(response.json()).sort(), ["error", "schemaVersion"]);
-  assert.equal(response.json<{ error: { code: string } }>().error.code, "invalid_request");
-});
-
-await test("unknown run SSE returns a versioned 404 before opening the stream", { timeout: 3000 }, async (t) => {
-  const app = await createWorkbenchApp({ mode: "fake" });
-  t.after(async () => { await app.close(); });
-  const response = await app.inject({ method: "GET", url: "/api/v1/runs/nonexistent/events" });
-  assert.equal(response.statusCode, 404);
-  assert.equal(response.json<{ schemaVersion: number; error: { code: string } }>().schemaVersion, 1);
-  assert.equal(response.json<{ error: { code: string } }>().error.code, "not_found");
-  assert.doesNotMatch(response.headers["content-type"] ?? "", /text\/event-stream/u);
-});
-
-await test("multibyte prompts exceeding runtime bytes are rejected before a run is created", async (t) => {
-  const app = await createWorkbenchApp({ mode: "fake" });
-  t.after(async () => { await app.close(); });
-  const conversationId = await createConversation(app);
-  const rejected = await submit(app, conversationId, { kind: "message", text: "汉".repeat(10_923) });
-  assert.equal(rejected.statusCode, 400);
-  assert.equal(rejected.json<{ error: { code: string } }>().error.code, "invalid_request");
-  const history = await app.inject({ method: "GET", url: `/api/v1/conversations/${conversationId}/runs` });
-  assert.deepEqual(history.json<{ runs: unknown[] }>().runs, []);
-  const accepted = await submit(app, conversationId, { kind: "message", text: "汉".repeat(10_922) });
-  assert.equal(accepted.statusCode, 202);
-  assert.equal((await waitForRun(app, accepted.json<WorkbenchRun>().runId)).status, "completed");
-});
-
-await test("large valid Chinese capability reports are summarized within the PI context byte budget", async (t) => {
-  const root = await temporaryRoot();
-  const fake = fauxProvider({ api: "large-context-test", provider: "large-context-test", models: [{ id: "test" }], tokenSize: { min: 8, max: 8 } });
-  fake.setResponses([fauxAssistantMessage(JSON.stringify({
-    title: "中文仓库分析",
-    claims: Array.from({ length: 32 }, (_, index) => ({
-      id: `unknown-${index}`, kind: "unknown", text: `待确认-${index}：` + "这是一个有效但较长的中文结论。".repeat(60),
-      evidenceIds: [], reason: "当前快照中没有直接证据。",
-    })),
-  }))]);
-  const app = await createWorkbenchApp({
-    mode: "fake", dataDirectory: root,
-    createAnalysisConfiguration: async () => ({
-      credentials: new InMemoryCredentialStore(), provider: fake.provider, model: fake.getModel(),
-      budget: { timeoutMs: 5000, maxModelCalls: 4, maxToolCalls: 4, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
-      pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    }),
-  });
-  t.after(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
-  const conversationId = await createConversation(app);
-  const response = await submit(app, conversationId, {
-    kind: "capability", capabilityId: "public_repository_analysis",
-    input: { repositoryUrl: "https://github.com/demo/harborlight", goal: "给出未知项。" },
-  });
-  assert.equal(response.statusCode, 202);
-  const run = await waitForRun(app, response.json<WorkbenchRun>().runId);
-  assert.equal(run.status, "completed");
-  assert.equal(run.result?.status === "completed" ? run.result.capabilityResult?.claims.length : 0, 32);
-  const followUp = await submit(app, conversationId, { kind: "message", text: "继续讨论这个报告" });
-  assert.equal(followUp.statusCode, 202);
-  assert.equal((await waitForRun(app, followUp.json<WorkbenchRun>().runId)).status, "completed");
-});
-
-await test("versioned API runs ordinary multi-turn prompts; idempotency and run IDs are stable", async (t) => {
-  const root = await temporaryRoot();
+async function temporaryRoot(): Promise<string> { return mkdtemp(path.join(os.tmpdir(), "pi-workbench-task011-")); }
+async function createApp(root: string) {
   const app = await createWorkbenchApp({ mode: "fake", dataDirectory: root });
-  t.after(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
-  const conversationId = await createConversation(app);
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  return { app, baseUrl: address };
+}
+async function createConversation(baseUrl: string): Promise<V2Conversation> {
+  const response = await fetch(`${baseUrl}/api/v2/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(response.status, 201);
+  return await response.json() as V2Conversation;
+}
+async function submit(baseUrl: string, conversationId: string, text: string, idempotencyKey = crypto.randomUUID()): Promise<Response> {
+  return fetch(`${baseUrl}/api/v2/runs`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
+    body: JSON.stringify({ schemaVersion: 2, conversationId, input: { kind: "message", text } }),
+  });
+}
+async function fetchRun(baseUrl: string, runId: string): Promise<V2Run> {
+  const response = await fetch(`${baseUrl}/api/v2/runs/${runId}`);
+  assert.equal(response.status, 200);
+  return await response.json() as V2Run;
+}
+async function waitForRun(baseUrl: string, runId: string, wanted?: string): Promise<V2Run> {
+  for (let attempt = 0; attempt < 500; attempt++) {
+    const run = await fetchRun(baseUrl, runId);
+    if (wanted ? run.status === wanted : ["completed", "failed", "cancelled", "interrupted"].includes(run.status)) return run;
+    await sleep(20);
+  }
+  throw new Error(`Run ${runId} did not reach the expected state`);
+}
+async function waitForWorker(baseUrl: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const response = await fetch(`${baseUrl}/api/v2/health`);
+    const health = await response.json() as { workerReady: boolean };
+    if (health.workerReady) return true;
+    await sleep(25);
+  }
+  return false;
+}
+
+await test("v2 Worker persists ordinary conversations and real SSE replays after restart", { timeout: 30_000 }, async (t) => {
+  const root = await temporaryRoot();
+  let { app, baseUrl } = await createApp(root);
+  t.after(async () => { await app.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); });
+  const health = await fetch(`${baseUrl}/api/v2/health`).then((response) => response.json()) as { workerReady: boolean };
+  assert.equal(health.workerReady, true, "API must wait for its supervised Worker to report ready");
+
+  const conversation = await createConversation(baseUrl);
+  const invalid = await fetch(`${baseUrl}/api/v2/runs`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() },
+    body: JSON.stringify({ schemaVersion: 2, conversationId: conversation.conversationId, input: { kind: "message", text: "" } }),
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json() as { code: string }).code, "invalid_request");
+  assert.deepEqual((await fetch(`${baseUrl}/api/v2/conversations/${conversation.conversationId}/runs`).then((response) => response.json()) as { runs: unknown[] }).runs, []);
   const idem = crypto.randomUUID();
-  const firstResponse = await submit(app, conversationId, { kind: "message", text: "first ordinary prompt" }, idem);
-  assert.equal(firstResponse.statusCode, 202);
-  const first = firstResponse.json<WorkbenchRun>();
-  const replay = await submit(app, conversationId, { kind: "message", text: "first ordinary prompt" }, idem);
-  assert.equal(replay.statusCode, 200);
-  assert.equal(replay.json<WorkbenchRun>().runId, first.runId);
-  const conflict = await submit(app, conversationId, { kind: "message", text: "different body" }, idem);
-  assert.equal(conflict.statusCode, 409);
-  const firstDone = await waitForRun(app, first.runId);
-  assert.equal(firstDone.status, "completed");
-  assert.match(firstDone.result?.status === "completed" ? firstDone.result.reply : "", /first ordinary prompt/u);
-  const cancelAfterFinished = await app.inject({ method: "POST", url: `/api/v1/runs/${first.runId}/cancel`, payload: {} });
-  assert.equal(cancelAfterFinished.statusCode, 200);
-  assert.equal(cancelAfterFinished.json<WorkbenchRun>().status, "completed", "a late cancel cannot overwrite the completed terminal state");
-  const completedEvents = await app.inject({ method: "GET", url: `/api/v1/runs/${first.runId}/events` });
-  assert.equal((completedEvents.payload.match(/event: run\.cancelling\n/gu) ?? []).length, 0);
-  assert.equal((completedEvents.payload.match(/event: run\.finished\n/gu) ?? []).length, 1);
-  const secondResponse = await submit(app, conversationId, { kind: "message", text: "follow-up prompt" });
-  const second = secondResponse.json<WorkbenchRun>();
-  assert.notEqual(second.runId, first.runId);
-  assert.equal(second.conversationId, conversationId);
-  assert.equal((await waitForRun(app, second.runId)).status, "completed");
-  const originalStream = await app.inject({ method: "GET", url: `/api/v1/runs/${second.runId}/events` });
-  assert.equal(originalStream.statusCode, 200);
-  const runFrames = originalStream.payload.split(/\r?\n\r?\n/u).filter((frame) => /^event: /mu.test(frame));
-  assert.ok(runFrames.some((frame) => /^event: run\.finished$/mu.test(frame)));
-  const runEventData = runFrames.map((frame) => JSON.parse(frame.split(/\r?\n/u).find((line) => line.startsWith("data: "))!.slice(6)) as { eventId: string; sequence: number });
-  assert.equal(new Set(runEventData.map((event) => event.eventId)).size, runEventData.length, "run event IDs are unique");
-  for (let index = 1; index < runEventData.length; index++) {
-    assert.ok(runEventData[index]!.sequence > runEventData[index - 1]!.sequence, "run event sequence strictly increases for every event");
-  }
-  const sseReplay = await app.inject({ method: "GET", url: `/api/v1/runs/${second.runId}/events`, headers: { "last-event-id": "cursor-that-fell-out-of-the-ring" } });
-  assert.equal(sseReplay.statusCode, 200);
-  assert.match(sseReplay.payload, /event: stream\.reset/u);
-  assert.doesNotMatch(sseReplay.payload, /event: run\.finished/u);
-  const frames = sseReplay.payload.split(/\r?\n\r?\n/u).filter((frame) => /^event: /mu.test(frame));
-  const resetFrame = frames.find((frame) => /^event: stream\.reset$/mu.test(frame));
-  assert.ok(resetFrame, "expired cursor should emit a reset control frame");
-  const resetData = resetFrame.split(/\r?\n/u).find((line) => line.startsWith("data: "))?.slice(6);
-  assert.ok(resetData);
-  const reset = JSON.parse(resetData) as { eventId: string; type: string; data: { latestEventId?: string; latestSequence: number } };
-  assert.equal(reset.type, "stream.reset");
-  assert.ok(reset.eventId);
-  assert.ok(reset.data.latestEventId);
-  assert.equal(resetFrame.includes(`id: ${reset.eventId}`), false, "control frame ID must not replace EventSource's last real cursor");
-  assert.equal(runEventData.at(-1)?.eventId, reset.data.latestEventId, "reset snapshot points to the latest actual run event");
-  assert.equal(runEventData.at(-1)?.sequence, reset.data.latestSequence);
-  const resumed = await app.inject({ method: "GET", url: `/api/v1/runs/${second.runId}/events?after=${encodeURIComponent(reset.data.latestEventId!)}` });
-  assert.equal(resumed.statusCode, 200);
-  assert.doesNotMatch(resumed.payload, /event: stream\.reset/u, "resume uses latest real event ID rather than the control-frame ID");
-  assert.doesNotMatch(resumed.payload, /event: run\.finished/u, "the already-consumed terminal event is not replayed again");
-  const loaded = await app.inject({ method: "GET", url: `/api/v1/conversations/${conversationId}` });
-  assert.equal(loaded.json<{ messages: unknown[] }>().messages.length, 4);
-});
+  const submitted = await submit(baseUrl, conversation.conversationId, "first persisted prompt", idem);
+  assert.equal(submitted.status, 202);
+  const first = await submitted.json() as V2Run;
+  assert.equal(first.schemaVersion, 2);
+  assert.equal(first.status, "running");
+  const done = await waitForRun(baseUrl, first.runId, "completed");
+  assert.match(done.result?.status === "completed" ? done.result.reply : "", /first persisted prompt/u);
 
-await test("global concurrency, cancellation, retry association, and unknown capability rejection", async (t) => {
-  const root = await temporaryRoot();
-  const app = await createWorkbenchApp({ mode: "fake", dataDirectory: root });
-  t.after(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
-  const firstConversation = await createConversation(app);
-  const secondConversation = await createConversation(app);
-  const slowResponse = await submit(app, firstConversation, { kind: "message", text: "[[fake:slow]] keep waiting" });
-  const slow = slowResponse.json<WorkbenchRun>();
-  assert.equal((await submit(app, secondConversation, { kind: "message", text: "must be busy" })).statusCode, 409);
-  await sleep(30);
-  const cancel = await app.inject({ method: "POST", url: `/api/v1/runs/${slow.runId}/cancel`, payload: {} });
-  assert.equal(cancel.statusCode, 200);
-  assert.equal((await waitForRun(app, slow.runId)).status, "cancelled");
-  const history = await app.inject({ method: "GET", url: `/api/v1/conversations/${firstConversation}` });
-  assert.equal(history.json<{ messages: Array<{ role: string }> }>().messages.some((message) => message.role === "assistant"), false);
+  const replay = await submit(baseUrl, conversation.conversationId, "first persisted prompt", idem);
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json() as V2Run).runId, first.runId);
+  const conflict = await submit(baseUrl, conversation.conversationId, "different prompt", idem);
+  assert.equal(conflict.status, 409);
 
-  const failedResponse = await submit(app, secondConversation, { kind: "message", text: "[[fake:fail]]" });
-  const failed = failedResponse.json<WorkbenchRun>();
-  assert.equal((await waitForRun(app, failed.runId)).status, "failed");
-  const retryResponse = await app.inject({ method: "POST", url: `/api/v1/runs/${failed.runId}/retry`, headers: { "idempotency-key": crypto.randomUUID() }, payload: {} });
-  assert.equal(retryResponse.statusCode, 202);
-  const retried = retryResponse.json<WorkbenchRun>();
+  const originalSse = await fetch(`${baseUrl}/api/v2/runs/${first.runId}/events`);
+  assert.equal(originalSse.status, 200);
+  assert.match(originalSse.headers.get("content-type") ?? "", /text\/event-stream/u);
+  const frames = (await originalSse.text()).split(/\r?\n\r?\n/u).filter((frame) => /^event: /mu.test(frame));
+  const actualEvents = frames.filter((frame) => !/^event: stream\.reset$/mu.test(frame));
+  assert.ok(actualEvents.some((frame) => /^event: run.completed$/mu.test(frame)), actualEvents.join("\n\n"));
+  const eventIds = actualEvents.map((frame) => frame.match(/^id: ([A-Za-z0-9_-]+)$/mu)?.[1]).filter(Boolean) as string[];
+  assert.ok(eventIds.length >= 4);
+  assert.equal(new Set(eventIds).size, eventIds.length);
+
+  const reconnected = await fetch(`${baseUrl}/api/v2/runs/${first.runId}/events`, { headers: { "last-event-id": eventIds[0]! } });
+  const resumedFrames = (await reconnected.text()).split(/\r?\n\r?\n/u).filter((frame) => /^event: /mu.test(frame));
+  assert.equal(resumedFrames.some((frame) => frame.includes(`id: ${eventIds[0]}`)), false);
+  assert.ok(resumedFrames.some((frame) => /^event: run.completed$/mu.test(frame)));
+
+  const db = openStorage({ dataDirectory: { dataDirectory: root } });
+  assert.equal(db.snapshots.latest(conversation.conversationId)?.sdkVersion, "0.86.1");
+  assert.ok(db.events.latestSequence(first.runId) >= eventIds.length);
+  assert.equal(db.attempts.list(first.runId).length, 1);
+  db.close();
+
+  await app.close();
+  ({ app, baseUrl } = await createApp(root));
+  assert.equal(await waitForWorker(baseUrl), true);
+  const loaded = await fetch(`${baseUrl}/api/v2/conversations/${conversation.conversationId}`).then((response) => response.json()) as V2Conversation;
+  assert.equal(loaded.messages.length, 2);
+  assert.equal((await fetchRun(baseUrl, first.runId)).status, "completed");
+  const next = await submit(baseUrl, conversation.conversationId, "continue the durable session");
+  assert.equal(next.status, 202);
+  assert.equal((await waitForRun(baseUrl, (await next.json() as V2Run).runId, "completed")).status, "completed");
+
+  const failedResponse = await submit(baseUrl, conversation.conversationId, "[[fake:fail]] test retry behavior");
+  const failed = await failedResponse.json() as V2Run;
+  assert.equal((await waitForRun(baseUrl, failed.runId, "failed")).status, "failed");
+  const retriedResponse = await fetch(`${baseUrl}/api/v2/runs/${failed.runId}/retry`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: "{}",
+  });
+  assert.equal(retriedResponse.status, 202);
+  const retried = await retriedResponse.json() as V2Run;
   assert.notEqual(retried.runId, failed.runId);
   assert.equal(retried.retryOfRunId, failed.runId);
-  assert.equal((await waitForRun(app, retried.runId)).status, "failed");
-
-  const unsupported = await submit(app, secondConversation, { kind: "capability", capabilityId: "not_registered", input: {} });
-  assert.equal(unsupported.statusCode, 400);
-  assert.equal(unsupported.json<{ error: { code: string } }>().error.code, "unsupported_capability");
+  assert.equal((await waitForRun(baseUrl, retried.runId, "failed")).status, "failed");
 });
 
-await test("analysis cancellation-pending keeps the global run lock until an uncooperative provider exits", { timeout: 10000 }, async (t) => {
+await test("global Worker slot serializes runs; cancellation waits for stop and conversation deletion is permanent", { timeout: 30_000 }, async (t) => {
   const root = await temporaryRoot();
-  const entered = deferred<void>();
-  const release = deferred<void>();
-  const fake = fauxProvider({ api: "pending-analysis-test", provider: "pending-analysis-test", models: [{ id: "test" }], tokenSize: { min: 8, max: 8 } });
-  fake.setResponses([async () => {
-    entered.resolve();
-    await release.promise; // Deliberately ignores AbortSignal to exercise the grace period.
-    return fauxAssistantMessage("", { stopReason: "aborted" });
-  }]);
-  const app = await createWorkbenchApp({
-    mode: "fake", dataDirectory: root,
-    createAnalysisConfiguration: async () => ({
-      credentials: new InMemoryCredentialStore(), provider: fake.provider, model: fake.getModel(),
-      budget: { timeoutMs: 30, maxModelCalls: 4, maxToolCalls: 4, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
-      pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    }),
+  let { app, baseUrl } = await createApp(root);
+  t.after(async () => { await app.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); });
+  const first = await createConversation(baseUrl);
+  const second = await createConversation(baseUrl);
+  const activeKey = crypto.randomUUID();
+  const running = await submit(baseUrl, first.conversationId, "[[fake:slow]] keep waiting", activeKey);
+  assert.equal(running.status, 202);
+  const run = await running.json() as V2Run;
+  await waitForRun(baseUrl, run.runId, "running");
+  const duplicate = await submit(baseUrl, first.conversationId, "[[fake:slow]] keep waiting", activeKey);
+  assert.equal(duplicate.status, 200, "a retry with the same idempotency key must replay the active run");
+  assert.equal((await duplicate.json() as V2Run).runId, run.runId);
+  const competingKey = crypto.randomUUID();
+  const competing = await submit(baseUrl, second.conversationId, "must wait", competingKey);
+  assert.equal(competing.status, 409);
+  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${first.conversationId}`, { method: "DELETE" })).status, 409);
+
+  const cancel = await fetch(`${baseUrl}/api/v2/runs/${run.runId}/cancel`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(cancel.status, 200);
+  assert.equal((await cancel.json() as V2Run).status, "cancelling");
+  assert.equal((await waitForRun(baseUrl, run.runId, "cancelled")).status, "cancelled");
+
+  const acceptedAfterRelease = await submit(baseUrl, second.conversationId, "must wait", competingKey);
+  assert.equal(acceptedAfterRelease.status, 202, "a rejected busy request must not leave an idempotency record or orphan run");
+  const otherRun = await acceptedAfterRelease.json() as V2Run;
+  assert.equal((await waitForRun(baseUrl, otherRun.runId, "completed")).status, "completed");
+
+  const beforeDeleteDb = openStorage({ dataDirectory: { dataDirectory: root } });
+  const deletedAttemptIds = beforeDeleteDb.attempts.list(run.runId).map((attempt) => attempt.attemptId);
+  beforeDeleteDb.close();
+  const deletion = await fetch(`${baseUrl}/api/v2/conversations/${first.conversationId}`, { method: "DELETE" });
+  assert.equal(deletion.status, 200);
+  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${first.conversationId}`)).status, 404);
+  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${second.conversationId}`)).status, 200);
+  const deletionDb = openStorage({ dataDirectory: { dataDirectory: root } });
+  assert.deepEqual(deletionDb.messages.list(first.conversationId), []);
+  assert.equal(deletionDb.snapshots.latest(first.conversationId), undefined);
+  assert.deepEqual(deletionDb.runs.list(first.conversationId), []);
+  assert.deepEqual(deletionDb.attempts.list(run.runId), []);
+  assert.equal(deletionDb.events.latestSequence(run.runId), 0);
+  assert.deepEqual(deletionDb.checkpoints.list(run.runId), []);
+  assert.equal(deletionDb.results.get(run.runId), undefined);
+  for (const attemptId of deletedAttemptIds) assert.equal(deletionDb.usage.get(attemptId), undefined);
+  assert.throws(() => deletionDb.idempotency.resolve(
+    { schemaVersion: 2, scope: first.conversationId, endpoint: "POST /api/v2/runs", key: activeKey, requestHash: run.requestHash },
+    { schemaVersion: 2, resourceKind: "run", resourceId: run.runId },
+  ), (error: unknown) => error instanceof StorageError && error.code === "not_found");
+  deletionDb.close();
+  const oldWrite = await fetch(`${baseUrl}/api/v1/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(oldWrite.status, 426);
+  assert.equal((await oldWrite.json() as { code: string }).code, "upgrade_required");
+  await app.close();
+  ({ app, baseUrl } = await createApp(root));
+  assert.equal(await waitForWorker(baseUrl), true);
+  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${first.conversationId}`)).status, 404);
+  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${second.conversationId}`)).status, 200);
+});
+
+await test("API restart detects Worker exit, marks run interrupted and only continues on explicit request", { timeout: 40_000 }, async (t) => {
+  const root = await temporaryRoot();
+  let { app, baseUrl } = await createApp(root);
+  t.after(async () => { await app.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); });
+  const conversation = await createConversation(baseUrl);
+  const submitted = await submit(baseUrl, conversation.conversationId, "[[fake:slow]] interrupted run");
+  const run = await submitted.json() as V2Run;
+  await waitForRun(baseUrl, run.runId, "running");
+  const db = openStorage({ dataDirectory: { dataDirectory: root } });
+  const identity = db.workerIdentity.get();
+  assert.ok(identity);
+  process.kill(identity!.pid, "SIGKILL");
+  db.close();
+  const interrupted = await waitForRun(baseUrl, run.runId, "interrupted");
+  assert.equal(interrupted.status, "interrupted");
+  assert.equal(await waitForWorker(baseUrl), true);
+
+  const continueKey = crypto.randomUUID();
+  const continuedResponse = await fetch(`${baseUrl}/api/v2/runs/${run.runId}/continue`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": continueKey }, body: "{}",
   });
-  t.after(async () => { release.resolve(); await app.close(); await rm(root, { recursive: true, force: true }); });
-  try {
-    const conversationId = await createConversation(app);
-    const response = await submit(app, conversationId, {
-      kind: "capability", capabilityId: "public_repository_analysis",
-      input: { repositoryUrl: "https://github.com/demo/harborlight", goal: "Inspect the fixture." },
+  assert.equal(continuedResponse.status, 202);
+  assert.equal((await continuedResponse.json() as V2Run).status, "running");
+  const resumedDb = openStorage({ dataDirectory: { dataDirectory: root } });
+  assert.equal(resumedDb.attempts.list(run.runId).length, 2);
+  resumedDb.close();
+  const duplicateContinue = await fetch(`${baseUrl}/api/v2/runs/${run.runId}/continue`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": continueKey }, body: "{}",
+  });
+  assert.equal(duplicateContinue.status, 200);
+  assert.equal((await duplicateContinue.json() as V2Run).runId, run.runId);
+  const duplicateDb = openStorage({ dataDirectory: { dataDirectory: root } });
+  assert.equal(duplicateDb.attempts.list(run.runId).length, 2);
+  duplicateDb.close();
+  await fetch(`${baseUrl}/api/v2/runs/${run.runId}/cancel`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal((await waitForRun(baseUrl, run.runId, "cancelled")).status, "cancelled");
+  await app.close();
+  ({ app, baseUrl } = await createApp(root));
+  assert.equal((await fetchRun(baseUrl, run.runId)).status, "cancelled");
+});
+
+await test("terminal result and session snapshot roll back together on persistence failure", { timeout: 30_000 }, async (t) => {
+  const root = await temporaryRoot();
+  const { app, baseUrl } = await createApp(root);
+  t.after(async () => { await app.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); });
+  const raw = new DatabaseSync(resolveDatabasePath({ dataDirectory: root }));
+  raw.exec(`CREATE TRIGGER fail_terminal_event BEFORE INSERT ON run_events WHEN NEW.event_type = 'run.completed' BEGIN SELECT RAISE(ABORT, 'injected terminal event failure'); END;`);
+  const conversation = await createConversation(baseUrl);
+  const submitted = await submit(baseUrl, conversation.conversationId, "atomic finalization fixture");
+  assert.equal(submitted.status, 202);
+  const run = await submitted.json() as V2Run;
+  let ready = true;
+  for (let attempt = 0; attempt < 200 && ready; attempt += 1) {
+    await sleep(20);
+    ready = (await fetch(`${baseUrl}/api/v2/health`).then((response) => response.json()) as { workerReady: boolean }).workerReady;
+  }
+  assert.equal(ready, false, "failed terminal persistence must fence the Worker");
+  const store = openStorage({ dataDirectory: { dataDirectory: root } });
+  assert.equal(store.runs.get(run.runId)?.status, "running");
+  assert.equal(store.results.get(run.runId), undefined);
+  assert.equal(store.snapshots.latest(conversation.conversationId), undefined);
+  assert.equal(store.messages.list(conversation.conversationId).length, 1);
+  assert.equal(store.attempts.list(run.runId)[0]?.status, "running");
+  assert.equal(store.activeSlot.get().runId, run.runId);
+  store.close();
+  raw.exec("DROP TRIGGER fail_terminal_event");
+  raw.close();
+  await app.close();
+  const recovered = openStorage({ dataDirectory: { dataDirectory: root } });
+  assert.equal(recovered.runs.get(run.runId)?.status, "interrupted");
+  assert.equal(recovered.snapshots.latest(conversation.conversationId), undefined);
+  recovered.close();
+});
+
+await test("nonterminal event and usage persistence failures fence the Worker without crashing the API", { timeout: 40_000 }, async (t) => {
+  const root = await temporaryRoot();
+  let app: Awaited<ReturnType<typeof createWorkbenchApp>> | undefined;
+  let raw: DatabaseSync | undefined;
+  t.after(async () => {
+    raw?.close();
+    await app?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const scenarios = [
+    ["message-delta", `CREATE TRIGGER fail_message_delta BEFORE INSERT ON run_events WHEN NEW.event_type = 'message.delta' BEGIN SELECT RAISE(ABORT, 'injected nonterminal event failure'); END;`],
+    ["usage-record", `CREATE TRIGGER fail_usage BEFORE INSERT ON usage_records BEGIN SELECT RAISE(ABORT, 'injected usage persistence failure'); END;`],
+  ] as const;
+
+  for (const [name, trigger] of scenarios) {
+    const dataDirectory = path.join(root, name);
+    await mkdir(dataDirectory);
+    app = await createWorkbenchApp({ mode: "fake", dataDirectory });
+    const health = async () => {
+      const response = await app!.inject({ method: "GET", url: "/api/v2/health" });
+      assert.equal(response.statusCode, 200, "the API must stay responsive after persistence failure");
+      return JSON.parse(response.body) as { workerReady: boolean };
+    };
+    assert.equal((await health()).workerReady, true);
+    raw = new DatabaseSync(resolveDatabasePath({ dataDirectory }));
+    raw.exec(trigger);
+    const conversationResponse = await app.inject({ method: "POST", url: "/api/v2/conversations", payload: {} });
+    assert.equal(conversationResponse.statusCode, 201);
+    const conversation = JSON.parse(conversationResponse.body) as V2Conversation;
+    const submitted = await app.inject({
+      method: "POST", url: "/api/v2/runs", headers: { "idempotency-key": crypto.randomUUID() },
+      payload: { schemaVersion: 2, conversationId: conversation.conversationId, input: { kind: "message", text: `fault injection ${name}` } },
     });
-    assert.equal(response.statusCode, 202);
-    const first = response.json<WorkbenchRun>();
-    await entered.promise;
-    await sleep(1150); // Runtime cancellation grace is currently 1000 ms.
-    const stillRunning = (await app.inject({ method: "GET", url: `/api/v1/runs/${first.runId}` })).json<WorkbenchRun>();
-    assert.equal(stillRunning.status, "cancelling");
-    const blocked = await submit(app, conversationId, { kind: "message", text: "must remain busy" });
-    assert.equal(blocked.statusCode, 409);
-    assert.equal(blocked.json<{ error: { code: string } }>().error.code, "busy");
-    release.resolve();
-    const finished = await waitForRun(app, first.runId);
-    assert.equal(finished.status, "cancelled");
-    assert.deepEqual(finished.result?.artifacts?.map((item) => item.kind).sort(), ["events.jsonl", "manifest.json"]);
-    const partial = await app.inject({ method: "GET", url: `/api/v1/runs/${first.runId}/artifacts/events.jsonl` });
-    assert.equal(partial.statusCode, 200);
-    assert.match(partial.payload, /"type":"run.finished"/u);
-    const events = await app.inject({ method: "GET", url: `/api/v1/runs/${first.runId}/events` });
-    assert.equal((events.payload.match(/event: run\.finished\n/gu) ?? []).length, 1);
-    assert.match(events.payload, /cancellation_pending/u);
-    const next = await submit(app, conversationId, { kind: "message", text: "after provider settled" });
-    assert.equal(next.statusCode, 202);
-    assert.equal((await waitForRun(app, next.json<WorkbenchRun>().runId)).status, "completed");
-  } finally { release.resolve(); }
-});
+    assert.equal(submitted.statusCode, 202);
+    const run = JSON.parse(submitted.body) as V2Run;
+    let workerReady = true;
+    for (let attempt = 0; attempt < 200 && workerReady; attempt += 1) {
+      await sleep(20);
+      workerReady = (await health()).workerReady;
+    }
+    assert.equal(workerReady, false, `${name}: a persistence failure must fence the Worker`);
 
-await test("repeated cancellation is idempotent and run.finished keeps the winning terminal state", async (t) => {
-  const root = await temporaryRoot();
-  const configStarted = deferred<void>();
-  const configGate = deferred<ModelConfiguration>();
-  const app = await createWorkbenchApp({
-    mode: "fake", dataDirectory: root,
-    createChatConfiguration: async () => { configStarted.resolve(); return configGate.promise; },
-  });
-  t.after(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
-  const conversationId = await createConversation(app);
-  const response = await submit(app, conversationId, { kind: "message", text: "cancel while setup is waiting" });
-  const run = response.json<WorkbenchRun>();
-  await configStarted.promise;
+    const store = openStorage({ dataDirectory: { dataDirectory } });
+    assert.equal(store.runs.get(run.runId)?.status, "running");
+    assert.equal(store.results.get(run.runId), undefined);
+    assert.equal(store.snapshots.latest(conversation.conversationId), undefined);
+    assert.equal(store.messages.list(conversation.conversationId).length, 1);
+    assert.equal(store.activeSlot.get().runId, run.runId);
+    assert.equal(store.usage.get(store.attempts.list(run.runId)[0]!.attemptId), undefined);
+    store.close();
+    raw.close();
+    raw = undefined;
 
-  const firstCancel = await app.inject({ method: "POST", url: `/api/v1/runs/${run.runId}/cancel`, payload: {} });
-  const duplicateCancel = await app.inject({ method: "POST", url: `/api/v1/runs/${run.runId}/cancel`, payload: {} });
-  assert.equal(firstCancel.statusCode, 200);
-  assert.equal(duplicateCancel.statusCode, 200);
-  assert.equal(firstCancel.json<WorkbenchRun>().status, "cancelling");
-  assert.equal(duplicateCancel.json<WorkbenchRun>().status, "cancelling");
-  assert.equal(duplicateCancel.json<WorkbenchRun>().updatedAt, firstCancel.json<WorkbenchRun>().updatedAt, "duplicate cancel leaves the accepted state unchanged");
-
-  configGate.resolve(createFakeChatConfiguration());
-  const finished = await waitForRun(app, run.runId);
-  assert.equal(finished.status, "cancelled");
-  assert.equal(finished.result?.status, "cancelled");
-  const finalCancel = await app.inject({ method: "POST", url: `/api/v1/runs/${run.runId}/cancel`, payload: {} });
-  assert.equal(finalCancel.statusCode, 200);
-  assert.equal(finalCancel.json<WorkbenchRun>().status, "cancelled", "a late cancel preserves the cancellation terminal state");
-  const events = await app.inject({ method: "GET", url: `/api/v1/runs/${run.runId}/events` });
-  assert.equal((events.payload.match(/event: run\.cancelling\n/gu) ?? []).length, 1, "the run emits exactly one cancellation event");
-  assert.equal((events.payload.match(/event: run\.finished\n/gu) ?? []).length, 1, "the run emits exactly one terminal event");
-});
-
-await test("fake repository capability returns only the demo fixture and rejects unsupported repositories and refs", async (t) => {
-  const root = await temporaryRoot();
-  const app = await createWorkbenchApp({ mode: "fake", dataDirectory: root });
-  t.after(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
-  const conversationId = await createConversation(app);
-  const response = await submit(app, conversationId, {
-    kind: "capability", capabilityId: "public_repository_analysis",
-    input: { repositoryUrl: "https://github.com/demo/harborlight", goal: "Summarize the service and default port." },
-  });
-  assert.equal(response.statusCode, 202);
-  const run = response.json<WorkbenchRun>();
-  const complete = await waitForRun(app, run.runId);
-  assert.equal(complete.status, "completed");
-  assert.equal(complete.result?.status, "completed");
-  if (complete.result?.status !== "completed") throw new Error("Expected successful capability result");
-  assert.equal(complete.result.capabilityResult?.capabilityId, "public_repository_analysis");
-  assert.ok(complete.result.artifacts?.some((artifact) => artifact.kind === "report.json"));
-  const report = await app.inject({ method: "GET", url: `/api/v1/runs/${run.runId}/artifacts/report.json` });
-  assert.equal(report.statusCode, 200);
-  assert.match(report.payload, /fixture-service-summary/u);
-  const unsupportedRepository = await submit(app, conversationId, {
-    kind: "capability", capabilityId: "public_repository_analysis",
-    input: { repositoryUrl: "https://github.com/acme/private-looking-project", goal: "Analyze a different repository in offline mode." },
-  });
-  assert.equal(unsupportedRepository.statusCode, 400);
-  assert.match(unsupportedRepository.json<{ error: { message: string } }>().error.message, /离线演示仅支持合成仓库/u);
-  const unsupportedRef = await submit(app, conversationId, {
-    kind: "capability", capabilityId: "public_repository_analysis",
-    input: { repositoryUrl: "https://github.com/demo/harborlight", ref: "other-branch", goal: "Do not claim a fake ref was inspected." },
-  });
-  assert.equal(unsupportedRef.statusCode, 400);
-  const conversation = (await app.inject({ method: "GET", url: `/api/v1/conversations/${conversationId}` })).json<{ messages: Array<{ role: string }> }>();
-  assert.equal(conversation.messages.filter((message) => message.role === "assistant").length, 1);
-});
-
-await test("online repository capability reports GitHub rate limits safely and authenticates only GitHub API lookups", async (t) => {
-  const root = await temporaryRoot();
-  const requests: Array<{ host: string; authorization: string | null }> = [];
-  const snapshotFetch: typeof fetch = async (input, init) => {
-    const url = String(input);
-    requests.push({ host: new URL(url).hostname, authorization: new Headers(init?.headers).get("authorization") });
-    const response = new Response(JSON.stringify({ message: "API rate limit exceeded" }), {
-      status: 403, headers: { "x-ratelimit-remaining": "0" },
-    });
-    Object.defineProperty(response, "url", { value: url });
-    return response;
-  };
-  const app = await createWorkbenchApp({
-    mode: "online", apiKey: "unit-test-model-key", githubToken: "unit-test-github-token",
-    snapshotFetch, dataDirectory: root,
-    createAnalysisConfiguration: async () => createFakeChatConfiguration(),
-  });
-  t.after(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
-  assert.equal((await app.inject({ method: "GET", url: "/api/v1/health" })).json<{ mode: string }>().mode, "online");
-  const conversationId = await createConversation(app);
-  const submitted = await submit(app, conversationId, {
-    kind: "capability", capabilityId: "public_repository_analysis",
-    input: { repositoryUrl: "https://github.com/octocat/Hello-World", goal: "Explain the project purpose." },
-  });
-  const run = submitted.json<WorkbenchRun>();
-  const complete = await waitForRun(app, run.runId);
-  assert.equal(complete.result?.status, "failed");
-  if (complete.result?.status !== "failed") throw new Error("Expected a safe GitHub rate-limit failure");
-  assert.equal(complete.result.error.code, "rate_limited");
-  assert.match(complete.result.error.message, /GitHub rate limit/u);
-  assert.deepEqual(requests, [{ host: "api.github.com", authorization: "Bearer unit-test-github-token" }]);
-  const stream = await app.inject({ method: "GET", url: `/api/v1/runs/${run.runId}/events` });
-  assert.doesNotMatch(stream.payload, /unit-test-github-token|API rate limit exceeded/u);
+    await app.close();
+    app = undefined;
+    app = await createWorkbenchApp({ mode: "fake", dataDirectory });
+    const recoveredRun = await app.inject({ method: "GET", url: `/api/v2/runs/${run.runId}` });
+    assert.equal(recoveredRun.statusCode, 200);
+    assert.equal((JSON.parse(recoveredRun.body) as V2Run).status, "interrupted");
+    const recovered = openStorage({ dataDirectory: { dataDirectory } });
+    assert.equal(recovered.snapshots.latest(conversation.conversationId), undefined);
+    recovered.close();
+    await app.close();
+    app = undefined;
+  }
 });

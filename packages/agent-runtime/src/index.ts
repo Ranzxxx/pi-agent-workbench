@@ -22,6 +22,7 @@ export {
   createConversationSession,
   type ConversationRuntimeOptions,
   type ConversationPromptOptions,
+  type ConversationSessionSnapshot,
   type ConversationTurnResult,
 } from "./conversation.js";
 

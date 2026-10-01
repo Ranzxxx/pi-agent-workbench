@@ -1,5 +1,6 @@
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
+import { RepositoryAnalysisInputSchema, RunSubmissionSchema, WorkbenchResultSchema } from "./workbench.js";
 
 const object = <T extends Record<string, import("typebox").TSchema>>(properties: T) =>
   Type.Object(properties, { additionalProperties: false });
@@ -29,8 +30,30 @@ export const V2RunSchema = object({
   extensionId: Type.Optional(Type.Union([id, Type.Null()])),
   status: V2RunStatusSchema,
   requestHash: sha256,
+  input: Type.Optional(RunSubmissionSchema),
   retryOfRunId: Type.Optional(id), currentAttemptId: Type.Optional(id),
   createdAt: timestamp, updatedAt: timestamp, endedAt: Type.Optional(Type.Union([timestamp, Type.Null()])),
+  result: Type.Optional(WorkbenchResultSchema),
+});
+
+export const V2ConversationMessageSchema = object({
+  schemaVersion: Type.Literal(2), messageId: id, conversationId: id,
+  sequence: sequence, role: Type.Union([Type.Literal("user"), Type.Literal("assistant"), Type.Literal("capability")]),
+  content: Type.String({ maxLength: 16_000 }), createdAt: timestamp,
+  extensionId: Type.Optional(Type.Union([id, Type.Null()])),
+  capabilityInput: Type.Optional(RepositoryAnalysisInputSchema),
+});
+export const V2ConversationSummarySchema = object({
+  schemaVersion: Type.Literal(2), conversationId: id, title: Type.String({ minLength: 1, maxLength: 256 }),
+  createdAt: timestamp, updatedAt: timestamp, preview: Type.String({ maxLength: 256 }), messageCount: nonnegative,
+});
+export const V2ConversationSchema = object({
+  schemaVersion: Type.Literal(2), conversationId: id, title: Type.String({ minLength: 1, maxLength: 256 }),
+  createdAt: timestamp, updatedAt: timestamp, preview: Type.String({ maxLength: 256 }), messageCount: nonnegative,
+  messages: Type.Array(V2ConversationMessageSchema, { maxItems: 1000 }),
+});
+export const V2SubmitRunRequestSchema = object({
+  schemaVersion: Type.Literal(2), conversationId: id, input: RunSubmissionSchema,
 });
 
 export const V2ErrorSchema = object({
@@ -39,6 +62,7 @@ export const V2ErrorSchema = object({
     Type.Literal("invalid_request"), Type.Literal("not_found"), Type.Literal("active_task"),
     Type.Literal("idempotency_conflict"), Type.Literal("upgrade_required"), Type.Literal("db_busy"),
     Type.Literal("db_readonly"), Type.Literal("unknown_schema"), Type.Literal("conflict"),
+    Type.Literal("busy"), Type.Literal("worker_unavailable"), Type.Literal("interrupted"),
     Type.Literal("internal_error"), Type.Literal("migration_failed"),
   ]),
   message: Type.String({ minLength: 1, maxLength: 512 }), retryable: Type.Boolean(),
@@ -100,6 +124,10 @@ export const V2IdempotencyResultSchema = object({
 export type V2RunIdentity = Static<typeof V2RunIdentitySchema>;
 export type V2AttemptIdentity = Static<typeof V2AttemptIdentitySchema>;
 export type V2Run = Static<typeof V2RunSchema>;
+export type V2ConversationMessage = Static<typeof V2ConversationMessageSchema>;
+export type V2ConversationSummary = Static<typeof V2ConversationSummarySchema>;
+export type V2Conversation = Static<typeof V2ConversationSchema>;
+export type V2SubmitRunRequest = Static<typeof V2SubmitRunRequestSchema>;
 export type V2RunAttempt = Static<typeof V2RunAttemptSchema>;
 export type V2RunEvent = Static<typeof V2RunEventSchema>;
 export type V2EventCursor = Static<typeof V2EventCursorSchema>;

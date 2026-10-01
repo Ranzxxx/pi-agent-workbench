@@ -36,13 +36,25 @@ test("stable data directory honors override, XDG, and home fallback", () => {
 
 test("new database migrates to WAL/FULL with foreign keys, and repeated open preserves schema", () => withDb((_root, path) => {
   const first = openStorage({ path });
-  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 1 });
+  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 2 });
   assert.equal(first.projects.list().length, 0);
   first.close();
   const reopened = openStorage({ path });
-  assert.equal(reopened.diagnostics.schemaVersion, 1);
+  assert.equal(reopened.diagnostics.schemaVersion, 2);
   assert.equal(reopened.projects.list().length, 0);
   reopened.close();
+}));
+
+test("nested repository calls participate in the outer storage transaction", () => withDb((_root, path) => {
+  const store = openStorage({ path });
+  assert.throws(() => store.transaction(() => {
+    store.projects.create({ id: "project_atomic", displayName: "Atomic fixture", canonicalRoot: "/tmp/pi-atomic-fixture", directoryIdentity: null, validationState: "valid" });
+    store.conversations.create({ id: "conversation_atomic", projectId: "project_atomic", piSessionId: null, title: "Atomic fixture" });
+    throw new Error("rollback fixture");
+  }));
+  assert.equal(store.projects.get("project_atomic"), undefined);
+  assert.equal(store.conversations.get("conversation_atomic"), undefined);
+  store.close();
 }));
 
 test("migration failure rolls back schema and data, and unknown newer schema is not modified", () => {
@@ -62,7 +74,7 @@ test("migration failure rolls back schema and data, and unknown newer schema is 
     const store = openStorage({ path });
     store.close();
     const raw = new DatabaseSync(path);
-    raw.prepare("UPDATE schema_migrations SET version = 99").run();
+    raw.prepare("UPDATE schema_migrations SET version = version + 98").run();
     raw.close();
     assert.throws(() => openStorage({ path }), StorageSchemaError);
     const verify = new DatabaseSync(path, { readOnly: true });
