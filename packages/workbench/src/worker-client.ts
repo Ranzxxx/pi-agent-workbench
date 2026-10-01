@@ -130,8 +130,12 @@ export class WorkerClient {
       if (message.runId === this.activeRunId) this.taskResolve?.({ result: message.result, ...(message.usage ? { usage: message.usage } : {}), ...(message.artifacts ? { artifacts: message.artifacts } : {}), ...(message.snapshot ? { snapshot: message.snapshot } : {}) });
       return;
     }
-    const callback = this.handlers?.onEvent(message.event);
-    const acknowledgement = Promise.resolve(callback).then(
+    // Invoke the persistence handler inside a promise boundary. It may throw
+    // synchronously (for example when SQLite rejects an event insert); without
+    // this boundary the async message listener would reject unobserved and can
+    // terminate the API process before the Worker is fenced.
+    const callback = Promise.resolve().then(() => this.handlers?.onEvent(message.event));
+    const acknowledgement = callback.then(
       () => this.send({ type: "ack", requestId: message.requestId, ok: true }),
       () => { this.send({ type: "ack", requestId: message.requestId, ok: false, error: "Persistence failed" }); throw new Error("Worker output could not be persisted"); },
     );

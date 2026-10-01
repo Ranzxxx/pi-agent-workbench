@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -255,4 +255,71 @@ await test("terminal result and session snapshot roll back together on persisten
   assert.equal(recovered.runs.get(run.runId)?.status, "interrupted");
   assert.equal(recovered.snapshots.latest(conversation.conversationId), undefined);
   recovered.close();
+});
+
+await test("nonterminal event and usage persistence failures fence the Worker without crashing the API", { timeout: 40_000 }, async (t) => {
+  const root = await temporaryRoot();
+  let app: Awaited<ReturnType<typeof createWorkbenchApp>> | undefined;
+  let raw: DatabaseSync | undefined;
+  t.after(async () => {
+    raw?.close();
+    await app?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const scenarios = [
+    ["message-delta", `CREATE TRIGGER fail_message_delta BEFORE INSERT ON run_events WHEN NEW.event_type = 'message.delta' BEGIN SELECT RAISE(ABORT, 'injected nonterminal event failure'); END;`],
+    ["usage-record", `CREATE TRIGGER fail_usage BEFORE INSERT ON usage_records BEGIN SELECT RAISE(ABORT, 'injected usage persistence failure'); END;`],
+  ] as const;
+
+  for (const [name, trigger] of scenarios) {
+    const dataDirectory = path.join(root, name);
+    await mkdir(dataDirectory);
+    app = await createWorkbenchApp({ mode: "fake", dataDirectory });
+    const health = async () => {
+      const response = await app!.inject({ method: "GET", url: "/api/v2/health" });
+      assert.equal(response.statusCode, 200, "the API must stay responsive after persistence failure");
+      return JSON.parse(response.body) as { workerReady: boolean };
+    };
+    assert.equal((await health()).workerReady, true);
+    raw = new DatabaseSync(resolveDatabasePath({ dataDirectory }));
+    raw.exec(trigger);
+    const conversationResponse = await app.inject({ method: "POST", url: "/api/v2/conversations", payload: {} });
+    assert.equal(conversationResponse.statusCode, 201);
+    const conversation = JSON.parse(conversationResponse.body) as V2Conversation;
+    const submitted = await app.inject({
+      method: "POST", url: "/api/v2/runs", headers: { "idempotency-key": crypto.randomUUID() },
+      payload: { schemaVersion: 2, conversationId: conversation.conversationId, input: { kind: "message", text: `fault injection ${name}` } },
+    });
+    assert.equal(submitted.statusCode, 202);
+    const run = JSON.parse(submitted.body) as V2Run;
+    let workerReady = true;
+    for (let attempt = 0; attempt < 200 && workerReady; attempt += 1) {
+      await sleep(20);
+      workerReady = (await health()).workerReady;
+    }
+    assert.equal(workerReady, false, `${name}: a persistence failure must fence the Worker`);
+
+    const store = openStorage({ dataDirectory: { dataDirectory } });
+    assert.equal(store.runs.get(run.runId)?.status, "running");
+    assert.equal(store.results.get(run.runId), undefined);
+    assert.equal(store.snapshots.latest(conversation.conversationId), undefined);
+    assert.equal(store.messages.list(conversation.conversationId).length, 1);
+    assert.equal(store.activeSlot.get().runId, run.runId);
+    assert.equal(store.usage.get(store.attempts.list(run.runId)[0]!.attemptId), undefined);
+    store.close();
+    raw.close();
+    raw = undefined;
+
+    await app.close();
+    app = undefined;
+    app = await createWorkbenchApp({ mode: "fake", dataDirectory });
+    const recoveredRun = await app.inject({ method: "GET", url: `/api/v2/runs/${run.runId}` });
+    assert.equal(recoveredRun.statusCode, 200);
+    assert.equal((JSON.parse(recoveredRun.body) as V2Run).status, "interrupted");
+    const recovered = openStorage({ dataDirectory: { dataDirectory } });
+    assert.equal(recovered.snapshots.latest(conversation.conversationId), undefined);
+    recovered.close();
+    await app.close();
+    app = undefined;
+  }
 });
