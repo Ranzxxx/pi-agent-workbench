@@ -240,6 +240,9 @@ export {
 
 export {
   V2AttemptIdentitySchema,
+  V2ConversationMessageSchema,
+  V2ConversationSchema,
+  V2ConversationSummarySchema,
   V2ErrorSchema,
   V2EventCursorSchema,
   V2IdempotencyRequestSchema,
@@ -250,6 +253,7 @@ export {
   V2RunIdentitySchema,
   V2RunSchema,
   V2RunStatusSchema,
+  V2SubmitRunRequestSchema,
   parseV2AttemptIdentity,
   parseV2EventCursor,
   parseV2Error,
@@ -261,6 +265,9 @@ export {
   parseV2RunEventPage,
   parseV2RunIdentity,
   type V2AttemptIdentity,
+  type V2Conversation,
+  type V2ConversationMessage,
+  type V2ConversationSummary,
   type V2Error,
   type V2EventCursor,
   type V2IdempotencyRequest,
@@ -271,4 +278,5 @@ export {
   type V2RunEventPage,
   type V2RunIdentity,
   type V2RunStatus,
+  type V2SubmitRunRequest,
 } from "./v2.js";

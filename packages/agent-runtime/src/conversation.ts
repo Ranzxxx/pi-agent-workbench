@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import {
-  createAgentSession, ModelRuntime, SessionManager, SettingsManager,
+  createAgentSession, ModelRuntime, parseSessionEntries, SessionManager, SettingsManager,
+  type FileEntry, type SessionEntry, type SessionHeader,
   type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -19,6 +21,18 @@ export interface ConversationRuntimeOptions {
   budget: Budget;
   pricing: Pricing;
   cancellationGraceMs?: number;
+  sessionId?: string;
+  restoredSnapshot?: ConversationSessionSnapshot;
+  persistSnapshot?: (snapshot: ConversationSessionSnapshot) => void | Promise<void>;
+}
+
+export interface ConversationSessionSnapshot {
+  formatVersion: "pi-session-v3";
+  sdkVersion: "0.86.1";
+  sessionId: string;
+  header: SessionHeader;
+  entries: SessionEntry[];
+  leafId: string | null;
 }
 
 export interface ConversationPromptOptions {
@@ -61,18 +75,42 @@ export async function createConversationSession(options: ConversationRuntimeOpti
   const runtime = await ModelRuntime.create({ credentials: options.credentials, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
   runtime.registerNativeProvider(options.provider);
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
+  const sessionId = options.restoredSnapshot?.sessionId ?? options.sessionId ?? randomUUID();
+  if (options.restoredSnapshot) {
+    const restored = options.restoredSnapshot;
+    if (restored.formatVersion !== "pi-session-v3" || restored.sdkVersion !== "0.86.1" || restored.sessionId !== restored.header.id ||
+      restored.header.type !== "session" || restored.header.cwd !== options.cwd || !Array.isArray(restored.entries)) {
+      runtime.unregisterProvider(options.provider.id);
+      throw new Error("Stored PI session snapshot is incompatible; original snapshot was not modified");
+    }
+  }
+  const sessionEntries: FileEntry[] = options.restoredSnapshot
+    ? [options.restoredSnapshot.header, ...options.restoredSnapshot.entries]
+    : [];
+  if (options.restoredSnapshot) {
+    try { parseSessionEntries(sessionEntries.map((entry) => JSON.stringify(entry)).join("\n")); }
+    catch {
+      runtime.unregisterProvider(options.provider.id);
+      throw new Error("Stored PI session entries are invalid; original snapshot was not modified");
+    }
+    if (options.restoredSnapshot.leafId !== null && !options.restoredSnapshot.entries.some((entry) => entry.id === options.restoredSnapshot!.leafId)) {
+      runtime.unregisterProvider(options.provider.id);
+      throw new Error("Stored PI session leaf is invalid; original snapshot was not modified");
+    }
+  }
   try {
     ({ session } = await createAgentSession({
       // Match the single-run adapter: no local resource discovery, built-in tools, extensions or persisted session files.
       cwd: options.cwd, agentDir: options.cwd, modelRuntime: runtime, model: options.model,
       resourceLoader: resources(options.systemPrompt), tools: [], customTools: [],
-      sessionManager: SessionManager.inMemory(options.cwd),
+      sessionManager: SessionManager.inMemory(options.cwd, { id: sessionId }, sessionEntries),
       settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
     }));
   } catch (error) {
     runtime.unregisterProvider(options.provider.id);
     throw error;
   }
+  if (options.restoredSnapshot?.leafId) session.sessionManager.branch(options.restoredSnapshot.leafId);
 
   type ActiveTurn = {
     ledger: BudgetLedger;
@@ -143,6 +181,23 @@ export async function createConversationSession(options: ConversationRuntimeOpti
     }
   });
 
+  function snapshot(): ConversationSessionSnapshot {
+    const header = session.sessionManager.getHeader();
+    if (!header || header.id !== session.sessionManager.getSessionId()) throw new Error("PI session did not expose a valid public session header");
+    return {
+      formatVersion: "pi-session-v3", sdkVersion: "0.86.1", sessionId: header.id,
+      header: structuredClone(header), entries: structuredClone(session.sessionManager.getEntries()),
+      leafId: session.sessionManager.getLeafId(),
+    };
+  }
+
+  async function persistSnapshot(): Promise<void> {
+    if (!options.persistSnapshot) return;
+    // Persistence failure is a business failure: never let an unrecorded turn
+    // be shown as successful or used as the starting point for another turn.
+    await options.persistSnapshot(snapshot());
+  }
+
   async function prompt(text: string, promptOptions: ConversationPromptOptions = {}): Promise<ConversationTurnResult> {
     if (disposed) throw new Error("Conversation session is disposed");
     if (active) throw new Error("Conversation session is busy");
@@ -165,6 +220,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
           await session.prompt(text);
           await session.agent.waitForIdle();
         }
+        await persistSnapshot();
         if (turn.cancelReason) return { status: "cancelled", reason: turn.cancelReason, usage: turn.ledger.snapshot() };
         if (turn.eventError) return { status: "failed", error: { code: "runtime_error", message: "Conversation runtime event validation failed" }, usage: turn.ledger.snapshot() };
         if (!turn.lastAssistant || turn.lastAssistant.stopReason !== "stop") {
@@ -173,6 +229,9 @@ export async function createConversationSession(options: ConversationRuntimeOpti
         const response = turn.lastAssistant.content.filter((part) => part.type === "text").map((part) => part.text).join("");
         return { status: "completed", text: response.slice(0, 16_000), usage: turn.ledger.snapshot() };
       } catch {
+        try { await persistSnapshot(); } catch {
+          return { status: "failed", error: { code: "runtime_error", message: "Conversation session could not be persisted" }, usage: turn.ledger.snapshot() };
+        }
         if (turn.cancelReason) return { status: "cancelled", reason: turn.cancelReason, usage: turn.ledger.snapshot() };
         return { status: "failed", error: { code: "runtime_error", message: "Conversation execution failed" }, usage: turn.ledger.snapshot() };
       } finally {
@@ -189,6 +248,8 @@ export async function createConversationSession(options: ConversationRuntimeOpti
 
   return {
     prompt,
+    snapshot,
+    persistSnapshot,
     addContextMessage(text: string): void {
       if (disposed) throw new Error("Conversation session is disposed");
       if (active) throw new Error("Conversation session is busy");

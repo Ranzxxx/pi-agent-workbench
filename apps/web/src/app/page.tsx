@@ -1,14 +1,46 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CapabilityInfo, Conversation, ConversationSummary, WorkbenchEvent, WorkbenchRun, WorkbenchStreamReset } from "@pi-workbench/protocol";
+import type { CapabilityInfo, Conversation, ConversationSummary, WorkbenchEvent, WorkbenchRun, V2Conversation, V2ConversationSummary, V2Run } from "@pi-workbench/protocol";
 import { RunArtifacts } from "./run-artifacts";
 
-const API = "/api/v1";
+const API = "/api/v2";
 const SUGGESTIONS = ["帮我制定一个清晰的实施计划", "解释一下 Agent 是如何工作的", "把这个想法拆解成可执行的步骤"];
-const EVENT_TYPES = ["run.started", "message.delta", "capability.started", "tool.started", "tool.finished", "run.cancelling", "run.warning", "stream.reset", "run.finished"] as const;
+const EVENT_TYPES = ["run.accepted", "run.started", "run.progress", "message.delta", "tool.started", "tool.finished", "checkpoint.saved", "usage.updated", "run.cancelling", "run.completed", "run.failed", "run.cancelled", "run.interrupted", "stream.reset"] as const;
 const REPOSITORY_URL_PATTERN = /^https:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/u;
 const FAKE_REPOSITORY_SHA = "7f06c6b2792349e4d9ccbd393008e5bf1f4d419a";
+type V2StreamReset = { schemaVersion: 2; type: "stream.reset"; runId: string; data: { reason: "event_history_expired"; earliestAvailableSequence: number; latestSequence: number; latestEventId?: string } };
+
+function normalizeConversation(value: V2Conversation): Conversation {
+  return {
+    schemaVersion: 1, conversationId: value.conversationId, title: value.title.slice(0, 128),
+    createdAt: value.createdAt, updatedAt: value.updatedAt, preview: value.preview, messageCount: value.messageCount,
+    messages: value.messages.map((message) => message.role === "capability" && message.capabilityInput
+      ? { schemaVersion: 1, id: message.messageId, role: "capability", text: message.content, createdAt: message.createdAt, capabilityId: "public_repository_analysis", input: message.capabilityInput }
+      : { schemaVersion: 1, id: message.messageId, role: message.role === "capability" ? "assistant" : message.role, text: message.content, createdAt: message.createdAt }),
+  };
+}
+function normalizeSummary(value: V2ConversationSummary): ConversationSummary {
+  return { schemaVersion: 1, conversationId: value.conversationId, title: value.title.slice(0, 128), createdAt: value.createdAt, updatedAt: value.updatedAt, preview: value.preview, messageCount: value.messageCount };
+}
+function normalizeRun(value: V2Run): WorkbenchRun {
+  if (!value.input) throw new Error("服务器返回的运行缺少输入记录");
+  const status = value.status === "accepted" ? "queued" : value.status;
+  return {
+    schemaVersion: 1, runId: value.runId, conversationId: value.conversationId, status,
+    createdAt: value.createdAt, updatedAt: value.updatedAt, input: value.input,
+    ...(value.retryOfRunId ? { retryOfRunId: value.retryOfRunId } : {}), ...(value.result ? { result: value.result } : {}),
+  };
+}
+function normalizeApiValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeApiValue);
+  if (!value || typeof value !== "object") return value;
+  const item = value as Record<string, unknown>;
+  if (item.schemaVersion === 2 && typeof item.runId === "string" && typeof item.requestHash === "string") return normalizeRun(item as unknown as V2Run);
+  if (item.schemaVersion === 2 && typeof item.conversationId === "string" && Array.isArray(item.messages)) return normalizeConversation(item as unknown as V2Conversation);
+  if (item.schemaVersion === 2 && typeof item.conversationId === "string" && typeof item.title === "string" && typeof item.preview === "string") return normalizeSummary(item as unknown as V2ConversationSummary);
+  return Object.fromEntries(Object.entries(item).map(([key, nested]) => [key, normalizeApiValue(nested)]));
+}
 function isFakeDemoRepository(value: string): boolean {
   try {
     const url = new URL(value);
@@ -20,20 +52,22 @@ function isFakeDemoRepository(value: string): boolean {
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, { ...init, headers: { "content-type": "application/json", ...init?.headers } });
-  const body = await response.json().catch(() => undefined) as { error?: { message?: string } } | undefined;
-  if (!response.ok) throw new Error(body?.error?.message ?? `请求失败 (${response.status})`);
-  return body as T;
+  const headers = new Headers(init?.headers);
+  if (init?.body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json");
+  const response = await fetch(`${API}${path}`, { ...init, headers });
+  const body = await response.json().catch(() => undefined) as { message?: string; error?: { message?: string } } | undefined;
+  if (!response.ok) throw new Error(body?.message ?? body?.error?.message ?? `请求失败 (${response.status})`);
+  return normalizeApiValue(body) as T;
 }
 function key(): string { return crypto.randomUUID(); }
-function Icon({ name }: { name: "plus" | "chat" | "grid" | "settings" | "send" | "stop" | "paperclip" | "spark" | "close" }) {
+function Icon({ name }: { name: "plus" | "chat" | "grid" | "settings" | "send" | "stop" | "paperclip" | "spark" | "close" | "trash" }) {
   const common = { width: 16, height: 16, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round" as const, strokeLinejoin: "round" as const, "aria-hidden": true as const };
   const paths: Record<typeof name, React.ReactNode> = {
     plus: <><path d="M12 5v14M5 12h14" /></>, chat: <><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5 8 8 0 0 1-3.5-.8L4 20l1.8-4A7.5 7.5 0 1 1 20 11.5Z" /></>,
     grid: <><rect x="4" y="4" width="6" height="6" rx="1.5" /><rect x="14" y="4" width="6" height="6" rx="1.5" /><rect x="4" y="14" width="6" height="6" rx="1.5" /><rect x="14" y="14" width="6" height="6" rx="1.5" /></>,
     settings: <><circle cx="12" cy="12" r="3" /><path d="m19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.6a8 8 0 0 1-1.6.9l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-1.6-.9l-1.7.6-1.4-2.4L8 15a8 8 0 0 1 0-1.9l-1.4-1.2L8 9.5l1.7.6a8 8 0 0 1 1.6-.9l.3-1.8h2.8l.3 1.8a8 8 0 0 1 1.6.9l1.7-.6 1.4 2.4-1.4 1.2a8 8 0 0 1 0 1.9Z" transform="translate(-1 -1) scale(1.08)" /></>,
     send: <><path d="m5 12 14-7-4 14-3.2-5.5L5 12Z" /><path d="m11.8 13.5 3.5-3.5" /></>, stop: <><rect x="6" y="6" width="12" height="12" rx="2" /></>,
-    paperclip: <><path d="m8.5 12.5 6-6a3 3 0 0 1 4.2 4.2l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.1-8.1" /></>, spark: <><path d="m12 3 1.6 6.4L20 11l-6.4 1.6L12 19l-1.6-6.4L4 11l6.4-1.6L12 3Z" /><path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z" /></>, close: <><path d="m6 6 12 12M18 6 6 18" /></>,
+    paperclip: <><path d="m8.5 12.5 6-6a3 3 0 0 1 4.2 4.2l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.1-8.1" /></>, spark: <><path d="m12 3 1.6 6.4L20 11l-6.4 1.6L12 19l-1.6-6.4L4 11l6.4-1.6L12 3Z" /><path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z" /></>, close: <><path d="m6 6 12 12M18 6 6 18" /></>, trash: <><path d="M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m4 4v6m6-6v6" /></>,
   };
   return <svg {...common}>{paths[name]}</svg>;
 }
@@ -54,6 +88,7 @@ export default function HomePage() {
   const [mode, setMode] = useState<"fake" | "online">("fake");
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversation, setConversation] = useState<Conversation | null>(null);
+  const [isNewConversationDraft, setIsNewConversationDraft] = useState(true);
   const [capabilities, setCapabilities] = useState<CapabilityInfo[]>([]);
   const [text, setText] = useState("");
   const [selectedCapability, setSelectedCapability] = useState<CapabilityInfo | null>(null);
@@ -72,8 +107,10 @@ export default function HomePage() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const lastEventIdByRunRef = useRef<Record<string, string>>({});
   const selectedConversationIdRef = useRef<string | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const submissionInFlightRef = useRef(false);
   const navigationTokenRef = useRef(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const busy = activeRun !== null && ["queued", "running", "cancelling"].includes(activeRun.status);
@@ -88,6 +125,7 @@ export default function HomePage() {
     eventSourceRef.current = null;
     activeRunIdRef.current = null;
     selectedConversationIdRef.current = id;
+    setIsNewConversationDraft(false);
     setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
     const [loaded, runResult] = await Promise.all([
       api<Conversation>(`/conversations/${encodeURIComponent(id)}`),
@@ -100,14 +138,18 @@ export default function HomePage() {
     const latestRun = runResult.runs[0];
     setSelectedRunId(latestRun?.runId ?? null);
     setActiveRun(latestRun ?? null); setEvents([]); setDraftReply("");
-    if (latestRun) connectEvents(latestRun.runId);
+    if (latestRun && ["queued", "running", "cancelling"].includes(latestRun.status)) {
+      delete lastEventIdByRunRef.current[latestRun.runId];
+      connectEvents(latestRun.runId);
+    }
   }, []);
   const connectEvents = useCallback((runId: string, afterEventId?: string) => {
     eventSourceRef.current?.close();
     activeRunIdRef.current = runId;
     const conversationId = selectedConversationIdRef.current;
     const token = navigationTokenRef.current;
-    const cursor = afterEventId ? `?after=${encodeURIComponent(afterEventId)}` : "";
+    const cursorId = afterEventId ?? lastEventIdByRunRef.current[runId];
+    const cursor = cursorId ? `?after=${encodeURIComponent(cursorId)}` : "";
     const source = new EventSource(`${API}/runs/${encodeURIComponent(runId)}/events${cursor}`);
     eventSourceRef.current = source;
     const isCurrent = () => eventSourceRef.current === source && activeRunIdRef.current === runId &&
@@ -116,14 +158,18 @@ export default function HomePage() {
     for (const type of EVENT_TYPES) source.addEventListener(type, (message) => {
       if (!isCurrent()) return;
       try {
-        const payload = JSON.parse((message as MessageEvent<string>).data) as WorkbenchEvent | WorkbenchStreamReset;
-        if ("type" in payload && payload.type === "stream.reset") {
+        const payload = JSON.parse((message as MessageEvent<string>).data) as Record<string, unknown>;
+        if (payload.type === "stream.reset") {
+          const reset = payload as unknown as V2StreamReset;
           source.close();
           void api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}`).then((snapshot) => {
             if (!isCurrent()) return;
             setActiveRun(snapshot);
             setRuns((current) => current.map((item) => item.runId === runId ? snapshot : item));
-            if (["queued", "running", "cancelling"].includes(snapshot.status)) connectEvents(runId, payload.data.latestEventId);
+            if (["queued", "running", "cancelling"].includes(snapshot.status)) {
+              if (reset.data.latestEventId) lastEventIdByRunRef.current[runId] = reset.data.latestEventId;
+              connectEvents(runId, reset.data.latestEventId);
+            }
             else {
               eventSourceRef.current = null;
               void refreshSidebar();
@@ -134,20 +180,54 @@ export default function HomePage() {
           }).catch(() => { if (isCurrent()) setNotice("运行状态恢复失败，请重新连接。"); });
           return;
         }
-        const event = payload as WorkbenchEvent;
-        if (event.runId !== runId || event.conversationId !== conversationId) return;
+        if (payload.runId !== runId) return;
+        if (typeof payload.eventId === "string") lastEventIdByRunRef.current[runId] = payload.eventId;
+        const eventType = payload.type;
+        if (eventType === "run.accepted" || eventType === "run.started") {
+          const status = eventType === "run.started" ? "running" : "queued";
+          setActiveRun((current) => current?.runId === runId ? { ...current, status } : current);
+          setRuns((current) => current.map((item) => item.runId === runId ? { ...item, status } : item));
+          setNotice("");
+          return;
+        }
+        if (eventType === "run.progress") {
+          const progress = payload.data as { message: string };
+          setNotice(progress.message);
+          return;
+        }
+        if (eventType === "checkpoint.saved" || eventType === "usage.updated") return;
+        if (["run.completed", "run.failed", "run.cancelled", "run.interrupted"].includes(String(eventType))) {
+          source.close();
+          void api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}`).then((snapshot) => {
+            if (!isCurrent()) return;
+            setActiveRun((current) => current?.runId === runId ? snapshot : current);
+            setRuns((current) => current.map((item) => item.runId === runId ? snapshot : item));
+            eventSourceRef.current = null;
+            void refreshSidebar();
+            if (conversationId) void api<Conversation>(`/conversations/${encodeURIComponent(conversationId)}`).then((loaded) => {
+              if (selectedConversationIdRef.current === conversationId && navigationTokenRef.current === token && activeRunIdRef.current === runId) setConversation(loaded);
+            }).catch(() => { if (selectedConversationIdRef.current === conversationId) setNotice("对话刷新失败，请重新选择该对话。"); });
+          }).catch(() => { if (isCurrent()) setNotice("运行状态刷新失败，请重新连接。"); });
+          return;
+        }
+        let event: WorkbenchEvent | undefined;
+        if (eventType === "message.delta") event = { schemaVersion: 1, eventId: String(payload.eventId), runId, conversationId: conversationId ?? "", sequence: Number(payload.sequence), timestamp: String(payload.timestamp), type: "message.delta", data: payload.data as { text: string } };
+        if (eventType === "tool.started") {
+          const data = payload.data as { toolCallId: string; toolName: string };
+          event = { schemaVersion: 1, eventId: String(payload.eventId), runId, conversationId: conversationId ?? "", sequence: Number(payload.sequence), timestamp: String(payload.timestamp), type: "tool.started", data };
+        }
+        if (eventType === "tool.finished") {
+          const data = payload.data as { toolCallId: string; toolName: string; isError: boolean };
+          event = { schemaVersion: 1, eventId: String(payload.eventId), runId, conversationId: conversationId ?? "", sequence: Number(payload.sequence), timestamp: String(payload.timestamp), type: "tool.finished", data };
+        }
+        if (eventType === "run.cancelling") {
+          const raw = payload.data as { reason: "user" | "shutdown" | "timeout" };
+          const data = { reason: raw.reason === "shutdown" ? "timeout" as const : raw.reason };
+          event = { schemaVersion: 1, eventId: String(payload.eventId), runId, conversationId: conversationId ?? "", sequence: Number(payload.sequence), timestamp: String(payload.timestamp), type: "run.cancelling", data };
+        }
+        if (!event || !conversationId) return;
         setEvents((current) => current.some((item) => item.eventId === event.eventId) ? current : [...current, event].slice(-256));
         if (event.type === "message.delta") setDraftReply((current) => current + event.data.text);
-        if (event.type === "run.finished") {
-          setActiveRun((current) => current?.runId === runId ? { ...current, status: event.data.status, result: event.data } : current);
-          setRuns((current) => current.map((item) => item.runId === runId ? { ...item, status: event.data.status, result: event.data } : item));
-          source.close();
-          eventSourceRef.current = null;
-          void refreshSidebar();
-          void api<Conversation>(`/conversations/${encodeURIComponent(event.conversationId)}`).then((loaded) => {
-            if (selectedConversationIdRef.current === event.conversationId && navigationTokenRef.current === token && activeRunIdRef.current === runId) setConversation(loaded);
-          }).catch(() => { if (selectedConversationIdRef.current === conversationId) setNotice("对话刷新失败，请重新选择该对话。"); });
-        }
         setNotice("");
       } catch { setNotice("收到无法识别的事件；正在保留当前对话状态。"); }
     });
@@ -164,28 +244,56 @@ export default function HomePage() {
         setMode(health.mode); setCapabilities(caps.capabilities); setConversations(listed.conversations);
         const saved = localStorage.getItem("pi-workbench-conversation");
         if (saved && listed.conversations.some((item) => item.conversationId === saved)) await loadConversation(saved);
-        else await createConversation();
+        else if (listed.conversations[0]) await loadConversation(listed.conversations[0].conversationId);
+        else {
+          localStorage.removeItem("pi-workbench-conversation");
+          setIsNewConversationDraft(true);
+        }
       } catch (error) { if (!ignore) setNotice(error instanceof Error ? error.message : "无法连接本地工作台服务。"); }
       finally { if (!ignore) setLoading(false); }
     })();
     return () => { ignore = true; navigationTokenRef.current++; eventSourceRef.current?.close(); eventSourceRef.current = null; };
   }, [loadConversation]);
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [conversation?.messages.length, events.length, draftReply]);
+  useEffect(() => { if (isNewConversationDraft && !loading) textareaRef.current?.focus(); }, [isNewConversationDraft, loading]);
 
-  async function createConversation() {
-    const token = ++navigationTokenRef.current;
+  function beginNewConversation() {
+    navigationTokenRef.current++;
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
     activeRunIdRef.current = null;
     selectedConversationIdRef.current = null;
     setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
-    const created = await api<Conversation>("/conversations", { method: "POST", body: "{}" });
-    if (token !== navigationTokenRef.current) return;
-    selectedConversationIdRef.current = created.conversationId;
-    setConversation(created); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
-    localStorage.setItem("pi-workbench-conversation", created.conversationId);
-    await refreshSidebar();
+    setIsNewConversationDraft(true);
+    setText(""); setSelectedCapability(null); setCapabilityValues({}); setPickerQuery(""); setShowPicker(false); setNotice("");
+    localStorage.removeItem("pi-workbench-conversation");
     textareaRef.current?.focus();
+  }
+  async function deleteConversation(id: string) {
+    const accepted = window.confirm("永久删除这条对话及其消息、会话快照、运行记录、事件和用量？此操作无法撤销。项目及项目目录中的文件不会被删除或自动回滚。若对话仍有活动任务，服务端会拒绝删除。\n\n确定永久删除？");
+    if (!accepted) return;
+    const wasSelected = selectedConversationIdRef.current === id;
+    try {
+      await api<{ deleted: boolean }>(`/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
+      const remaining = conversations.filter((item) => item.conversationId !== id);
+      setConversations(remaining);
+      if (wasSelected) {
+        if (remaining[0]) {
+          await loadConversation(remaining[0].conversationId);
+        } else {
+          navigationTokenRef.current++;
+          eventSourceRef.current?.close(); eventSourceRef.current = null;
+          activeRunIdRef.current = null; selectedConversationIdRef.current = null;
+          localStorage.removeItem("pi-workbench-conversation");
+          setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
+          setText(""); clearCapability();
+          setIsNewConversationDraft(true);
+        }
+      } else await refreshSidebar();
+      setNotice("对话及其本地运行记录已永久删除。");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "无法删除对话；活动运行可能仍在执行。");
+    }
   }
   function onComposerChange(value: string) {
     setText(value);
@@ -199,8 +307,8 @@ export default function HomePage() {
   }
   function clearCapability() { setSelectedCapability(null); setCapabilityValues({}); }
   async function submit() {
-    if (!conversation || busy) return;
-    const conversationId = conversation.conversationId;
+    if ((!conversation && !isNewConversationDraft) || busy || submissionInFlightRef.current) return;
+    let conversationId = conversation?.conversationId;
     const token = navigationTokenRef.current;
     const trimmed = text.trim();
     let capabilityInput: Record<string, string> | undefined;
@@ -223,24 +331,71 @@ export default function HomePage() {
         }
       }
     } else if (!trimmed) return;
+    submissionInFlightRef.current = true;
     setNotice(""); setDraftReply(""); setEvents([]);
     const input = selectedCapability ? {
       kind: "capability", capabilityId: selectedCapability.id,
       input: capabilityInput,
     } : { kind: "message", text: trimmed };
+    let newlyCreatedConversation: Conversation | undefined;
+    let runAccepted = false;
     try {
-      const created = await api<WorkbenchRun>(`/conversations/${encodeURIComponent(conversationId)}/runs`, {
-        method: "POST", headers: { "Idempotency-Key": key() }, body: JSON.stringify({ schemaVersion: 1, input }),
+      if (!conversationId) {
+        newlyCreatedConversation = await api<Conversation>("/conversations", { method: "POST", body: "{}" });
+        if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== null) {
+          await api(`/conversations/${encodeURIComponent(newlyCreatedConversation.conversationId)}`, { method: "DELETE" }).catch(() => undefined);
+          return;
+        }
+        conversationId = newlyCreatedConversation.conversationId;
+        selectedConversationIdRef.current = conversationId;
+        setConversation(newlyCreatedConversation);
+        setIsNewConversationDraft(false);
+        localStorage.setItem("pi-workbench-conversation", conversationId);
+      }
+      const created = await api<WorkbenchRun>("/runs", {
+        method: "POST", headers: { "Idempotency-Key": key() }, body: JSON.stringify({ schemaVersion: 2, conversationId, input }),
       });
+      runAccepted = true;
       if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== conversationId) return;
       setActiveRun(created);
       setRuns((current) => [created, ...current].slice(0, 32));
       setSelectedRunId(created.runId);
+      if (newlyCreatedConversation && input.kind === "message") {
+        const messageAt = new Date().toISOString();
+        const optimisticMessage: Conversation["messages"][number] = {
+          schemaVersion: 1, id: key(), role: "user", text: trimmed, createdAt: messageAt,
+        };
+        setConversation((current) => {
+          if (!current || current.conversationId !== conversationId) return current;
+          return {
+            ...current, updatedAt: messageAt, preview: trimmed.replace(/\s+/gu, " ").slice(0, 256),
+            messageCount: current.messageCount + 1, messages: [...current.messages, optimisticMessage],
+          };
+        });
+      }
       setText("");
       clearCapability();
       await refreshSidebar();
       connectEvents(created.runId);
-    } catch (error) { setNotice(error instanceof Error ? error.message : "无法提交运行。"); }
+    } catch (error) {
+      if (newlyCreatedConversation && !runAccepted) {
+        let rolledBack = false;
+        try {
+          await api(`/conversations/${encodeURIComponent(newlyCreatedConversation.conversationId)}`, { method: "DELETE" });
+          rolledBack = true;
+        } catch { /* Keep the conversation if the server may already have accepted the run. */ }
+        if (rolledBack) {
+          if (token === navigationTokenRef.current && selectedConversationIdRef.current === newlyCreatedConversation.conversationId) {
+            selectedConversationIdRef.current = null;
+            localStorage.removeItem("pi-workbench-conversation");
+            setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
+            setIsNewConversationDraft(true);
+          }
+          void refreshSidebar().catch(() => undefined);
+        }
+      }
+      if (token === navigationTokenRef.current) setNotice(error instanceof Error ? error.message : "无法提交运行。");
+    } finally { submissionInFlightRef.current = false; }
   }
   async function cancel() {
     if (!activeRun || !busy) return;
@@ -268,8 +423,20 @@ export default function HomePage() {
       setEvents([]); setDraftReply(""); connectEvents(next.runId);
     } catch (error) { setNotice(error instanceof Error ? error.message : "重试失败。"); }
   }
+  async function continueRun(runId: string) {
+    if (busy) return;
+    const conversationId = selectedConversationIdRef.current;
+    const token = navigationTokenRef.current;
+    try {
+      const next = await api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}/continue`, { method: "POST", headers: { "Idempotency-Key": key() }, body: "{}" });
+      if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== conversationId) return;
+      setActiveRun(next); setRuns((current) => [next, ...current.filter((run) => run.runId !== next.runId)].slice(0, 32)); setSelectedRunId(next.runId);
+      setEvents([]); setDraftReply(""); connectEvents(next.runId);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "继续运行失败。"); }
+  }
   const filteredCapabilities = capabilities.filter((capability) => `${capability.name} ${capability.id}`.toLowerCase().includes(pickerQuery.toLowerCase()));
   const isWelcome = !conversation?.messages.length && !activeRun;
+  const canCompose = conversation !== null || isNewConversationDraft;
   const selectedRun = selectedRunId === activeRun?.runId ? activeRun : runs.find((run) => run.runId === selectedRunId) ?? activeRun;
   const selectedIsActive = selectedRun?.runId === activeRun?.runId;
   const result = selectedRun?.result;
@@ -278,15 +445,18 @@ export default function HomePage() {
     <aside className={`sidebar ${mobileOpen ? "mobile-open" : ""}`}>
       <div className="brand-row"><a className="brand" href="#home" aria-label="PI Workbench">PI <span>Workbench</span></a><button className="collapse" aria-label="收起导航" onClick={() => setMobileOpen(false)}>‹</button></div>
       <nav className="primary-nav" aria-label="主导航">
-        <button className="nav-item selected" onClick={() => void createConversation()}><Icon name="plus" /><span>新对话</span></button>
+        <button className="nav-item selected" onClick={beginNewConversation}><Icon name="plus" /><span>新对话</span></button>
         <div className="nav-caption">工作区</div>
         <button className="nav-item" onClick={() => textareaRef.current?.focus()}><Icon name="chat" /><span>对话</span></button>
         <button className="nav-item" onClick={() => { setPickerQuery(""); setShowPicker((current) => !current); textareaRef.current?.focus(); }}><Icon name="grid" /><span>能力中心</span></button>
       </nav>
-      <div className="section-heading"><span>最近对话</span><button className="icon-button" aria-label="新建对话" onClick={() => void createConversation()}><Icon name="plus" /></button></div>
+      <div className="section-heading"><span>最近对话</span><button className="icon-button" aria-label="新建对话" onClick={beginNewConversation}><Icon name="plus" /></button></div>
       <div className="conversation-list">
-        {conversations.map((item) => <button key={item.conversationId} className={`conversation-item ${item.conversationId === conversation?.conversationId ? "current" : ""}`} title={item.title} onClick={() => void loadConversation(item.conversationId)}><Icon name="chat" /><span>{item.title}</span></button>)}
-        {!conversations.length && <p className="empty-sidebar">对话会暂存在当前服务进程中</p>}
+        {conversations.map((item) => <div className={`conversation-row ${item.conversationId === conversation?.conversationId ? "current" : ""}`} key={item.conversationId}>
+          <button className="conversation-item" title={item.title} onClick={() => void loadConversation(item.conversationId)}><Icon name="chat" /><span>{item.title}</span></button>
+          <button className="delete-conversation" title={`永久删除：${item.title}`} aria-label={`永久删除对话：${item.title}`} onClick={() => void deleteConversation(item.conversationId)}><Icon name="trash" /></button>
+        </div>)}
+        {!conversations.length && <p className="empty-sidebar">对话保存在本地 SQLite 数据库中</p>}
       </div>
       <div className="sidebar-footer"><button className="nav-item" onClick={() => setShowSettings(true)}><Icon name="settings" /><span>设置和更多</span></button></div>
     </aside>
@@ -298,8 +468,8 @@ export default function HomePage() {
           {isWelcome ? <section className="welcome-block"><div className="welcome-mark"><Icon name="spark" /></div><h1>你好，今天想解决什么问题？</h1><p>直接描述你的目标，PI Workbench 会通过对话协助你。<br className="wide-break" />需要读取公开仓库时，可以在输入框中用 <kbd>@</kbd> 显式选择“仓库分析”。</p></section> : <section className="transcript" aria-label="对话记录">
             {conversation?.messages.map((message) => <article key={message.id} className={`message-row ${message.role === "assistant" ? "assistant" : "user"}`}><div className="message-avatar">{message.role === "assistant" ? <span>PI</span> : "你"}</div><div className="message-body"><div className="message-role">{message.role === "assistant" ? "PI Workbench" : message.role === "capability" ? "能力调用" : "你"}</div><div className="message-text">{message.text}</div>{message.role === "capability" && <div className="capability-chip">@{capabilities.find((cap) => cap.id === message.capabilityId)?.name ?? "能力"}</div>}</div></article>)}
             {busy && selectedIsActive && <article className="message-row assistant"><div className="message-avatar"><span>PI</span></div><div className="message-body"><div className="message-role">PI Workbench</div>{draftReply ? <div className="message-text">{draftReply}</div> : <div className="thinking"><span /><span /><span /> 正在处理你的请求</div>}</div></article>}
-            {runs.length > 0 && <div className="run-history" aria-label="运行记录"><span>运行记录</span>{runs.map((run) => <button key={run.runId} className={`run-history-item ${selectedRun?.runId === run.runId ? "current" : ""}`} onClick={() => setSelectedRunId(run.runId)} aria-pressed={selectedRun?.runId === run.runId}>{run.input.kind === "capability" ? "能力" : "对话"} · {run.runId.slice(0, 8)} · {run.status === "completed" ? "完成" : run.status === "cancelled" ? "取消" : run.status === "failed" ? "失败" : "执行中"}</button>)}</div>}
-            {selectedRun && <div className="run-card"><div className="run-card-head"><div><span className={`run-state ${selectedRun.status}`}>{selectedRun.status === "running" ? "运行中" : selectedRun.status === "cancelling" ? "正在取消" : selectedRun.status === "completed" ? "已完成" : selectedRun.status === "failed" ? "失败" : selectedRun.status === "cancelled" ? "已取消" : "等待中"}</span><span className="run-id">运行 {selectedRun.runId.slice(0, 8)}</span></div><div className="run-actions">{selectedIsActive && busy && <button className="quiet-button" onClick={() => void cancel()}>取消</button>}{!busy && selectedRun.status !== "completed" && <button className="quiet-button" onClick={() => void retry(selectedRun.runId)}>重试</button>}{selectedIsActive && <button className="quiet-button" onClick={() => connectEvents(selectedRun.runId)}>重新连接</button>}</div></div>
+            {runs.length > 0 && <div className="run-history" aria-label="运行记录"><span>运行记录</span>{runs.map((run) => <button key={run.runId} className={`run-history-item ${selectedRun?.runId === run.runId ? "current" : ""}`} onClick={() => setSelectedRunId(run.runId)} aria-pressed={selectedRun?.runId === run.runId}>{run.input.kind === "capability" ? "能力" : "对话"} · {run.runId.slice(0, 8)} · {run.status === "completed" ? "完成" : run.status === "cancelled" ? "取消" : run.status === "failed" ? "失败" : run.status === "interrupted" ? "中断" : "执行中"}</button>)}</div>}
+            {selectedRun && <div className="run-card"><div className="run-card-head"><div><span className={`run-state ${selectedRun.status}`}>{selectedRun.status === "running" ? "运行中" : selectedRun.status === "cancelling" ? "正在取消" : selectedRun.status === "completed" ? "已完成" : selectedRun.status === "failed" ? "失败" : selectedRun.status === "cancelled" ? "已取消" : selectedRun.status === "interrupted" ? "已中断" : "等待中"}</span><span className="run-id">运行 {selectedRun.runId.slice(0, 8)}</span></div><div className="run-actions">{selectedIsActive && busy && <button className="quiet-button" onClick={() => void cancel()}>取消</button>}{!busy && selectedRun.status === "interrupted" && <button className="quiet-button" onClick={() => void continueRun(selectedRun.runId)}>继续</button>}{!busy && ["failed", "cancelled"].includes(selectedRun.status) && <button className="quiet-button" onClick={() => void retry(selectedRun.runId)}>重试</button>}{selectedIsActive && <button className="quiet-button" onClick={() => connectEvents(selectedRun.runId)}>重新连接</button>}</div></div>
               {selectedIsActive && <div className="event-list">{events.filter((event) => event.type !== "message.delta").slice(-10).map((event) => <div className="event-item" key={event.eventId}><span className={`event-dot ${event.type}`} /><span>{eventLabel(event)}</span></div>)}</div>}
               {!busy && result?.status === "failed" && <p className="result-error">{result.error.message}</p>}
               {!busy && result?.status === "cancelled" && <p className="result-note">运行已取消。未把部分执行结果加入 Agent 上下文。</p>}
@@ -312,16 +482,16 @@ export default function HomePage() {
             {selectedCapability && <div className="capability-fields"><div className="capability-form-head"><div><span className="capability-kicker">已选择能力</span><strong>@{selectedCapability.name}</strong></div><button className="icon-button" aria-label="移除能力" onClick={clearCapability}><Icon name="close" /></button></div><div className="field-grid">{selectedCapability.inputs.map((field) => <label className="capability-input-field" key={field.id}><span>{field.label}{field.required ? "（必填）" : "（可选）"}</span>{field.control === "textarea" ? <textarea value={capabilityValues[field.id] ?? ""} maxLength={field.maxLength} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} rows={3} /> : <input value={capabilityValues[field.id] ?? ""} maxLength={field.maxLength} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} />}</label>)}</div>{selectedCapability.id === "public_repository_analysis" && mode === "fake" && <p className="offline-capability-note">离线演示只使用合成的 Harborlight 仓库，不会分析真实仓库；其他地址会被拒绝。真实分析需切换在线模式。</p>}</div>}
             <div className="composer-wrap">
               {showPicker && <div className="capability-picker"><div className="picker-title">选择已注册能力</div>{filteredCapabilities.length ? filteredCapabilities.map((capability) => <button key={capability.id} className="picker-option" onMouseDown={(event) => event.preventDefault()} onClick={() => chooseCapability(capability)}><span className="picker-icon"><Icon name="spark" /></span><span><strong>@{capability.name}</strong><small>{capability.description}</small></span><kbd>↵</kbd></button>) : <div className="picker-empty">没有匹配的已注册能力</div>}</div>}
-              <textarea ref={textareaRef} value={text} onChange={(event) => onComposerChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !showPicker) { event.preventDefault(); void submit(); } if (event.key === "Escape" && showPicker) setShowPicker(false); }} placeholder={selectedCapability ? "能力参数请填写在上方；普通提示可移除能力后单独发送" : "给 PI Workbench 一个任务；输入 @ 可显式调用已注册能力"} rows={2} aria-label="输入你的任务" disabled={selectedCapability !== null} />
-              <div className="composer-toolbar"><div className="composer-tools"><button className="tool-button" title="附件入口将在后续版本提供" aria-label="附件"><Icon name="paperclip" /></button><span className="tool-separator" /><span className="composer-hint">Enter 发送 · Shift + Enter 换行</span></div><button className={`send-button ${busy ? "cancel" : ""}`} onClick={() => busy ? void cancel() : void submit()} aria-label={busy ? "取消运行" : "发送"}>{busy ? <Icon name="stop" /> : <Icon name="send" />}</button></div>
+              <textarea ref={textareaRef} value={text} onChange={(event) => onComposerChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !showPicker) { event.preventDefault(); void submit(); } if (event.key === "Escape" && showPicker) setShowPicker(false); }} placeholder={!canCompose ? "请先新建对话" : selectedCapability ? "能力参数请填写在上方；普通提示可移除能力后单独发送" : "给 PI Workbench 一个任务；输入 @ 可显式调用已注册能力"} rows={2} aria-label="输入你的任务" disabled={!canCompose || selectedCapability !== null} />
+              <div className="composer-toolbar"><div className="composer-tools"><button className="tool-button" title="附件入口将在后续版本提供" aria-label="附件"><Icon name="paperclip" /></button><span className="tool-separator" /><span className="composer-hint">Enter 发送 · Shift + Enter 换行</span></div><button className={`send-button ${busy ? "cancel" : ""}`} onClick={() => busy ? void cancel() : void submit()} aria-label={busy ? "取消运行" : "发送"} disabled={!canCompose && !busy}>{busy ? <Icon name="stop" /> : <Icon name="send" />}</button></div>
               </div>
-            {isWelcome && <div className="suggestions">{SUGGESTIONS.map((suggestion, index) => <button key={suggestion} className="suggestion" onClick={() => setText(suggestion)}>{index === 0 && <Icon name="spark" />}{suggestion}</button>)}</div>}
+            {isWelcome && canCompose && <div className="suggestions">{SUGGESTIONS.map((suggestion, index) => <button key={suggestion} className="suggestion" onClick={() => setText(suggestion)}>{index === 0 && <Icon name="spark" />}{suggestion}</button>)}</div>}
             {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")} aria-label="关闭提示"><Icon name="close" /></button></div>}
-            <div className="disclaimer">普通提示使用默认空工具集 · 对话仅保存在当前进程 · AI 生成内容请自行核验</div>
+            <div className="disclaimer">普通提示使用默认空工具集 · 对话保存于本地 SQLite · AI 生成内容请自行核验</div>
           </section>
         </>}
       </div>
     </main>
-    {showSettings && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSettings(false); }}><section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="dialog-head"><h2 id="settings-title">设置和更多</h2><button className="icon-button" onClick={() => setShowSettings(false)} aria-label="关闭"><Icon name="close" /></button></div><div className="settings-row"><div><strong>模型模式</strong><p>{mode === "fake" ? "离线模拟，无真实模型调用" : "DeepSeek Flash；密钥仅由服务端读取"}</p></div><span className={`mode-pill ${mode === "fake" ? "offline" : "online"}`}>{mode === "fake" ? "离线演示" : "在线"}</span></div><div className="settings-row"><div><strong>对话存储</strong><p>保存在服务进程内；重启后清空</p></div></div><p className="settings-footnote">本地 API 默认绑定 127.0.0.1。此页面不会读取或保存 API Key。</p></section></div>}
+    {showSettings && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSettings(false); }}><section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="dialog-head"><h2 id="settings-title">设置和更多</h2><button className="icon-button" onClick={() => setShowSettings(false)} aria-label="关闭"><Icon name="close" /></button></div><div className="settings-row"><div><strong>模型模式</strong><p>{mode === "fake" ? "离线模拟，无真实模型调用" : "DeepSeek Flash；密钥仅由服务端读取"}</p></div><span className={`mode-pill ${mode === "fake" ? "offline" : "online"}`}>{mode === "fake" ? "离线演示" : "在线"}</span></div><div className="settings-row"><div><strong>对话存储</strong><p>保存在本机数据目录的 SQLite 数据库中；服务重启后保留</p></div></div><p className="settings-footnote">本地 API 默认绑定 127.0.0.1。此页面不会读取或保存 API Key。</p></section></div>}
   </div>;
 }

@@ -80,6 +80,10 @@ export interface ActiveSlot {
   runId: string | null; claimToken: string | null; generation: number; workerBootId: string | null;
   heartbeatAt: string | null; leaseExpiresAt: string | null;
 }
+export interface WorkerIdentityRecord {
+  bootId: string; pid: number; processStart: string; status: "idle" | "running" | "stopping" | "uncertain";
+  startedAt: string; heartbeatAt: string;
+}
 export interface StorageDiagnostics {
   journalMode: string; synchronous: number; foreignKeys: boolean; busyTimeoutMs: number; schemaVersion: number;
 }
@@ -105,6 +109,8 @@ export class Storage {
   readonly usage: UsageRepository;
   readonly idempotency: IdempotencyRepository;
   readonly activeSlot: ActiveSlotRepository;
+  readonly results: RunResultRepository;
+  readonly workerIdentity: WorkerIdentityRepository;
   readonly path: string;
   readonly readOnly: boolean;
 
@@ -122,6 +128,8 @@ export class Storage {
     this.usage = new UsageRepository(context);
     this.idempotency = new IdempotencyRepository(context);
     this.activeSlot = new ActiveSlotRepository(context);
+    this.results = new RunResultRepository(context);
+    this.workerIdentity = new WorkerIdentityRepository(context);
   }
 
   static open(options: StorageOptions = {}): Storage {
@@ -169,13 +177,20 @@ export class Storage {
       if (check?.quick_check !== "ok") throw new Error("SQLite quick check failed");
       const version = db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get() as { version: number };
 
+      let transactionDepth = 0;
       const context: Context = {
         db,
         readOnly,
         atomic<T>(callback: (connection: DatabaseSync) => T): T {
           if (readOnly) throw new StorageError("db_readonly", "Database is read-only");
+          if (transactionDepth > 0) {
+            const value = callback(db);
+            if (value !== null && typeof value === "object" && "then" in value) throw new TypeError("SQLite transactions must not be asynchronous");
+            return value;
+          }
           try {
             db.exec("BEGIN IMMEDIATE");
+            transactionDepth += 1;
             const value = callback(db);
             if (value !== null && typeof value === "object" && "then" in value) throw new TypeError("SQLite transactions must not be asynchronous");
             db.exec("COMMIT");
@@ -183,6 +198,8 @@ export class Storage {
           } catch (error) {
             try { if (db.isTransaction) db.exec("ROLLBACK"); } catch { /* Keep the original failure. */ }
             return translateStorageError(error);
+          } finally {
+            transactionDepth = 0;
           }
         },
         translate: translateStorageError,
@@ -201,6 +218,7 @@ export class Storage {
   }
 
   readonly diagnostics!: StorageDiagnostics;
+  transaction<T>(callback: () => T): T { return this.context.atomic(() => callback()); }
   close(): void { if (this.context.db.isOpen) this.context.db.close(); }
 }
 
@@ -268,6 +286,45 @@ export class ConversationRepository {
     if (result.changes !== 1) throw new StorageError("not_found", "Conversation was not found");
     return this.get(id)!;
   }
+  update(id: string, patch: { title?: string; status?: ConversationRecord["status"]; piSessionId?: string | null; updatedAt?: string }): ConversationRecord {
+    const current = this.get(id);
+    if (!current) throw new StorageError("not_found", "Conversation was not found");
+    const updatedAt = patch.updatedAt ?? new Date().toISOString();
+    assertTimestamp(updatedAt);
+    const title = patch.title ?? current.title;
+    if (!title.trim() || title.length > 256) throw new StorageError("invalid_input", "Conversation title is invalid");
+    const piSessionId = patch.piSessionId === undefined ? current.piSessionId : patch.piSessionId;
+    if (piSessionId !== null) assertId(piSessionId, "PI session id");
+    this.context.atomic((db) => {
+      const result = db.prepare("UPDATE conversations SET title = ?, status = ?, pi_session_id = ?, updated_at = ? WHERE id = ?")
+        .run(title, patch.status ?? current.status, piSessionId, updatedAt, id);
+      if (result.changes !== 1) throw new StorageError("not_found", "Conversation was not found");
+    });
+    return this.get(id)!;
+  }
+  deletePermanently(id: string): void {
+    this.context.atomic((db) => {
+      if (!db.prepare("SELECT 1 FROM conversations WHERE id = ?").get(id)) throw new StorageError("not_found", "Conversation was not found");
+      const active = db.prepare(`SELECT 1 FROM runs WHERE conversation_id = ? AND status IN ('accepted', 'running', 'cancelling') LIMIT 1`).get(id);
+      if (active) throw new StorageError("active_task", "Conversation has a run that has not stopped");
+      const slot = db.prepare(`SELECT 1 FROM global_slot WHERE singleton = 1 AND active_run_id IN (SELECT id FROM runs WHERE conversation_id = ?)`).get(id);
+      if (slot) throw new StorageError("active_task", "Conversation worker exit has not been confirmed");
+      const worker = db.prepare("SELECT status FROM worker_identity WHERE singleton = 1").get() as { status: string } | undefined;
+      if (worker && (worker.status === "stopping" || worker.status === "uncertain")) throw new StorageError("active_task", "Worker exit has not been confirmed");
+
+      db.prepare("DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?)").run(id);
+      db.prepare("DELETE FROM checkpoints WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?)").run(id);
+      db.prepare("DELETE FROM usage_records WHERE attempt_id IN (SELECT a.id FROM run_attempts a JOIN runs r ON r.id = a.run_id WHERE r.conversation_id = ?)").run(id);
+      db.prepare("DELETE FROM messages WHERE conversation_id = ?").run(id);
+      db.prepare("DELETE FROM run_attempts WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?)").run(id);
+      db.prepare("DELETE FROM run_results WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?)").run(id);
+      db.prepare("UPDATE runs SET retry_of_run_id = NULL WHERE conversation_id = ?").run(id);
+      db.prepare("DELETE FROM idempotency_keys WHERE (resource_kind = 'conversation' AND resource_id = ?) OR resource_id IN (SELECT id FROM runs WHERE conversation_id = ?)").run(id, id);
+      db.prepare("DELETE FROM runs WHERE conversation_id = ?").run(id);
+      db.prepare("DELETE FROM session_snapshots WHERE conversation_id = ?").run(id);
+      db.prepare("DELETE FROM conversations WHERE id = ?").run(id);
+    });
+  }
 }
 
 export class MessageRepository {
@@ -330,6 +387,17 @@ export interface CreateRunInput {
   runId: string; conversationId: string; projectId?: string | null; extensionId?: string | null;
   request: unknown; requestHash?: string; retryOfRunId?: string; createdAt?: string;
 }
+export interface InitialRunAdmission {
+  attemptId: string; claimToken: string; workerBootId: string;
+  heartbeatAt: string; leaseExpiresAt: string; updatedAt: string;
+  conversationTitle: string; acceptedEventId: string; startedEventId: string;
+  message: { id: string; role: MessageRecord["role"]; content: string; extensionId: string | null; createdAt: string };
+}
+export interface AdmittedRunState { slot: ActiveSlot; attemptId: string; events: V2RunEvent[]; }
+export interface ResumeRunAdmission {
+  attemptId: string; claimToken: string; workerBootId: string;
+  heartbeatAt: string; leaseExpiresAt: string; updatedAt: string; startedEventId: string;
+}
 export class RunRepository {
   constructor(private readonly context: Context) {}
   create(input: CreateRunInput): RunRecord {
@@ -356,7 +424,7 @@ export class RunRepository {
       .run(run.runId, run.conversationId, run.projectId ?? null, run.extensionId ?? null, run.status, requestHash, requestJson, run.retryOfRunId ?? null, createdAt, createdAt));
     return this.get(input.runId)!;
   }
-  createIdempotent(input: CreateRunInput, key: Omit<V2IdempotencyRequest, "schemaVersion" | "requestHash">): IdempotencyResolution & { run: RunRecord } {
+  createIdempotent(input: CreateRunInput, key: Omit<V2IdempotencyRequest, "schemaVersion" | "requestHash">, admission?: InitialRunAdmission): IdempotencyResolution & { run: RunRecord; admission?: AdmittedRunState } {
     assertId(input.runId, "Run id"); assertId(input.conversationId, "Conversation id");
     if (input.projectId) assertId(input.projectId, "Project id");
     if (input.extensionId) assertId(input.extensionId, "Extension id");
@@ -364,6 +432,12 @@ export class RunRepository {
     parseV2IdempotencyRequest({ schemaVersion: 2, ...key, requestHash: "0".repeat(64) });
     const requestJson = safeJson(input.request);
     const createdAt = input.createdAt ?? new Date().toISOString();
+    if (admission) {
+      assertId(admission.attemptId, "Attempt id"); assertId(admission.claimToken, "Claim token"); assertId(admission.workerBootId, "Worker boot id");
+      assertId(admission.message.id, "Message id"); assertTimestamp(admission.heartbeatAt); assertTimestamp(admission.leaseExpiresAt); assertTimestamp(admission.updatedAt); assertTimestamp(admission.message.createdAt);
+      assertLikelyCredentialFree(admission.message.content);
+      if (!admission.conversationTitle.trim() || admission.conversationTitle.length > 256) throw new StorageError("invalid_input", "Conversation title is invalid");
+    }
     const result = this.context.atomic((db) => {
       const conversation = db.prepare("SELECT project_id FROM conversations WHERE id = ?").get(input.conversationId) as { project_id: string | null } | undefined;
       if (!conversation) throw new StorageError("not_found", "Conversation was not found");
@@ -371,6 +445,7 @@ export class RunRepository {
       if (projectId !== conversation.project_id) throw new StorageError("conflict", "Run project must match its conversation");
       const requestHash = hashRunRequest(input, projectId, requestJson);
       if (input.requestHash && input.requestHash !== requestHash) throw new StorageError("invalid_input", "Run request hash does not match its request");
+      let nextGeneration: number | undefined;
       const existing = db.prepare(`SELECT request_hash, resource_kind, resource_id FROM idempotency_keys
         WHERE scope = ? AND endpoint = ? AND idempotency_key = ?`).get(key.scope, key.endpoint, key.key) as IdempotencyRow | undefined;
       if (existing) {
@@ -379,6 +454,14 @@ export class RunRepository {
         const stored = db.prepare("SELECT * FROM runs WHERE id = ?").get(existing.resource_id) as RunRow | undefined;
         if (!stored) throw new StorageError("conflict", "Idempotent run no longer exists");
         return { runId: stored.id, replayed: true };
+      }
+      if (admission) {
+        const slot = db.prepare("SELECT active_run_id, generation FROM global_slot WHERE singleton = 1").get() as { active_run_id: string | null; generation: number } | undefined;
+        if (!slot) throw new StorageError("conflict", "Global active slot is missing");
+        if (slot.active_run_id !== null) throw new StorageError("active_task", "Another run already holds the global active slot");
+        nextGeneration = slot.generation + 1;
+        const identity = db.prepare("SELECT boot_id, status FROM worker_identity WHERE singleton = 1").get() as { boot_id: string; status: string } | undefined;
+        if (!identity || identity.boot_id !== admission.workerBootId || identity.status !== "idle") throw new StorageError("conflict", "Worker identity is not idle and confirmed");
       }
       const run = parseV2Run({
         schemaVersion: 2, runId: input.runId, conversationId: input.conversationId,
@@ -391,10 +474,88 @@ export class RunRepository {
       db.prepare(`INSERT INTO idempotency_keys(scope, endpoint, idempotency_key, request_hash, resource_kind, resource_id, created_at)
         VALUES (?, ?, ?, ?, 'run', ?, ?)`)
         .run(key.scope, key.endpoint, key.key, requestHash, run.runId, createdAt);
-      return { runId: run.runId, replayed: false };
+      if (!admission) return { runId: run.runId, replayed: false };
+
+      if (nextGeneration === undefined) throw new StorageError("conflict", "Run admission slot generation was not initialized");
+      const slotUpdate = db.prepare(`UPDATE global_slot SET active_run_id = ?, claim_token = ?, generation = ?, worker_boot_id = ?, heartbeat_at = ?, lease_expires_at = ?
+        WHERE singleton = 1 AND active_run_id IS NULL`).run(run.runId, admission.claimToken, nextGeneration, admission.workerBootId, admission.heartbeatAt, admission.leaseExpiresAt);
+      if (slotUpdate.changes !== 1) throw new StorageError("active_task", "Another run claimed the global active slot");
+      const attempt = parseV2RunAttempt({
+        schemaVersion: 2, runId: run.runId, attemptId: admission.attemptId, attemptNumber: 1,
+        status: "running", usageComplete: false, workerBootId: admission.workerBootId, startedAt: admission.updatedAt,
+      });
+      db.prepare(`INSERT INTO run_attempts(id, run_id, attempt_number, status, usage_complete, worker_boot_id, started_at, ended_at, error_json)
+        VALUES (?, ?, ?, ?, 0, ?, ?, NULL, NULL)`).run(attempt.attemptId, attempt.runId, attempt.attemptNumber, attempt.status, admission.workerBootId, attempt.startedAt);
+      const running = parseV2Run({ ...run, status: "running", updatedAt: admission.updatedAt });
+      db.prepare("UPDATE runs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'accepted'").run(admission.updatedAt, run.runId);
+      const messageSequence = numberFrom(db.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM messages WHERE conversation_id = ?").get(run.conversationId), "next");
+      db.prepare(`INSERT INTO messages(id, conversation_id, run_id, sequence, role, content, source, extension_id, attachment_refs_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'user', ?, '[]', ?)`).run(admission.message.id, run.conversationId, run.runId, messageSequence, admission.message.role, admission.message.content, admission.message.extensionId, admission.message.createdAt);
+      db.prepare("UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?").run(admission.conversationTitle, admission.updatedAt, run.conversationId);
+      const events = [
+        parseV2RunEvent({ schemaVersion: 2, eventId: admission.acceptedEventId, runId: run.runId, attemptId: attempt.attemptId, sequence: 1, timestamp: admission.updatedAt, type: "run.accepted", data: { conversationId: run.conversationId, requestHash } }),
+        parseV2RunEvent({ schemaVersion: 2, eventId: admission.startedEventId, runId: run.runId, attemptId: attempt.attemptId, sequence: 2, timestamp: admission.updatedAt, type: "run.started", data: { workerBootId: admission.workerBootId } }),
+      ];
+      const insertEvent = db.prepare(`INSERT INTO run_events(event_id, run_id, attempt_id, sequence, event_type, event_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`);
+      for (const event of events) insertEvent.run(event.eventId, event.runId, event.attemptId, event.sequence, event.type, safeJson(event), event.timestamp);
+      const workerUpdate = db.prepare("UPDATE worker_identity SET status = 'running', heartbeat_at = ? WHERE singleton = 1 AND boot_id = ? AND status = 'idle'").run(admission.heartbeatAt, admission.workerBootId);
+      if (workerUpdate.changes !== 1) throw new StorageError("conflict", "Worker identity changed during run admission");
+      return {
+        runId: running.runId, replayed: false,
+        admission: { slot: { runId: running.runId, claimToken: admission.claimToken, generation: nextGeneration, workerBootId: admission.workerBootId, heartbeatAt: admission.heartbeatAt, leaseExpiresAt: admission.leaseExpiresAt }, attemptId: attempt.attemptId, events },
+      };
     });
     const run = this.get(result.runId)!;
-    return { result: { schemaVersion: 2, resourceKind: "run", resourceId: result.runId }, replayed: result.replayed, run };
+    return { result: { schemaVersion: 2, resourceKind: "run", resourceId: result.runId }, replayed: result.replayed, run, ...(result.admission ? { admission: result.admission } : {}) };
+  }
+  continueIdempotent(runId: string, key: Omit<V2IdempotencyRequest, "schemaVersion">, admission: ResumeRunAdmission): IdempotencyResolution & { run: RunRecord; replayed: boolean; admission?: AdmittedRunState } {
+    assertId(runId, "Run id");
+    parseV2IdempotencyRequest({ schemaVersion: 2, ...key });
+    assertId(admission.attemptId, "Attempt id"); assertId(admission.claimToken, "Claim token"); assertId(admission.workerBootId, "Worker boot id"); assertId(admission.startedEventId, "Event id");
+    assertTimestamp(admission.heartbeatAt); assertTimestamp(admission.leaseExpiresAt); assertTimestamp(admission.updatedAt);
+    const result = this.context.atomic((db) => {
+      const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as RunRow | undefined;
+      if (!run) throw new StorageError("not_found", "Run was not found");
+      const existing = db.prepare(`SELECT request_hash, resource_kind, resource_id FROM idempotency_keys
+        WHERE scope = ? AND endpoint = ? AND idempotency_key = ?`).get(key.scope, key.endpoint, key.key) as IdempotencyRow | undefined;
+      if (existing) {
+        if (existing.request_hash !== key.requestHash) throw new StorageError("conflict", "Idempotency key was already used for a different request");
+        if (existing.resource_kind !== "run" || existing.resource_id !== runId) throw new StorageError("conflict", "Idempotency key refers to a different resource");
+        return { runId, replayed: true };
+      }
+      if (run.status !== "interrupted") throw new StorageError("conflict", "Only interrupted runs can be continued");
+      const slot = db.prepare("SELECT active_run_id, generation FROM global_slot WHERE singleton = 1").get() as { active_run_id: string | null; generation: number } | undefined;
+      if (!slot) throw new StorageError("conflict", "Global active slot is missing");
+      if (slot.active_run_id !== null) throw new StorageError("active_task", "Another run already holds the global active slot");
+      const identity = db.prepare("SELECT boot_id, status FROM worker_identity WHERE singleton = 1").get() as { boot_id: string; status: string } | undefined;
+      if (!identity || identity.boot_id !== admission.workerBootId || identity.status !== "idle") throw new StorageError("conflict", "Worker identity is not idle and confirmed");
+      const generation = slot.generation + 1;
+      db.prepare(`INSERT INTO idempotency_keys(scope, endpoint, idempotency_key, request_hash, resource_kind, resource_id, created_at)
+        VALUES (?, ?, ?, ?, 'run', ?, ?)`).run(key.scope, key.endpoint, key.key, key.requestHash, runId, admission.updatedAt);
+      const slotUpdate = db.prepare(`UPDATE global_slot SET active_run_id = ?, claim_token = ?, generation = ?, worker_boot_id = ?, heartbeat_at = ?, lease_expires_at = ?
+        WHERE singleton = 1 AND active_run_id IS NULL`).run(runId, admission.claimToken, generation, admission.workerBootId, admission.heartbeatAt, admission.leaseExpiresAt);
+      if (slotUpdate.changes !== 1) throw new StorageError("active_task", "Another run claimed the global active slot");
+      const attemptNumber = numberFrom(db.prepare("SELECT COALESCE(MAX(attempt_number), 0) + 1 AS next FROM run_attempts WHERE run_id = ?").get(runId), "next");
+      const attempt = parseV2RunAttempt({
+        schemaVersion: 2, runId, attemptId: admission.attemptId, attemptNumber, status: "running",
+        usageComplete: false, workerBootId: admission.workerBootId, startedAt: admission.updatedAt,
+      });
+      db.prepare(`INSERT INTO run_attempts(id, run_id, attempt_number, status, usage_complete, worker_boot_id, started_at, ended_at, error_json)
+        VALUES (?, ?, ?, 'running', 0, ?, ?, NULL, NULL)`).run(attempt.attemptId, runId, attempt.attemptNumber, admission.workerBootId, admission.updatedAt);
+      const eventSequence = numberFrom(db.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM run_events WHERE run_id = ?").get(runId), "next");
+      const event = parseV2RunEvent({ schemaVersion: 2, eventId: admission.startedEventId, runId, attemptId: attempt.attemptId, sequence: eventSequence,
+        timestamp: admission.updatedAt, type: "run.started", data: { workerBootId: admission.workerBootId } });
+      db.prepare(`INSERT INTO run_events(event_id, run_id, attempt_id, sequence, event_type, event_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(event.eventId, event.runId, event.attemptId, event.sequence, event.type, safeJson(event), event.timestamp);
+      const runUpdate = db.prepare("UPDATE runs SET status = 'running', updated_at = ?, ended_at = NULL WHERE id = ? AND status = 'interrupted'").run(admission.updatedAt, runId);
+      if (runUpdate.changes !== 1) throw new StorageError("conflict", "Run state changed before continuation was committed");
+      const workerUpdate = db.prepare("UPDATE worker_identity SET status = 'running', heartbeat_at = ? WHERE singleton = 1 AND boot_id = ? AND status = 'idle'").run(admission.heartbeatAt, admission.workerBootId);
+      if (workerUpdate.changes !== 1) throw new StorageError("conflict", "Worker identity changed during run continuation");
+      return { runId, replayed: false, admission: { slot: { runId, claimToken: admission.claimToken, generation, workerBootId: admission.workerBootId, heartbeatAt: admission.heartbeatAt, leaseExpiresAt: admission.leaseExpiresAt }, attemptId: attempt.attemptId, events: [event] } };
+    });
+    const run = this.get(result.runId)!;
+    return { result: { schemaVersion: 2, resourceKind: "run", resourceId: result.runId }, replayed: result.replayed, run, ...(result.admission ? { admission: result.admission } : {}) };
   }
   get(id: string): RunRecord | undefined {
     const row = this.context.db.prepare("SELECT * FROM runs WHERE id = ?").get(id) as RunRow | undefined;
@@ -406,6 +567,10 @@ export class RunRepository {
       createdAt: row.created_at, updatedAt: row.updated_at, endedAt: row.ended_at,
     });
     return { ...parsed, request: parseJson(row.request_json) };
+  }
+  list(conversationId: string): RunRecord[] {
+    assertId(conversationId, "Conversation id");
+    return (this.context.db.prepare("SELECT id FROM runs WHERE conversation_id = ? ORDER BY created_at DESC, id").all(conversationId) as Array<{ id: string }>).map((row) => this.get(row.id)!).filter(Boolean);
   }
   updateStatus(id: string, status: V2RunStatus, updatedAt = new Date().toISOString(), endedAt?: string | null): RunRecord {
     assertId(id, "Run id"); assertTimestamp(updatedAt);
@@ -427,6 +592,54 @@ export class RunRepository {
       db.prepare("UPDATE runs SET status = ?, updated_at = ?, ended_at = ? WHERE id = ?").run(status, updatedAt, nextEndedAt, id);
     });
     return this.get(id)!;
+  }
+}
+
+export class RunResultRepository {
+  constructor(private readonly context: Context) {}
+  save(runId: string, result: unknown, updatedAt = new Date().toISOString()): JsonValue {
+    assertId(runId, "Run id"); assertTimestamp(updatedAt);
+    const encoded = safeJson(result);
+    this.context.atomic((db) => {
+      if (!db.prepare("SELECT 1 FROM runs WHERE id = ?").get(runId)) throw new StorageError("not_found", "Run was not found");
+      db.prepare(`INSERT INTO run_results(run_id, result_json, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET result_json = excluded.result_json, updated_at = excluded.updated_at`)
+        .run(runId, encoded, updatedAt);
+    });
+    return parseJson(encoded);
+  }
+  get(runId: string): JsonValue | undefined {
+    const row = this.context.db.prepare("SELECT result_json FROM run_results WHERE run_id = ?").get(runId) as { result_json: string } | undefined;
+    return row && parseJson(row.result_json);
+  }
+}
+
+export class WorkerIdentityRepository {
+  constructor(private readonly context: Context) {}
+  get(): WorkerIdentityRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM worker_identity WHERE singleton = 1").get() as WorkerIdentityRow | undefined;
+    return row && { bootId: row.boot_id, pid: row.pid, processStart: row.process_start, status: row.status, startedAt: row.started_at, heartbeatAt: row.heartbeat_at };
+  }
+  save(record: WorkerIdentityRecord): WorkerIdentityRecord {
+    assertId(record.bootId, "Worker boot id");
+    if (!Number.isSafeInteger(record.pid) || record.pid < 1 || !record.processStart || record.processStart.length > 128) throw new StorageError("invalid_input", "Worker process identity is invalid");
+    assertTimestamp(record.startedAt); assertTimestamp(record.heartbeatAt);
+    this.context.atomic((db) => db.prepare(`INSERT INTO worker_identity(singleton, boot_id, pid, process_start, status, started_at, heartbeat_at)
+      VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(singleton) DO UPDATE SET boot_id = excluded.boot_id, pid = excluded.pid,
+      process_start = excluded.process_start, status = excluded.status, started_at = excluded.started_at, heartbeat_at = excluded.heartbeat_at`)
+      .run(record.bootId, record.pid, record.processStart, record.status, record.startedAt, record.heartbeatAt));
+    return record;
+  }
+  setStatus(bootId: string, status: WorkerIdentityRecord["status"], heartbeatAt = new Date().toISOString()): void {
+    assertId(bootId, "Worker boot id"); assertTimestamp(heartbeatAt);
+    this.context.atomic((db) => {
+      const result = db.prepare("UPDATE worker_identity SET status = ?, heartbeat_at = ? WHERE singleton = 1 AND boot_id = ?").run(status, heartbeatAt, bootId);
+      if (result.changes !== 1) throw new StorageError("conflict", "Worker identity changed before status update");
+    });
+  }
+  clear(bootId: string): void {
+    assertId(bootId, "Worker boot id");
+    this.context.atomic((db) => db.prepare("DELETE FROM worker_identity WHERE singleton = 1 AND boot_id = ?").run(bootId));
   }
 }
 
@@ -525,6 +738,11 @@ export class RunEventRepository {
   latestSequence(runId: string): number {
     return numberFrom(this.context.db.prepare("SELECT COALESCE(MAX(sequence), 0) AS latest FROM run_events WHERE run_id = ?").get(runId), "latest");
   }
+  sequenceById(runId: string, eventId: string): number | undefined {
+    assertId(runId, "Run id"); assertId(eventId, "Event id");
+    const row = this.context.db.prepare("SELECT sequence FROM run_events WHERE run_id = ? AND event_id = ?").get(runId, eventId) as { sequence: number } | undefined;
+    return row?.sequence;
+  }
 }
 
 export class CheckpointRepository {
@@ -610,7 +828,7 @@ export class ActiveSlotRepository {
     const row = this.context.db.prepare("SELECT active_run_id, claim_token, generation, worker_boot_id, heartbeat_at, lease_expires_at FROM global_slot WHERE singleton = 1").get() as SlotRow;
     return mapSlot(row);
   }
-  claim(input: { runId: string; claimToken: string; workerBootId?: string | null; heartbeatAt?: string; leaseExpiresAt?: string | null }): ActiveSlot {
+  claim(input: { runId: string; claimToken: string; workerBootId?: string | null; heartbeatAt?: string; leaseExpiresAt?: string | null; resume?: boolean }): ActiveSlot {
     const heartbeatAt = input.heartbeatAt ?? new Date().toISOString();
     assertId(input.runId, "Run id"); assertId(input.claimToken, "Claim token"); assertTimestamp(heartbeatAt);
     if (input.workerBootId) assertId(input.workerBootId, "Worker boot id");
@@ -620,7 +838,7 @@ export class ActiveSlotRepository {
       if (current.active_run_id !== null) throw new StorageError("active_task", "Another run already holds the global active slot");
       const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(input.runId) as { status: string } | undefined;
       if (!run) throw new StorageError("not_found", "Run was not found");
-      if (run.status !== "accepted") throw new StorageError("conflict", "Only an accepted run can claim the active slot");
+      if (run.status !== "accepted" && !(input.resume && run.status === "interrupted")) throw new StorageError("conflict", "Only an accepted or explicitly resumed interrupted run can claim the active slot");
       const generation = current.generation + 1;
       db.prepare(`UPDATE global_slot SET active_run_id = ?, claim_token = ?, generation = ?, worker_boot_id = ?, heartbeat_at = ?, lease_expires_at = ?
         WHERE singleton = 1 AND active_run_id IS NULL`)
@@ -673,6 +891,7 @@ type CheckpointRow = { id: string; run_id: string; attempt_id: string; phase_id:
 type UsageRow = { attempt_id: string; model_id: string | null; model_calls: number; tool_calls: number; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; total_tokens: number; estimated_cost_usd: number | null; cost_status: UsageRecord["costStatus"]; pricing_version: string | null; updated_at: string };
 type IdempotencyRow = { request_hash: string; resource_kind: "run" | "conversation"; resource_id: string };
 type SlotRow = { active_run_id: string | null; claim_token: string | null; generation: number; worker_boot_id: string | null; heartbeat_at: string | null; lease_expires_at: string | null };
+type WorkerIdentityRow = { boot_id: string; pid: number; process_start: string; status: WorkerIdentityRecord["status"]; started_at: string; heartbeat_at: string };
 
 function mapProject(row: ProjectRow): ProjectRecord {
   return { id: row.id, displayName: row.display_name, canonicalRoot: row.canonical_root, directoryIdentity: row.directory_identity,

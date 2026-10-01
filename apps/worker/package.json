@@ -1,0 +1,12 @@
+{
+  "name": "@pi-workbench/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node --import tsx/esm src/main.ts", "check": "tsc --noEmit", "test": "tsx --test tests/*.test.ts" },
+  "dependencies": {
+    "@pi-workbench/agent-runtime": "0.1.0",
+    "@pi-workbench/protocol": "0.1.0",
+    "@pi-workbench/workbench": "0.1.0"
+  }
+}

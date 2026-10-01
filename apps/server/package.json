@@ -15,7 +15,9 @@
     "@pi-workbench/agent-runtime": "0.1.0",
     "@pi-workbench/protocol": "0.1.0",
     "@pi-workbench/reporting": "0.1.0",
+    "@pi-workbench/storage": "0.1.0",
     "@pi-workbench/tools": "0.1.0",
+    "@pi-workbench/workbench": "0.1.0",
     "fastify": "5.12.5"
   }
 }

@@ -22,8 +22,12 @@ export class StorageMigrationError extends Error {
 }
 
 export function loadCoreMigrations(): readonly StorageMigration[] {
-  const sql = readFileSync(new URL("./migrations/001_core.sql", import.meta.url), "utf8");
-  return [{ version: 1, name: "core", sql }];
+  const core = readFileSync(new URL("./migrations/001_core.sql", import.meta.url), "utf8");
+  const worker = readFileSync(new URL("./migrations/002_worker_recovery.sql", import.meta.url), "utf8");
+  return [
+    { version: 1, name: "core", sql: core },
+    { version: 2, name: "worker_recovery", sql: worker },
+  ];
 }
 
 export function migrationChecksum(sql: string): string {

@@ -43,6 +43,7 @@ export const ConversationSchema = object({
 export const WorkbenchRunStatusSchema = Type.Union([
   Type.Literal("queued"), Type.Literal("running"), Type.Literal("cancelling"),
   Type.Literal("completed"), Type.Literal("failed"), Type.Literal("cancelled"),
+  Type.Literal("interrupted"),
 ]);
 export const WorkbenchArtifactSchema = object({
   kind: Type.Union([Type.Literal("report.json"), Type.Literal("report.md"), Type.Literal("manifest.json"), Type.Literal("events.jsonl")]),
