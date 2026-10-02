@@ -38,7 +38,7 @@ async function execute(command: Extract<WorkerCommand, { type: "execute" }>): Pr
         fixtureRoot: process.env.PI_WORKBENCH_FIXTURE_ROOT ?? "",
         ...(process.env.DEEPSEEK_API_KEY ? { apiKey: process.env.DEEPSEEK_API_KEY } : {}),
         ...(process.env.GITHUB_TOKEN ? { githubToken: process.env.GITHUB_TOKEN } : {}),
-        ...(command.snapshot ? { snapshot: command.snapshot } : {}), signal: controller.signal, emit,
+        ...(command.snapshot ? { snapshot: command.snapshot } : {}), ...(command.project ? { project: command.project } : {}), signal: controller.signal, emit,
         saveSnapshot: async (snapshot) => { saveSnapshot(snapshot); },
       });
       const pending = queued.splice(0);

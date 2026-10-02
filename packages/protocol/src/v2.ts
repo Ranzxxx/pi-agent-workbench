@@ -9,6 +9,9 @@ const timestamp = Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\
 const sha256 = Type.String({ pattern: "^[a-f0-9]{64}$" });
 const nonnegative = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
 const sequence = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
+const relativeFilePath = Type.String({ minLength: 1, maxLength: 1024,
+  pattern: "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:]).+$",
+});
 
 /** API, event and persistence payloads have independent versions. This is not a report schema version. */
 export const V2RunStatusSchema = Type.Union([
@@ -98,6 +101,53 @@ export const V2ProjectRulesSchema = object({
   acceptedAt: timestamp, revokedAt: Type.Optional(Type.Union([timestamp, Type.Null()])),
 });
 export const V2ProjectRulesAcceptRequestSchema = object({ schemaVersion: Type.Literal(2), previewToken: id });
+export const V2FileOperationSchema = object({
+  schemaVersion: Type.Literal(2), operationId: id, changesetId: id, sequence,
+  path: relativeFilePath, kind: Type.Union([Type.Literal("create"), Type.Literal("replace"), Type.Literal("restore"), Type.Literal("remove_created")]),
+  status: Type.Union([Type.Literal("prepared"), Type.Literal("applied"), Type.Literal("not_applied"), Type.Literal("conflict"), Type.Literal("uncertain"), Type.Literal("undone")]),
+  preHash: Type.Optional(Type.Union([sha256, Type.Null()])), postHash: Type.Optional(Type.Union([sha256, Type.Null()])),
+  errorCode: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 128 }), Type.Null()])),
+});
+export const V2FileDiffSchema = object({
+  path: relativeFilePath, status: Type.String({ minLength: 1, maxLength: 32 }),
+  beforeText: Type.Union([Type.String({ maxLength: 65536 }), Type.Null()]),
+  afterText: Type.Union([Type.String({ maxLength: 65536 }), Type.Null()]),
+  diffText: Type.String({ maxLength: 131072 }), truncated: Type.Boolean(),
+});
+export const V2ChangesetSchema = object({
+  schemaVersion: Type.Literal(2), changesetId: id, conversationId: id, projectId: id,
+  runId: Type.Optional(Type.Union([id, Type.Null()])), undoOfChangesetId: Type.Optional(Type.Union([id, Type.Null()])),
+  status: Type.Union([Type.Literal("open"), Type.Literal("applied"), Type.Literal("partial"), Type.Literal("conflict"), Type.Literal("undone")]),
+  createdAt: timestamp, updatedAt: timestamp,
+  operations: Type.Array(V2FileOperationSchema, { maxItems: 1000 }), diffs: Type.Array(V2FileDiffSchema, { maxItems: 200 }),
+});
+export const V2ChangesetSummarySchema = object({
+  schemaVersion: Type.Literal(2), changesetId: id, conversationId: id, projectId: id,
+  runId: Type.Optional(Type.Union([id, Type.Null()])), undoOfChangesetId: Type.Optional(Type.Union([id, Type.Null()])),
+  status: Type.Union([Type.Literal("open"), Type.Literal("applied"), Type.Literal("partial"), Type.Literal("conflict"), Type.Literal("undone")]),
+  operationCount: nonnegative, createdAt: timestamp, updatedAt: timestamp,
+});
+export const V2ChangesetUndoRequestSchema = object({ schemaVersion: Type.Literal(2), confirm: Type.Literal(true) });
+export const V2ChangesetUndoResultSchema = object({
+  schemaVersion: Type.Literal(2), changesetId: id, status: Type.Union([Type.Literal("undone"), Type.Literal("partial"), Type.Literal("conflict")]),
+  undonePaths: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 200 }),
+  conflictPaths: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 200 }),
+});
+export const V2CleanupPreviewSchema = object({
+  schemaVersion: Type.Literal(2), changesetIds: Type.Array(id, { maxItems: 100 }),
+  changesetCount: nonnegative, backupObjectCount: nonnegative, backupBytes: nonnegative,
+  losesUndoHistory: Type.Boolean(), note: Type.String({ minLength: 1, maxLength: 512 }),
+});
+export const V2CleanupRequestSchema = object({
+  schemaVersion: Type.Literal(2), confirm: Type.Literal(true), changesetIds: Type.Array(id, { minItems: 1, maxItems: 100 }),
+});
+export const V2CleanupResultSchema = object({
+  schemaVersion: Type.Literal(2), deletedChangesetCount: nonnegative, queuedBackupObjects: nonnegative,
+});
+export const V2AttachmentResultSchema = object({
+  schemaVersion: Type.Literal(2), resultId: id, conversationId: id, sourceAttachmentId: Type.Optional(Type.Union([id, Type.Null()])),
+  fileName: Type.String({ minLength: 1, maxLength: 512 }), byteSize: nonnegative, mediaType: Type.Literal("text/plain; charset=utf-8"), createdAt: timestamp,
+});
 
 export const V2ErrorSchema = object({
   schemaVersion: Type.Literal(2),
@@ -140,12 +190,26 @@ export const V2RunEventSchema = Type.Union([
   object({ ...eventEnvelope, type: Type.Literal("tool.started"), data: object({ toolCallId: id, toolName: id, argumentsSummary: Type.Literal("omitted") }) }),
   object({ ...eventEnvelope, type: Type.Literal("tool.finished"), data: object({ toolCallId: id, toolName: id, isError: Type.Boolean() }) }),
   object({ ...eventEnvelope, type: Type.Literal("checkpoint.saved"), data: object({ checkpointId: id, phase: smallText }) }),
+  object({ ...eventEnvelope, type: Type.Literal("file_change_prepared"), data: object({
+    changesetId: id, operationId: id, path: relativeFilePath,
+    kind: Type.Union([Type.Literal("create"), Type.Literal("replace"), Type.Literal("restore"), Type.Literal("remove_created")]),
+    preHash: Type.Union([sha256, Type.Null()]), postHash: Type.Union([sha256, Type.Null()]),
+  }) }),
+  object({ ...eventEnvelope, type: Type.Literal("file_change_applied"), data: object({
+    changesetId: id, operationId: id, path: relativeFilePath, postHash: Type.Union([sha256, Type.Null()]),
+  }) }),
+  object({ ...eventEnvelope, type: Type.Literal("file_change_conflict"), data: object({
+    changesetId: id, operationId: id, path: relativeFilePath, reason: smallText,
+  }) }),
   object({ ...eventEnvelope, type: Type.Literal("usage.updated"), data: usage }),
   object({ ...eventEnvelope, type: Type.Literal("run.cancelling"), data: object({ reason: Type.Union([Type.Literal("user"), Type.Literal("shutdown"), Type.Literal("timeout")]) }) }),
   object({ ...eventEnvelope, type: Type.Literal("run.completed"), data: object({ resultRef: Type.Optional(id) }) }),
   object({ ...eventEnvelope, type: Type.Literal("run.failed"), data: object({ error: V2ErrorSchema }) }),
   object({ ...eventEnvelope, type: Type.Literal("run.cancelled"), data: object({ reason: Type.Union([Type.Literal("user"), Type.Literal("shutdown"), Type.Literal("timeout")]) }) }),
   object({ ...eventEnvelope, type: Type.Literal("run.interrupted"), data: object({ reason: Type.Union([Type.Literal("process_exit"), Type.Literal("state_uncertain")]) }) }),
+  object({ ...eventEnvelope, type: Type.Literal("changeset_undone"), data: object({
+    changesetId: id, status: Type.Union([Type.Literal("undone"), Type.Literal("partial"), Type.Literal("conflict")]),
+  }) }),
 ]);
 
 export const V2EventCursorSchema = object({
@@ -184,6 +248,16 @@ export type V2AttachmentImportRequest = Static<typeof V2AttachmentImportRequestS
 export type V2ImportResult = Static<typeof V2ImportResultSchema>;
 export type V2ProjectRules = Static<typeof V2ProjectRulesSchema>;
 export type V2ProjectRulesAcceptRequest = Static<typeof V2ProjectRulesAcceptRequestSchema>;
+export type V2FileOperation = Static<typeof V2FileOperationSchema>;
+export type V2FileDiff = Static<typeof V2FileDiffSchema>;
+export type V2Changeset = Static<typeof V2ChangesetSchema>;
+export type V2ChangesetSummary = Static<typeof V2ChangesetSummarySchema>;
+export type V2ChangesetUndoRequest = Static<typeof V2ChangesetUndoRequestSchema>;
+export type V2ChangesetUndoResult = Static<typeof V2ChangesetUndoResultSchema>;
+export type V2CleanupPreview = Static<typeof V2CleanupPreviewSchema>;
+export type V2CleanupRequest = Static<typeof V2CleanupRequestSchema>;
+export type V2CleanupResult = Static<typeof V2CleanupResultSchema>;
+export type V2AttachmentResult = Static<typeof V2AttachmentResultSchema>;
 export type V2RunAttempt = Static<typeof V2RunAttemptSchema>;
 export type V2RunEvent = Static<typeof V2RunEventSchema>;
 export type V2EventCursor = Static<typeof V2EventCursorSchema>;

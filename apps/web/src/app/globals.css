@@ -111,6 +111,22 @@ kbd { display: inline-block; padding: 1px 5px; border: 1px solid #464946; border
 .thinking span:nth-child(2) { animation-delay: .15s; }.thinking span:nth-child(3) { animation-delay: .3s; }
 @keyframes pulse { 0%, 75%, 100% { opacity: .25; transform: translateY(0); } 35% { opacity: .9; transform: translateY(-3px); } }
 .run-card { margin: 6px 0 12px 47px; padding: 13px 15px; border: 1px solid #363a36; border-radius: var(--radius-md); background: #242624; }
+.file-history { display: grid; gap: 10px; margin: 4px 0 16px 47px; padding: 14px; border: 1px solid #363a36; border-radius: var(--radius-md); background: #222522; }
+.file-history-head, .file-diff-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.file-history-head h3 { margin: 2px 0 0; color: #d2d7d2; font-size: var(--font-md); font-weight: 560; }
+.file-history-list { display: grid; gap: 6px; }
+.file-history-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 9px; border: 1px solid #353a35; border-radius: 8px; background: #262926; }
+.file-history-open { display: flex; min-width: 0; flex: 1; flex-wrap: wrap; align-items: baseline; gap: 9px; padding: 0; border: 0; background: transparent; color: #cbd3cb; text-align: left; }
+.file-history-open span { color: #858e85; font-size: var(--font-xs); }
+.file-history-item > .quiet-button { flex: 0 0 auto; border-color: #414741; }
+.file-history-item > .quiet-button:disabled { opacity: .45; }
+.file-diff-view { display: grid; gap: 8px; padding-top: 8px; border-top: 1px solid #353a35; }
+.file-diff-head { color: #c7d1c7; font-size: var(--font-sm); }
+.file-diff { overflow: hidden; border: 1px solid #333833; border-radius: 8px; }
+.file-diff-path { display: flex; justify-content: space-between; gap: 10px; padding: 7px 9px; background: #292d29; color: #bdc9bd; font: var(--font-xs) ui-monospace, SFMono-Regular, Consolas, monospace; }
+.file-diff-path span { flex: 0 0 auto; color: #8b958b; font-family: inherit; }
+.file-diff pre { max-height: 260px; overflow: auto; margin: 0; padding: 9px; background: #1d1f1d; color: #b8c4b8; font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre; }
+.file-history .empty-sidebar { margin: 0; }
 .run-history { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 8px 0 8px 47px; color: var(--muted); font-size: var(--font-xs); }
 .run-history-item { max-width: 100%; padding: 5px 9px; border: 1px solid var(--border); border-radius: 999px; background: transparent; color: var(--text-secondary); font-size: var(--font-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-history-item:hover { border-color: #576157; color: var(--text); }

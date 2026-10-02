@@ -22,3 +22,16 @@ export {
   type SnapshotLimits,
   type SnapshotOptions,
 } from "./public-github-snapshot.js";
+export {
+  createProjectFileAccess,
+  ProjectFileAccess,
+  PROJECT_FILE_LIMITS,
+  type ProjectFileChangeKind,
+  type ProjectFileContents,
+  type ProjectFileEntry,
+  type ProjectFileError,
+  type ProjectFileJournal,
+  type ProjectFileOperationState,
+  type ProjectFileSearchMatch,
+  type ProjectFileVersion,
+} from "./project-files.js";

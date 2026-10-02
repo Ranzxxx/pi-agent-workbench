@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CapabilityInfo, Conversation, ConversationSummary, WorkbenchEvent, WorkbenchRun, V2Conversation, V2ConversationSummary, V2Run } from "@pi-workbench/protocol";
+import type { CapabilityInfo, Conversation, ConversationSummary, WorkbenchEvent, WorkbenchRun, V2AttachmentResult, V2Changeset, V2ChangesetSummary, V2Conversation, V2ConversationSummary, V2Run, V2CleanupPreview, V2ChangesetUndoResult } from "@pi-workbench/protocol";
 import { RunArtifacts } from "./run-artifacts";
 import { retryStartupRead } from "./startup";
 
@@ -18,6 +18,7 @@ type LocalProject = { schemaVersion: 2; projectId: string; displayName: string; 
 type PickerDirectory = { schemaVersion: 2; directoryToken: string; parentToken?: string; displayPath: string; canSelectProject: boolean; truncated: boolean; entries: Array<{ name: string; kind: "directory" | "file" | "excluded"; token?: string; byteSize?: number; reason?: string }> };
 type PickerRoot = { label: string; token: string };
 type LocalAttachment = { schemaVersion: 2; attachmentId: string; conversationId: string; fileName: string; relativePath: string; byteSize: number; mediaType: string; createdAt: string };
+type LocalAttachmentResult = V2AttachmentResult;
 type ProjectRuleView = { schemaVersion: 2; projectId: string; sourcePath: string; sourceSha256: string; sourceVersion: string; content: string; acceptedAt: string; revokedAt?: string | null };
 let pickerCsrfToken: string | null = null;
 let pickerSessionRequest: Promise<string> | null = null;
@@ -152,6 +153,9 @@ export default function HomePage() {
   const [projects, setProjects] = useState<LocalProject[]>([]);
   const [currentProject, setCurrentProject] = useState<LocalProject | null>(null);
   const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
+  const [attachmentResults, setAttachmentResults] = useState<LocalAttachmentResult[]>([]);
+  const [fileChangesets, setFileChangesets] = useState<V2ChangesetSummary[]>([]);
+  const [changesetDetail, setChangesetDetail] = useState<V2Changeset | null>(null);
   const [showProjectPicker, setShowProjectPicker] = useState(false);
   const [pickerMode, setPickerMode] = useState<"project" | "attachment" | "rules">("project");
   const [pickerRoots, setPickerRoots] = useState<PickerRoot[]>([]);
@@ -180,6 +184,17 @@ export default function HomePage() {
     const result = await api<{ conversations: UiConversationSummary[] }>("/conversations");
     setConversations(result.conversations);
   }, []);
+  const refreshConversationFiles = useCallback(async (id: string, token: number) => {
+    const [attachmentData, resultData, changesetData] = await Promise.all([
+      pickerApi<{ attachments: LocalAttachment[] }>(`/conversations/${encodeURIComponent(id)}/attachments`),
+      pickerApi<{ results: LocalAttachmentResult[] }>(`/conversations/${encodeURIComponent(id)}/attachment-results`),
+      pickerApi<{ changesets: V2ChangesetSummary[] }>(`/conversations/${encodeURIComponent(id)}/changesets`),
+    ]);
+    if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== id) return;
+    setAttachments(attachmentData.attachments);
+    setAttachmentResults(resultData.results);
+    setFileChangesets(changesetData.changesets);
+  }, []);
   const loadConversation = useCallback(async (id: string, signal?: AbortSignal) => {
     const token = ++navigationTokenRef.current;
     eventSourceRef.current?.close();
@@ -188,6 +203,7 @@ export default function HomePage() {
     selectedConversationIdRef.current = id;
     setIsNewConversationDraft(false);
     setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
+    setAttachments([]); setAttachmentResults([]); setFileChangesets([]); setChangesetDetail(null);
     const [loaded, runResult] = await Promise.all([
       api<UiConversation>(`/conversations/${encodeURIComponent(id)}`, { signal }),
       api<{ runs: WorkbenchRun[] }>(`/conversations/${encodeURIComponent(id)}/runs`, { signal }),
@@ -196,6 +212,7 @@ export default function HomePage() {
     localStorage.setItem("pi-workbench-conversation", id);
     setConversation(loaded);
     setAttachments([]);
+    setAttachmentResults([]); setFileChangesets([]); setChangesetDetail(null);
     setCurrentProject(null);
     setRuns(runResult.runs);
     const latestRun = runResult.runs[0];
@@ -205,9 +222,9 @@ export default function HomePage() {
       delete lastEventIdByRunRef.current[latestRun.runId];
       connectEvents(latestRun.runId);
     }
-    void pickerApi<{ attachments: LocalAttachment[] }>(`/conversations/${encodeURIComponent(id)}/attachments`)
-      .then((result) => { if (token === navigationTokenRef.current && selectedConversationIdRef.current === id) setAttachments(result.attachments); })
-      .catch(() => { if (token === navigationTokenRef.current && selectedConversationIdRef.current === id) setNotice("附件列表暂时无法读取；对话本身仍可使用。"); });
+    void refreshConversationFiles(id, token).catch(() => {
+      if (token === navigationTokenRef.current && selectedConversationIdRef.current === id) setNotice("附件或项目修改记录暂时无法读取。");
+    });
     void pickerApi<{ projects: LocalProject[] }>("/projects")
       .then((result) => {
         if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== id) return;
@@ -215,7 +232,7 @@ export default function HomePage() {
         setCurrentProject(result.projects.find((project) => project.projectId === loaded.projectId) ?? null);
       })
       .catch(() => { if (token === navigationTokenRef.current && selectedConversationIdRef.current === id) setNotice("项目状态暂时无法读取；对话本身仍可使用。"); });
-  }, []);
+  }, [refreshConversationFiles]);
   const connectEvents = useCallback((runId: string, afterEventId?: string) => {
     eventSourceRef.current?.close();
     activeRunIdRef.current = runId;
@@ -246,6 +263,7 @@ export default function HomePage() {
             else {
               eventSourceRef.current = null;
               void refreshSidebar();
+              if (conversationId) void refreshConversationFiles(conversationId, token).catch(() => undefined);
               if (conversationId) void api<UiConversation>(`/conversations/${encodeURIComponent(conversationId)}`).then((loaded) => {
                 if (selectedConversationIdRef.current === conversationId && navigationTokenRef.current === token) setConversation(loaded);
               }).catch(() => setNotice("对话刷新失败，请重新选择该对话。"));
@@ -277,6 +295,7 @@ export default function HomePage() {
             setRuns((current) => current.map((item) => item.runId === runId ? snapshot : item));
             eventSourceRef.current = null;
             void refreshSidebar();
+            if (conversationId) void refreshConversationFiles(conversationId, token).catch(() => undefined);
             if (conversationId) void api<UiConversation>(`/conversations/${encodeURIComponent(conversationId)}`).then((loaded) => {
               if (selectedConversationIdRef.current === conversationId && navigationTokenRef.current === token && activeRunIdRef.current === runId) setConversation(loaded);
             }).catch(() => { if (selectedConversationIdRef.current === conversationId) setNotice("对话刷新失败，请重新选择该对话。"); });
@@ -304,7 +323,7 @@ export default function HomePage() {
         setNotice("");
       } catch { setNotice("收到无法识别的事件；正在保留当前对话状态。"); }
     });
-  }, [refreshSidebar]);
+  }, [refreshSidebar, refreshConversationFiles]);
 
   useEffect(() => {
     let ignore = false;
@@ -345,18 +364,34 @@ export default function HomePage() {
     activeRunIdRef.current = null;
     selectedConversationIdRef.current = null;
     setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
-    setAttachments([]); setCurrentProject(null);
+    setAttachments([]); setAttachmentResults([]); setFileChangesets([]); setChangesetDetail(null); setCurrentProject(null);
     setIsNewConversationDraft(true);
     setText(""); setSelectedCapability(null); setCapabilityValues({}); setPickerQuery(""); setShowPicker(false); setNotice("");
     localStorage.removeItem("pi-workbench-conversation");
     textareaRef.current?.focus();
   }
   async function deleteConversation(id: string) {
-    const accepted = window.confirm("永久删除这条对话及其消息、会话快照、运行记录、事件和用量？此操作无法撤销。项目及项目目录中的文件不会被删除或自动回滚。若对话仍有活动任务，服务端会拒绝删除。\n\n确定永久删除？");
+    let changesets: V2ChangesetSummary[] = [];
+    try {
+      changesets = id === selectedConversationIdRef.current ? fileChangesets
+        : (await pickerApi<{ changesets: V2ChangesetSummary[] }>(`/conversations/${encodeURIComponent(id)}/changesets`)).changesets;
+    } catch { setNotice("无法读取该对话的文件修改记录，因此没有删除。"); return; }
+    const applied = changesets.filter((item) => item.status === "applied" || item.status === "partial" || item.status === "conflict");
+    let changedPaths: string[] = [];
+    if (applied.length) {
+      try {
+        const details = await Promise.all(applied.map((item) => pickerApi<V2Changeset>(`/conversations/${encodeURIComponent(id)}/changesets/${encodeURIComponent(item.changesetId)}`)));
+        changedPaths = [...new Set(details.flatMap((detail) => detail.diffs.map((diff) => diff.path)))].sort();
+      } catch { setNotice("无法读取将失去撤销能力的文件列表，因此没有删除。"); return; }
+    }
+    const historyText = applied.length
+      ? `\n该对话有 ${applied.length} 组项目文件修改记录，涉及：${changedPaths.slice(0, 20).join("、") || "文件差异记录"}${changedPaths.length > 20 ? ` 等 ${changedPaths.length} 个文件` : ""}。删除后不会回滚项目文件，但会永久失去工作台内对应的撤销记录。`
+      : "";
+    const accepted = window.confirm(`永久删除这条对话及其消息、会话快照、运行记录、事件、附件和用量？此操作无法撤销。${historyText}\n项目目录中的当前文件不会被删除或自动回滚。若对话仍有活动任务，服务端会拒绝删除。\n\n确定永久删除？`);
     if (!accepted) return;
     const wasSelected = selectedConversationIdRef.current === id;
     try {
-      await api<{ deleted: boolean }>(`/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
+      await pickerApi<{ deleted: boolean }>(`/conversations/${encodeURIComponent(id)}`, { method: "DELETE", body: "{}" });
       const remaining = conversations.filter((item) => item.conversationId !== id);
       setConversations(remaining);
       if (wasSelected) {
@@ -367,7 +402,7 @@ export default function HomePage() {
           eventSourceRef.current?.close(); eventSourceRef.current = null;
           activeRunIdRef.current = null; selectedConversationIdRef.current = null;
           localStorage.removeItem("pi-workbench-conversation");
-          setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply(""); setAttachments([]); setCurrentProject(null);
+          setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply(""); setAttachments([]); setAttachmentResults([]); setFileChangesets([]); setChangesetDetail(null); setCurrentProject(null);
           setText(""); clearCapability();
           setIsNewConversationDraft(true);
         }
@@ -376,6 +411,49 @@ export default function HomePage() {
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "无法删除对话；活动运行可能仍在执行。");
     }
+  }
+  async function openChangeset(changesetId: string) {
+    const conversationId = selectedConversationIdRef.current;
+    const token = navigationTokenRef.current;
+    if (!conversationId) return;
+    try {
+      const detail = await pickerApi<V2Changeset>(`/conversations/${encodeURIComponent(conversationId)}/changesets/${encodeURIComponent(changesetId)}`);
+      if (token === navigationTokenRef.current && selectedConversationIdRef.current === conversationId) setChangesetDetail(detail);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "无法读取文件差异。"); }
+  }
+  async function undoChangeset(changeset: V2ChangesetSummary) {
+    if (busy || !conversation) return;
+    const accepted = window.confirm(`确认撤销此请求对项目文件的修改？\n工作台会先核对文件版本；文件已被外部修改时会保留现状并报告冲突。\n\n${changeset.operationCount} 条操作记录`);
+    if (!accepted) return;
+    const conversationId = conversation.conversationId;
+    const token = navigationTokenRef.current;
+    try {
+      const result = await pickerApi<V2ChangesetUndoResult>(`/conversations/${encodeURIComponent(conversationId)}/changesets/${encodeURIComponent(changeset.changesetId)}/undo`, {
+        method: "POST", body: JSON.stringify({ schemaVersion: 2, confirm: true }),
+      });
+      setNotice(!result.undonePaths.length && !result.conflictPaths.length
+        ? "没有需要撤销的文件修改，项目文件未更改。"
+        : result.conflictPaths.length ? `已撤销 ${result.undonePaths.length} 个文件；${result.conflictPaths.length} 个文件因版本变化保留现状。`
+          : `已撤销 ${result.undonePaths.length} 个文件修改。`);
+      await refreshConversationFiles(conversationId, token);
+      if (changesetDetail?.changesetId === changeset.changesetId) await openChangeset(changeset.changesetId);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "撤销文件修改失败。"); }
+  }
+  async function cleanupFileHistory() {
+    const conversationId = conversation?.conversationId;
+    if (!conversationId || busy) return;
+    try {
+      const preview = await pickerApi<V2CleanupPreview>(`/conversations/${encodeURIComponent(conversationId)}/file-cleanup-preview`);
+      if (!preview.changesetIds.length) { setNotice("当前对话没有可清理的文件修改记录。"); return; }
+      const accepted = window.confirm(`将清除 ${preview.changesetCount} 组文件差异和撤销记录，预计涉及 ${preview.backupObjectCount} 个备份对象（${formatBytes(preview.backupBytes)}）。\n\n${preview.note}\n\n确认清理？`);
+      if (!accepted) return;
+      const result = await pickerApi<{ deletedChangesetCount: number; queuedBackupObjects: number }>(`/conversations/${encodeURIComponent(conversationId)}/file-cleanup`, {
+        method: "POST", body: JSON.stringify({ schemaVersion: 2, confirm: true, changesetIds: preview.changesetIds }),
+      });
+      setChangesetDetail(null);
+      setNotice(`已清理 ${result.deletedChangesetCount} 组文件修改历史。`);
+      await refreshConversationFiles(conversationId, navigationTokenRef.current);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "清理文件修改历史失败。"); }
   }
   function onComposerChange(value: string) {
     setText(value);
@@ -425,7 +503,7 @@ export default function HomePage() {
       if (!conversationId) {
         newlyCreatedConversation = await api<UiConversation>("/conversations", { method: "POST", body: "{}" });
         if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== null) {
-          await api(`/conversations/${encodeURIComponent(newlyCreatedConversation.conversationId)}`, { method: "DELETE" }).catch(() => undefined);
+          await pickerApi(`/conversations/${encodeURIComponent(newlyCreatedConversation.conversationId)}`, { method: "DELETE", body: "{}" }).catch(() => undefined);
           return;
         }
         conversationId = newlyCreatedConversation.conversationId;
@@ -463,7 +541,7 @@ export default function HomePage() {
       if (newlyCreatedConversation && !runAccepted) {
         let rolledBack = false;
         try {
-          await api(`/conversations/${encodeURIComponent(newlyCreatedConversation.conversationId)}`, { method: "DELETE" });
+          await pickerApi(`/conversations/${encodeURIComponent(newlyCreatedConversation.conversationId)}`, { method: "DELETE", body: "{}" });
           rolledBack = true;
         } catch { /* Keep the conversation if the server may already have accepted the run. */ }
         if (rolledBack) {
@@ -579,7 +657,7 @@ export default function HomePage() {
         total_size_limit: "超过 20 MiB 总量限制", file_count_limit: "超过 100 个文件限制", scan_limit: "目录项目过多，扫描已停止",
       };
       if (createdConversation && result.attachments.length === 0) {
-        await api(`/conversations/${encodeURIComponent(createdConversation.conversationId)}`, { method: "DELETE" });
+        await pickerApi(`/conversations/${encodeURIComponent(createdConversation.conversationId)}`, { method: "DELETE", body: "{}" });
       } else if (createdConversation) {
         setShowProjectPicker(false); await refreshSidebar(); await loadConversation(createdConversation.conversationId);
       } else {
@@ -591,7 +669,7 @@ export default function HomePage() {
         : result.skipped.length ? "没有导入附件；请查看跳过原因。" : "没有可导入的文件。");
       if (result.skipped.length) setPickerSkipped(result.skipped.map((item) => ({ ...item, reason: reasonLabel[item.reason] ?? item.reason })));
     } catch (error) {
-      if (createdConversation) await api(`/conversations/${encodeURIComponent(createdConversation.conversationId)}`, { method: "DELETE" }).catch(() => undefined);
+      if (createdConversation) await pickerApi(`/conversations/${encodeURIComponent(createdConversation.conversationId)}`, { method: "DELETE", body: "{}" }).catch(() => undefined);
       setPickerNotice(error instanceof Error ? error.message : "附件导入失败，没有完成保存。");
     }
   }
@@ -632,6 +710,15 @@ export default function HomePage() {
       const file = await response.blob();
       const url = URL.createObjectURL(file); const anchor = document.createElement("a"); anchor.href = url; anchor.download = item.fileName; anchor.click(); URL.revokeObjectURL(url);
     } catch (error) { setNotice(error instanceof Error ? error.message : "无法读取附件。"); }
+  }
+  async function downloadAttachmentResult(item: LocalAttachmentResult) {
+    try {
+      if (!pickerCsrfToken) await openPickerSession();
+      const response = await fetch(`${API}/conversations/${encodeURIComponent(item.conversationId)}/attachment-results/${encodeURIComponent(item.resultId)}`, { headers: { "x-csrf-token": pickerCsrfToken! } });
+      if (!response.ok) throw new Error("结果文件不可用或本地会话已过期。");
+      const file = await response.blob();
+      const url = URL.createObjectURL(file); const anchor = document.createElement("a"); anchor.href = url; anchor.download = item.fileName; anchor.click(); URL.revokeObjectURL(url);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "无法下载结果文件。"); }
   }
   const filteredCapabilities = capabilities.filter((capability) => `${capability.name} ${capability.id}`.toLowerCase().includes(pickerQuery.toLowerCase()));
   const isWelcome = !conversation?.messages.length && !activeRun;
@@ -677,11 +764,30 @@ export default function HomePage() {
               {result?.status === "completed" && result.capabilityResult && <section className="report-card"><div className="report-heading"><div><span className="eyebrow">能力结果</span><h3>{result.capabilityResult.title}</h3></div></div><p>{result.capabilityResult.summary}</p><div className="claim-list">{result.capabilityResult.claims.map((claim) => <article className="claim" key={claim.id}><span className={`claim-kind ${claim.kind}`}>{claim.kind === "fact" ? "事实" : claim.kind === "inference" ? "推断" : "未知"}</span><p>{claim.text}</p>{claim.evidence.map((evidence, index) => <div className="evidence-ref" key={`${evidence.path}-${index}`}>{evidence.path}:{evidence.startLine}-{evidence.endLine}</div>)}</article>)}</div></section>}
               <RunArtifacts run={selectedRun} />
             </div>}
+            {fileChangesets.length > 0 && <section className="file-history" aria-label="项目文件修改记录">
+              <div className="file-history-head"><div><span className="eyebrow">项目文件</span><h3>修改记录与差异</h3></div><button className="quiet-button" onClick={() => void cleanupFileHistory()} disabled={busy}>清理历史</button></div>
+              <div className="file-history-list">{fileChangesets.map((item) => <article className="file-history-item" key={item.changesetId}>
+                <button className="file-history-open" onClick={() => void openChangeset(item.changesetId)} aria-expanded={changesetDetail?.changesetId === item.changesetId}>
+                  <strong>{item.status === "applied" ? "已应用" : item.status === "partial" ? "部分完成" : item.status === "conflict" ? "有冲突" : item.status === "undone" ? "已撤销" : item.status === "open" ? "记录未完成" : "状态待核对"}</strong>
+                  <span>{item.operationCount} 条操作 · {new Date(item.updatedAt).toLocaleString()}</span>
+                </button>
+                {item.status !== "undone" && item.status !== "open" && <button className="quiet-button" onClick={() => void undoChangeset(item)} disabled={busy}>撤销此请求</button>}
+              </article>)}</div>
+              {changesetDetail && <div className="file-diff-view">
+                <div className="file-diff-head"><strong>请求差异</strong><button className="icon-button" onClick={() => setChangesetDetail(null)} aria-label="关闭差异">×</button></div>
+                {changesetDetail.diffs.map((diff) => <article className="file-diff" key={diff.path}>
+                  <div className="file-diff-path">{diff.path} <span>{diff.status === "applied" ? "已应用" : diff.status === "undone" ? "已撤销" : diff.status === "conflict" ? "冲突" : diff.status === "uncertain" ? "待核对" : diff.status}</span></div>
+                  <pre>{diff.diffText}{diff.truncated ? "\n… 差异显示已截断" : ""}</pre>
+                </article>)}
+                {!changesetDetail.diffs.length && <p className="empty-sidebar">没有可显示的文件差异。</p>}
+              </div>}
+            </section>}
             <div ref={messagesEndRef} />
           </section>}
           <section className="composer-zone">
             {selectedCapability && <div className="capability-fields"><div className="capability-form-head"><div><span className="capability-kicker">已选择能力</span><strong>@{selectedCapability.name}</strong></div><button className="icon-button" aria-label="移除能力" onClick={clearCapability}><Icon name="close" /></button></div><div className="field-grid">{selectedCapability.inputs.map((field) => <label className="capability-input-field" key={field.id}><span>{field.label}{field.required ? "（必填）" : "（可选）"}</span>{field.control === "textarea" ? <textarea value={capabilityValues[field.id] ?? ""} maxLength={field.maxLength} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} rows={3} /> : <input value={capabilityValues[field.id] ?? ""} maxLength={field.maxLength} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} />}</label>)}</div>{selectedCapability.id === "public_repository_analysis" && mode === "fake" && <p className="offline-capability-note">离线演示只使用合成的 Harborlight 仓库，不会分析真实仓库；其他地址会被拒绝。真实分析需切换在线模式。</p>}</div>}
             {attachments.length > 0 && <div className="attachment-chips" aria-label="当前对话附件">{attachments.map((item) => <button key={item.attachmentId} title={`${item.relativePath} · ${item.byteSize} bytes`} onClick={() => void downloadAttachment(item)}><Icon name="paperclip" /><span>{item.fileName}</span><small>{formatBytes(item.byteSize)}</small></button>)}</div>}
+            {attachmentResults.length > 0 && <div className="attachment-chips result-chips" aria-label="可下载的结果文件">{attachmentResults.map((item) => <button key={item.resultId} title={`下载结果 · ${item.byteSize} bytes`} onClick={() => void downloadAttachmentResult(item)}><Icon name="paperclip" /><span>{item.fileName}</span><small>结果 · {formatBytes(item.byteSize)}</small></button>)}</div>}
             <div className="composer-wrap">
               {showPicker && <div className="capability-picker"><div className="picker-title">选择已注册能力</div>{filteredCapabilities.length ? filteredCapabilities.map((capability) => <button key={capability.id} className="picker-option" onMouseDown={(event) => event.preventDefault()} onClick={() => chooseCapability(capability)}><span className="picker-icon"><Icon name="spark" /></span><span><strong>@{capability.name}</strong><small>{capability.description}</small></span><kbd>↵</kbd></button>) : <div className="picker-empty">没有匹配的已注册能力</div>}</div>}
               <textarea ref={textareaRef} value={text} onChange={(event) => onComposerChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !showPicker) { event.preventDefault(); void submit(); } if (event.key === "Escape" && showPicker) setShowPicker(false); }} placeholder={!canCompose ? "请先新建对话" : selectedCapability ? "能力参数请填写在上方；普通提示可移除能力后单独发送" : "给 PI Workbench 一个任务；输入 @ 可显式调用已注册能力"} rows={2} aria-label="输入你的任务" disabled={!canCompose || selectedCapability !== null} />

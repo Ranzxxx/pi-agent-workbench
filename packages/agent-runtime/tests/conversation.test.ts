@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fauxAssistantMessage, fauxProvider, type Provider } from "@earendil-works/pi-ai";
-import { createConversationSession, InMemoryCredentialStore, type ConversationRuntimeOptions, type ConversationSessionSnapshot } from "../src/index.js";
+import { Type } from "typebox";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, type Provider } from "@earendil-works/pi-ai";
+import { createConversationSession, defineTool, InMemoryCredentialStore, type ConversationRuntimeOptions, type ConversationSessionSnapshot } from "../src/index.js";
 
 const budget = { timeoutMs: 2000, maxModelCalls: 4, maxToolCalls: 0, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 };
 
@@ -66,6 +67,33 @@ test("ordinary conversation has no configured tools and reports model failures s
       assert.equal(result.error.message.includes("private provider detail"), false);
     }
     assert.equal("tools" in conversation, false);
+  } finally { await conversation.dispose(); }
+});
+
+test("only explicitly injected tools run, consume budget, and report bounded lifecycle events", { timeout: 5000 }, async () => {
+  const faux = fauxProvider({ api: "conversation-tools-test", provider: "conversation-tools-test", models: [{ id: "test" }], tokenSize: { min: 8, max: 8 } });
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("read_fixture", { path: "safe.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("read complete"),
+  ]);
+  let called = false;
+  const tool = defineTool({ name: "read_fixture", label: "Read fixture", description: "Read the safe in-memory fixture.", parameters: Type.Object({ path: Type.String() }),
+    async execute(_id, args) { called = true; return { content: [{ type: "text", text: args.path }], details: {} }; },
+  });
+  const events: Array<{ phase: string; toolCallId: string; toolName: string; isError?: boolean }> = [];
+  const conversation = await createConversationSession({
+    cwd: process.cwd(), credentials: new InMemoryCredentialStore(), provider: faux.provider, model: faux.getModel(),
+    systemPrompt: "Use only the explicit read fixture tool.", tools: [tool],
+    budget: { ...budget, maxToolCalls: 1 },
+    pricing: { version: "test-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  });
+  try {
+    const result = await conversation.prompt("read the fixture", { onToolEvent: (event) => events.push(event) });
+    assert.equal(result.status, "completed");
+    if (result.status === "completed") assert.equal(result.usage.toolCalls, 1);
+    assert.equal(called, true);
+    assert.deepEqual(events.map((event) => event.phase), ["started", "finished"]);
+    assert.equal(events[0]?.toolCallId, events[1]?.toolCallId);
   } finally { await conversation.dispose(); }
 });
 

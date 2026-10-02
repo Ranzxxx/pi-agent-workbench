@@ -12,7 +12,7 @@
     "./worker-ipc": "./src/worker-ipc.ts",
     "./worker-client": "./src/worker-client.ts"
   },
-  "scripts": { "check": "tsc --noEmit" },
+  "scripts": { "check": "tsc --noEmit", "test": "tsx --test tests/*.test.ts" },
   "dependencies": {
     "@earendil-works/pi-ai": "0.86.1",
     "@pi-workbench/agent-runtime": "0.1.0",

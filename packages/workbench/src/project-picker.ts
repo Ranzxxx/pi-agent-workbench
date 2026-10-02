@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { mkdir, open, lstat, realpath, readdir, link, unlink, rm } from "node:fs/promises";
 import path from "node:path";
 import { StorageError, type AttachmentRecord, type ProjectRecord, type ProjectRulesRecord, type Storage } from "@pi-workbench/storage";
+import { readManagedObject } from "./managed-object-store.js";
 
 const SESSION_MS = 4 * 60 * 60 * 1000;
 const TOKEN_MS = 10 * 60 * 1000;
@@ -302,8 +303,9 @@ export class ProjectPickerService {
     for (const item of this.storage.garbage.list(250)) {
       try {
         if (!this.storage.garbage.claim(item)) continue;
-        const target = item.kind === "attachment_object" ? this.objectPath(item.objectRef) : path.join(this.dataDirectory, "runs", item.objectRef);
-        if (item.kind === "attachment_object") {
+        const target = item.kind === "attachment_object" ? this.objectPath(item.objectRef)
+          : item.kind === "file_backup_object" ? this.fileObjectPath(item.objectRef) : path.join(this.dataDirectory, "runs", item.objectRef);
+        if (item.kind === "attachment_object" || item.kind === "file_backup_object") {
           const parent = path.dirname(target);
           const parentInfo = await lstat(parent).catch(() => undefined);
           if (parentInfo && (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || await realpath(parent).catch(() => "") !== parent)) throw new Error("attachment object directory is unsafe");
@@ -321,6 +323,12 @@ export class ProjectPickerService {
             await unlink(target);
             const parent = path.dirname(target);
             await rm(parent, { recursive: false }).catch(() => undefined);
+          } else if (item.kind === "file_backup_object") {
+            if (!info.isFile() || info.isSymbolicLink() || !await readManagedObject(this.dataDirectory, "file-objects", item.objectRef)) {
+              throw new Error("file backup object is unsafe or failed integrity checks");
+            }
+            await unlink(target);
+            await rm(path.dirname(target), { recursive: false }).catch(() => undefined);
           } else if (info.isDirectory() && !info.isSymbolicLink()) await rm(target, { recursive: true, force: true });
           else await unlink(target);
         }
@@ -429,6 +437,10 @@ export class ProjectPickerService {
   private objectPath(sha256: string): string {
     if (!/^[a-f0-9]{64}$/u.test(sha256)) throw fail("invalid_request", "附件引用无效。");
     return path.join(this.objectRoot, sha256.slice(0, 2), sha256);
+  }
+  private fileObjectPath(sha256: string): string {
+    if (!/^[a-f0-9]{64}$/u.test(sha256)) throw fail("invalid_request", "文件备份引用无效。");
+    return path.join(this.dataDirectory, "file-objects", sha256.slice(0, 2), sha256);
   }
   private async writeObject(sha256: string, bytes: Buffer): Promise<void> {
     if (digest(bytes) !== sha256) throw fail("conflict", "附件内容校验失败。");

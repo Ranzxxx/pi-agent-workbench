@@ -36,13 +36,55 @@ test("stable data directory honors override, XDG, and home fallback", () => {
 
 test("new database migrates to WAL/FULL with foreign keys, and repeated open preserves schema", () => withDb((_root, path) => {
   const first = openStorage({ path });
-  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 3 });
+  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 5 });
   assert.equal(first.projects.list().length, 0);
   first.close();
   const reopened = openStorage({ path });
-  assert.equal(reopened.diagnostics.schemaVersion, 3);
+  assert.equal(reopened.diagnostics.schemaVersion, 5);
   assert.equal(reopened.projects.list().length, 0);
   reopened.close();
+}));
+
+test("file changesets persist operations, support multiple sequence numbers, and release only unreferenced objects", () => withDb((_root, path) => {
+  const store = openStorage({ path });
+  const { run } = createBase(store, "files");
+  const runCompletedAt = new Date(Date.now() + 1).toISOString();
+  store.runs.updateStatus(run.runId, "running", runCompletedAt);
+  store.runs.updateStatus(run.runId, "completed", runCompletedAt, runCompletedAt);
+  const backupA = "b".repeat(64);
+  const resultA = "c".repeat(64);
+  const backupB = "d".repeat(64);
+  for (const sha256 of [backupA, resultA, backupB]) store.contentObjects.register({ sha256, byteSize: 5, createdAt: at });
+  const changeset = store.fileChangesets.ensureForRun({
+    id: "changeset_files", conversationId: "conversation_files", projectId: "project_files", runId: run.runId, createdAt: at,
+  });
+  const first = store.fileOperations.prepare({
+    id: "operation_first", changesetId: changeset.id, relativePath: "src/a.ts", kind: "replace",
+    preVersion: "version_before", preHash: "a".repeat(64), expectedPostHash: resultA,
+    backupSha256: backupA, resultSha256: resultA, createdAt: at,
+  });
+  const appliedFirst = store.fileOperations.applied(first.id, "version_middle", resultA, at);
+  assert.equal(appliedFirst.sequence, 1);
+  const second = store.fileOperations.prepare({
+    id: "operation_second", changesetId: changeset.id, relativePath: "src/a.ts", kind: "replace",
+    preVersion: "version_middle", preHash: resultA, expectedPostHash: backupB,
+    backupSha256: resultA, resultSha256: backupB, createdAt: at,
+  });
+  assert.equal(second.sequence, 2);
+  store.fileOperations.applied(second.id, "version_after", backupB, at);
+  assert.equal(store.fileChangesets.finalizeRun(run.runId, at)?.status, "applied");
+  assert.equal(store.fileOperations.list(changeset.id).length, 2);
+
+  store.attachmentResults.create({
+    id: "result_file", conversationId: "conversation_files", runId: run.runId, sourceAttachmentId: null,
+    objectSha256: "e".repeat(64), fileName: "edited.txt", byteSize: 12, createdAt: at,
+  });
+  store.conversations.deletePermanently("conversation_files");
+  const garbage = store.garbage.list();
+  assert.deepEqual(garbage.filter((item) => item.kind === "file_backup_object").map((item) => item.objectRef).sort(),
+    [backupA, backupB, resultA].sort());
+  assert.deepEqual(garbage.filter((item) => item.kind === "attachment_object").map((item) => item.objectRef), ["e".repeat(64)]);
+  store.close();
 }));
 
 test("attachment references stay scoped and conversation deletion queues only unshared objects", () => withDb((_root, path) => {
