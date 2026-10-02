@@ -45,16 +45,59 @@ export const V2ConversationMessageSchema = object({
 });
 export const V2ConversationSummarySchema = object({
   schemaVersion: Type.Literal(2), conversationId: id, title: Type.String({ minLength: 1, maxLength: 256 }),
+  projectId: Type.Optional(Type.Union([id, Type.Null()])),
   createdAt: timestamp, updatedAt: timestamp, preview: Type.String({ maxLength: 256 }), messageCount: nonnegative,
 });
 export const V2ConversationSchema = object({
   schemaVersion: Type.Literal(2), conversationId: id, title: Type.String({ minLength: 1, maxLength: 256 }),
+  projectId: Type.Optional(Type.Union([id, Type.Null()])),
   createdAt: timestamp, updatedAt: timestamp, preview: Type.String({ maxLength: 256 }), messageCount: nonnegative,
   messages: Type.Array(V2ConversationMessageSchema, { maxItems: 1000 }),
 });
 export const V2SubmitRunRequestSchema = object({
   schemaVersion: Type.Literal(2), conversationId: id, input: RunSubmissionSchema,
 });
+
+export const V2ProjectSchema = object({
+  schemaVersion: Type.Literal(2), projectId: id, displayName: Type.String({ minLength: 1, maxLength: 256 }),
+  canonicalRoot: Type.String({ minLength: 1, maxLength: 4096 }), validationState: Type.Union([Type.Literal("valid"), Type.Literal("missing"), Type.Literal("needs_review")]),
+  createdAt: timestamp, lastAccessedAt: timestamp,
+});
+export const V2PickerEntrySchema = object({
+  name: Type.String({ minLength: 1, maxLength: 255 }), kind: Type.Union([Type.Literal("directory"), Type.Literal("file"), Type.Literal("excluded")]),
+  token: Type.Optional(id), byteSize: Type.Optional(nonnegative), reason: Type.Optional(Type.String({ maxLength: 128 })),
+});
+export const V2PickerDirectorySchema = object({
+  schemaVersion: Type.Literal(2), directoryToken: id, parentToken: Type.Optional(id), displayPath: Type.String({ minLength: 1, maxLength: 4096 }),
+  canSelectProject: Type.Boolean(), truncated: Type.Boolean(), entries: Type.Array(V2PickerEntrySchema, { maxItems: 500 }),
+});
+export const V2PickerRootsSchema = object({
+  schemaVersion: Type.Literal(2), roots: Type.Array(object({ label: Type.String({ minLength: 1, maxLength: 256 }), token: id }), { maxItems: 32 }),
+});
+export const V2PickerSessionSchema = object({ schemaVersion: Type.Literal(2), csrfToken: Type.String({ minLength: 32, maxLength: 128 }), expiresAt: timestamp });
+export const V2PickerBrowseRequestSchema = object({ schemaVersion: Type.Literal(2), mode: Type.Union([Type.Literal("project"), Type.Literal("attachment")]), directoryToken: id });
+export const V2PickerSelectProjectRequestSchema = object({ schemaVersion: Type.Literal(2), directoryToken: id });
+export const V2PickerOpenProjectRequestSchema = object({
+  schemaVersion: Type.Literal(2), selectionToken: id, displayName: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+});
+export const V2AttachmentSchema = object({
+  schemaVersion: Type.Literal(2), attachmentId: id, conversationId: id, fileName: Type.String({ minLength: 1, maxLength: 512 }),
+  relativePath: Type.String({ minLength: 1, maxLength: 4096 }), byteSize: nonnegative, mediaType: Type.Literal("text/plain; charset=utf-8"), createdAt: timestamp,
+});
+export const V2AttachmentImportRequestSchema = object({
+  schemaVersion: Type.Literal(2), fileTokens: Type.Array(id, { maxItems: 100 }), directoryToken: Type.Optional(id),
+});
+export const V2ImportResultSchema = object({
+  schemaVersion: Type.Literal(2), attachments: Type.Array(V2AttachmentSchema, { maxItems: 100 }),
+  skipped: Type.Array(object({ path: Type.String({ minLength: 1, maxLength: 4096 }), reason: Type.String({ minLength: 1, maxLength: 128 }) }), { maxItems: 500 }),
+  totalBytes: nonnegative,
+});
+export const V2ProjectRulesSchema = object({
+  schemaVersion: Type.Literal(2), projectId: id, sourcePath: Type.String({ minLength: 1, maxLength: 4096 }),
+  sourceSha256: sha256, sourceVersion: Type.String({ minLength: 1, maxLength: 128 }), content: Type.String({ maxLength: 65536 }),
+  acceptedAt: timestamp, revokedAt: Type.Optional(Type.Union([timestamp, Type.Null()])),
+});
+export const V2ProjectRulesAcceptRequestSchema = object({ schemaVersion: Type.Literal(2), previewToken: id });
 
 export const V2ErrorSchema = object({
   schemaVersion: Type.Literal(2),
@@ -128,6 +171,19 @@ export type V2ConversationMessage = Static<typeof V2ConversationMessageSchema>;
 export type V2ConversationSummary = Static<typeof V2ConversationSummarySchema>;
 export type V2Conversation = Static<typeof V2ConversationSchema>;
 export type V2SubmitRunRequest = Static<typeof V2SubmitRunRequestSchema>;
+export type V2Project = Static<typeof V2ProjectSchema>;
+export type V2PickerEntry = Static<typeof V2PickerEntrySchema>;
+export type V2PickerDirectory = Static<typeof V2PickerDirectorySchema>;
+export type V2PickerRoots = Static<typeof V2PickerRootsSchema>;
+export type V2PickerSession = Static<typeof V2PickerSessionSchema>;
+export type V2PickerBrowseRequest = Static<typeof V2PickerBrowseRequestSchema>;
+export type V2PickerSelectProjectRequest = Static<typeof V2PickerSelectProjectRequestSchema>;
+export type V2PickerOpenProjectRequest = Static<typeof V2PickerOpenProjectRequestSchema>;
+export type V2Attachment = Static<typeof V2AttachmentSchema>;
+export type V2AttachmentImportRequest = Static<typeof V2AttachmentImportRequestSchema>;
+export type V2ImportResult = Static<typeof V2ImportResultSchema>;
+export type V2ProjectRules = Static<typeof V2ProjectRulesSchema>;
+export type V2ProjectRulesAcceptRequest = Static<typeof V2ProjectRulesAcceptRequestSchema>;
 export type V2RunAttempt = Static<typeof V2RunAttemptSchema>;
 export type V2RunEvent = Static<typeof V2RunEventSchema>;
 export type V2EventCursor = Static<typeof V2EventCursorSchema>;

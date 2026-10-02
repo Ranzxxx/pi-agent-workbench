@@ -3,25 +3,37 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { CapabilityInfo, Conversation, ConversationSummary, WorkbenchEvent, WorkbenchRun, V2Conversation, V2ConversationSummary, V2Run } from "@pi-workbench/protocol";
 import { RunArtifacts } from "./run-artifacts";
+import { retryStartupRead } from "./startup";
 
 const API = "/api/v2";
 const SUGGESTIONS = ["帮我制定一个清晰的实施计划", "解释一下 Agent 是如何工作的", "把这个想法拆解成可执行的步骤"];
 const EVENT_TYPES = ["run.accepted", "run.started", "run.progress", "message.delta", "tool.started", "tool.finished", "checkpoint.saved", "usage.updated", "run.cancelling", "run.completed", "run.failed", "run.cancelled", "run.interrupted", "stream.reset"] as const;
+const API_REQUEST_TIMEOUT_MS = 30_000;
 const REPOSITORY_URL_PATTERN = /^https:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/u;
 const FAKE_REPOSITORY_SHA = "7f06c6b2792349e4d9ccbd393008e5bf1f4d419a";
 type V2StreamReset = { schemaVersion: 2; type: "stream.reset"; runId: string; data: { reason: "event_history_expired"; earliestAvailableSequence: number; latestSequence: number; latestEventId?: string } };
+type UiConversation = Conversation & { projectId?: string | null };
+type UiConversationSummary = ConversationSummary & { projectId?: string | null };
+type LocalProject = { schemaVersion: 2; projectId: string; displayName: string; canonicalRoot: string; validationState: "valid" | "missing" | "needs_review"; createdAt: string; lastAccessedAt: string };
+type PickerDirectory = { schemaVersion: 2; directoryToken: string; parentToken?: string; displayPath: string; canSelectProject: boolean; truncated: boolean; entries: Array<{ name: string; kind: "directory" | "file" | "excluded"; token?: string; byteSize?: number; reason?: string }> };
+type PickerRoot = { label: string; token: string };
+type LocalAttachment = { schemaVersion: 2; attachmentId: string; conversationId: string; fileName: string; relativePath: string; byteSize: number; mediaType: string; createdAt: string };
+type ProjectRuleView = { schemaVersion: 2; projectId: string; sourcePath: string; sourceSha256: string; sourceVersion: string; content: string; acceptedAt: string; revokedAt?: string | null };
+let pickerCsrfToken: string | null = null;
+let pickerSessionRequest: Promise<string> | null = null;
 
-function normalizeConversation(value: V2Conversation): Conversation {
+function normalizeConversation(value: V2Conversation): UiConversation {
   return {
     schemaVersion: 1, conversationId: value.conversationId, title: value.title.slice(0, 128),
+    projectId: value.projectId ?? null,
     createdAt: value.createdAt, updatedAt: value.updatedAt, preview: value.preview, messageCount: value.messageCount,
     messages: value.messages.map((message) => message.role === "capability" && message.capabilityInput
       ? { schemaVersion: 1, id: message.messageId, role: "capability", text: message.content, createdAt: message.createdAt, capabilityId: "public_repository_analysis", input: message.capabilityInput }
       : { schemaVersion: 1, id: message.messageId, role: message.role === "capability" ? "assistant" : message.role, text: message.content, createdAt: message.createdAt }),
   };
 }
-function normalizeSummary(value: V2ConversationSummary): ConversationSummary {
-  return { schemaVersion: 1, conversationId: value.conversationId, title: value.title.slice(0, 128), createdAt: value.createdAt, updatedAt: value.updatedAt, preview: value.preview, messageCount: value.messageCount };
+function normalizeSummary(value: V2ConversationSummary): UiConversationSummary {
+  return { schemaVersion: 1, conversationId: value.conversationId, title: value.title.slice(0, 128), projectId: value.projectId ?? null, createdAt: value.createdAt, updatedAt: value.updatedAt, preview: value.preview, messageCount: value.messageCount };
 }
 function normalizeRun(value: V2Run): WorkbenchRun {
   if (!value.input) throw new Error("服务器返回的运行缺少输入记录");
@@ -54,13 +66,44 @@ function isFakeDemoRepository(value: string): boolean {
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json");
-  const response = await fetch(`${API}${path}`, { ...init, headers });
-  const body = await response.json().catch(() => undefined) as { message?: string; error?: { message?: string } } | undefined;
-  if (!response.ok) throw new Error(body?.message ?? body?.error?.message ?? `请求失败 (${response.status})`);
+  const timeoutSignal = AbortSignal.timeout(API_REQUEST_TIMEOUT_MS);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+  const response = await fetch(`${API}${path}`, { ...init, headers, signal });
+  const body = await response.json().catch((error: unknown) => {
+    if (signal.aborted) throw signal.reason;
+    if (response.ok) throw error;
+    return undefined;
+  }) as { message?: string; error?: { message?: string } } | undefined;
+  if (!response.ok) throw Object.assign(new Error(body?.message ?? body?.error?.message ?? `请求失败 (${response.status})`), { status: response.status });
   return normalizeApiValue(body) as T;
 }
+async function openPickerSession(): Promise<string> {
+  if (pickerCsrfToken) return pickerCsrfToken;
+  if (!pickerSessionRequest) {
+    pickerSessionRequest = api<{ csrfToken: string }>("/picker/session", { method: "POST", body: "{}" })
+      .then((session) => { pickerCsrfToken = session.csrfToken; return session.csrfToken; });
+  }
+  const pending = pickerSessionRequest;
+  try { return await pending; }
+  finally { if (pickerSessionRequest === pending) pickerSessionRequest = null; }
+}
+async function pickerApi<T>(path: string, init?: RequestInit, retry = true): Promise<T> {
+  const csrfToken = await openPickerSession();
+  const headers = new Headers(init?.headers);
+  headers.set("x-csrf-token", csrfToken);
+  try { return await api<T>(path, { ...init, headers }); }
+  catch (error) {
+    if (retry && error && typeof error === "object" && "status" in error && error.status === 404) {
+      if (pickerCsrfToken === csrfToken) pickerCsrfToken = null;
+      await openPickerSession();
+      return pickerApi<T>(path, init, false);
+    }
+    throw error;
+  }
+}
 function key(): string { return crypto.randomUUID(); }
-function Icon({ name }: { name: "plus" | "chat" | "grid" | "settings" | "send" | "stop" | "paperclip" | "spark" | "close" | "trash" }) {
+function formatBytes(bytes: number): string { return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KiB`; }
+function Icon({ name }: { name: "plus" | "chat" | "grid" | "settings" | "send" | "stop" | "paperclip" | "spark" | "close" | "trash" | "folder" }) {
   const common = { width: 16, height: 16, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round" as const, strokeLinejoin: "round" as const, "aria-hidden": true as const };
   const paths: Record<typeof name, React.ReactNode> = {
     plus: <><path d="M12 5v14M5 12h14" /></>, chat: <><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5 8 8 0 0 1-3.5-.8L4 20l1.8-4A7.5 7.5 0 1 1 20 11.5Z" /></>,
@@ -68,6 +111,7 @@ function Icon({ name }: { name: "plus" | "chat" | "grid" | "settings" | "send" |
     settings: <><circle cx="12" cy="12" r="3" /><path d="m19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.6a8 8 0 0 1-1.6.9l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-1.6-.9l-1.7.6-1.4-2.4L8 15a8 8 0 0 1 0-1.9l-1.4-1.2L8 9.5l1.7.6a8 8 0 0 1 1.6-.9l.3-1.8h2.8l.3 1.8a8 8 0 0 1 1.6.9l1.7-.6 1.4 2.4-1.4 1.2a8 8 0 0 1 0 1.9Z" transform="translate(-1 -1) scale(1.08)" /></>,
     send: <><path d="m5 12 14-7-4 14-3.2-5.5L5 12Z" /><path d="m11.8 13.5 3.5-3.5" /></>, stop: <><rect x="6" y="6" width="12" height="12" rx="2" /></>,
     paperclip: <><path d="m8.5 12.5 6-6a3 3 0 0 1 4.2 4.2l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.1-8.1" /></>, spark: <><path d="m12 3 1.6 6.4L20 11l-6.4 1.6L12 19l-1.6-6.4L4 11l6.4-1.6L12 3Z" /><path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z" /></>, close: <><path d="m6 6 12 12M18 6 6 18" /></>, trash: <><path d="M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m4 4v6m6-6v6" /></>,
+    folder: <><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5Z" /><path d="M3.5 9h17" /></>,
   };
   return <svg {...common}>{paths[name]}</svg>;
 }
@@ -86,8 +130,8 @@ function eventLabel(event: WorkbenchEvent): string {
 
 export default function HomePage() {
   const [mode, setMode] = useState<"fake" | "online">("fake");
-  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
-  const [conversation, setConversation] = useState<Conversation | null>(null);
+  const [conversations, setConversations] = useState<UiConversationSummary[]>([]);
+  const [conversation, setConversation] = useState<UiConversation | null>(null);
   const [isNewConversationDraft, setIsNewConversationDraft] = useState(true);
   const [capabilities, setCapabilities] = useState<CapabilityInfo[]>([]);
   const [text, setText] = useState("");
@@ -102,7 +146,24 @@ export default function HomePage() {
   const [draftReply, setDraftReply] = useState("");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(true);
+  const [startupError, setStartupError] = useState(false);
+  const [startupAttempt, setStartupAttempt] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
+  const [projects, setProjects] = useState<LocalProject[]>([]);
+  const [currentProject, setCurrentProject] = useState<LocalProject | null>(null);
+  const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
+  const [showProjectPicker, setShowProjectPicker] = useState(false);
+  const [pickerMode, setPickerMode] = useState<"project" | "attachment" | "rules">("project");
+  const [pickerRoots, setPickerRoots] = useState<PickerRoot[]>([]);
+  const [pickerDirectory, setPickerDirectory] = useState<PickerDirectory | null>(null);
+  const [selectedFileTokens, setSelectedFileTokens] = useState<string[]>([]);
+  const [selectedFileBytes, setSelectedFileBytes] = useState(0);
+  const [pickerNotice, setPickerNotice] = useState("");
+  const [pickerSkipped, setPickerSkipped] = useState<Array<{ path: string; reason: string }>>([]);
+  const [projectName, setProjectName] = useState("");
+  const [rulesPreviewToken, setRulesPreviewToken] = useState<string | null>(null);
+  const [projectRules, setProjectRules] = useState<ProjectRuleView | null>(null);
+  const [rulesAccepted, setRulesAccepted] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -116,10 +177,10 @@ export default function HomePage() {
   const busy = activeRun !== null && ["queued", "running", "cancelling"].includes(activeRun.status);
 
   const refreshSidebar = useCallback(async () => {
-    const result = await api<{ conversations: ConversationSummary[] }>("/conversations");
+    const result = await api<{ conversations: UiConversationSummary[] }>("/conversations");
     setConversations(result.conversations);
   }, []);
-  const loadConversation = useCallback(async (id: string) => {
+  const loadConversation = useCallback(async (id: string, signal?: AbortSignal) => {
     const token = ++navigationTokenRef.current;
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
@@ -128,12 +189,14 @@ export default function HomePage() {
     setIsNewConversationDraft(false);
     setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
     const [loaded, runResult] = await Promise.all([
-      api<Conversation>(`/conversations/${encodeURIComponent(id)}`),
-      api<{ runs: WorkbenchRun[] }>(`/conversations/${encodeURIComponent(id)}/runs`),
+      api<UiConversation>(`/conversations/${encodeURIComponent(id)}`, { signal }),
+      api<{ runs: WorkbenchRun[] }>(`/conversations/${encodeURIComponent(id)}/runs`, { signal }),
     ]);
     if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== id) return;
     localStorage.setItem("pi-workbench-conversation", id);
     setConversation(loaded);
+    setAttachments([]);
+    setCurrentProject(null);
     setRuns(runResult.runs);
     const latestRun = runResult.runs[0];
     setSelectedRunId(latestRun?.runId ?? null);
@@ -142,6 +205,16 @@ export default function HomePage() {
       delete lastEventIdByRunRef.current[latestRun.runId];
       connectEvents(latestRun.runId);
     }
+    void pickerApi<{ attachments: LocalAttachment[] }>(`/conversations/${encodeURIComponent(id)}/attachments`)
+      .then((result) => { if (token === navigationTokenRef.current && selectedConversationIdRef.current === id) setAttachments(result.attachments); })
+      .catch(() => { if (token === navigationTokenRef.current && selectedConversationIdRef.current === id) setNotice("附件列表暂时无法读取；对话本身仍可使用。"); });
+    void pickerApi<{ projects: LocalProject[] }>("/projects")
+      .then((result) => {
+        if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== id) return;
+        setProjects(result.projects);
+        setCurrentProject(result.projects.find((project) => project.projectId === loaded.projectId) ?? null);
+      })
+      .catch(() => { if (token === navigationTokenRef.current && selectedConversationIdRef.current === id) setNotice("项目状态暂时无法读取；对话本身仍可使用。"); });
   }, []);
   const connectEvents = useCallback((runId: string, afterEventId?: string) => {
     eventSourceRef.current?.close();
@@ -173,7 +246,7 @@ export default function HomePage() {
             else {
               eventSourceRef.current = null;
               void refreshSidebar();
-              if (conversationId) void api<Conversation>(`/conversations/${encodeURIComponent(conversationId)}`).then((loaded) => {
+              if (conversationId) void api<UiConversation>(`/conversations/${encodeURIComponent(conversationId)}`).then((loaded) => {
                 if (selectedConversationIdRef.current === conversationId && navigationTokenRef.current === token) setConversation(loaded);
               }).catch(() => setNotice("对话刷新失败，请重新选择该对话。"));
             }
@@ -204,7 +277,7 @@ export default function HomePage() {
             setRuns((current) => current.map((item) => item.runId === runId ? snapshot : item));
             eventSourceRef.current = null;
             void refreshSidebar();
-            if (conversationId) void api<Conversation>(`/conversations/${encodeURIComponent(conversationId)}`).then((loaded) => {
+            if (conversationId) void api<UiConversation>(`/conversations/${encodeURIComponent(conversationId)}`).then((loaded) => {
               if (selectedConversationIdRef.current === conversationId && navigationTokenRef.current === token && activeRunIdRef.current === runId) setConversation(loaded);
             }).catch(() => { if (selectedConversationIdRef.current === conversationId) setNotice("对话刷新失败，请重新选择该对话。"); });
           }).catch(() => { if (isCurrent()) setNotice("运行状态刷新失败，请重新连接。"); });
@@ -235,25 +308,33 @@ export default function HomePage() {
 
   useEffect(() => {
     let ignore = false;
+    const controller = new AbortController();
+    setLoading(true);
+    setStartupError(false);
     void (async () => {
       try {
-        const health = await api<{ mode: "fake" | "online" }>("/health");
-        const caps = await api<{ capabilities: CapabilityInfo[] }>("/capabilities");
-        const listed = await api<{ conversations: ConversationSummary[] }>("/conversations");
+        const [health, caps, listed] = await retryStartupRead(async (signal) => {
+          const health = await api<{ mode: "fake" | "online" }>("/health", { signal });
+          const [caps, listed] = await Promise.all([
+            api<{ capabilities: CapabilityInfo[] }>("/capabilities", { signal }),
+            api<{ conversations: UiConversationSummary[] }>("/conversations", { signal }),
+          ]);
+          return [health, caps, listed] as const;
+        }, controller.signal);
         if (ignore) return;
         setMode(health.mode); setCapabilities(caps.capabilities); setConversations(listed.conversations);
         const saved = localStorage.getItem("pi-workbench-conversation");
-        if (saved && listed.conversations.some((item) => item.conversationId === saved)) await loadConversation(saved);
-        else if (listed.conversations[0]) await loadConversation(listed.conversations[0].conversationId);
+        if (saved && listed.conversations.some((item) => item.conversationId === saved)) await loadConversation(saved, controller.signal);
+        else if (listed.conversations[0]) await loadConversation(listed.conversations[0].conversationId, controller.signal);
         else {
           localStorage.removeItem("pi-workbench-conversation");
           setIsNewConversationDraft(true);
         }
-      } catch (error) { if (!ignore) setNotice(error instanceof Error ? error.message : "无法连接本地工作台服务。"); }
+      } catch { if (!ignore) setStartupError(true); }
       finally { if (!ignore) setLoading(false); }
     })();
-    return () => { ignore = true; navigationTokenRef.current++; eventSourceRef.current?.close(); eventSourceRef.current = null; };
-  }, [loadConversation]);
+    return () => { ignore = true; controller.abort(); navigationTokenRef.current++; eventSourceRef.current?.close(); eventSourceRef.current = null; };
+  }, [loadConversation, startupAttempt]);
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [conversation?.messages.length, events.length, draftReply]);
   useEffect(() => { if (isNewConversationDraft && !loading) textareaRef.current?.focus(); }, [isNewConversationDraft, loading]);
 
@@ -264,6 +345,7 @@ export default function HomePage() {
     activeRunIdRef.current = null;
     selectedConversationIdRef.current = null;
     setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
+    setAttachments([]); setCurrentProject(null);
     setIsNewConversationDraft(true);
     setText(""); setSelectedCapability(null); setCapabilityValues({}); setPickerQuery(""); setShowPicker(false); setNotice("");
     localStorage.removeItem("pi-workbench-conversation");
@@ -285,7 +367,7 @@ export default function HomePage() {
           eventSourceRef.current?.close(); eventSourceRef.current = null;
           activeRunIdRef.current = null; selectedConversationIdRef.current = null;
           localStorage.removeItem("pi-workbench-conversation");
-          setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
+          setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply(""); setAttachments([]); setCurrentProject(null);
           setText(""); clearCapability();
           setIsNewConversationDraft(true);
         }
@@ -337,11 +419,11 @@ export default function HomePage() {
       kind: "capability", capabilityId: selectedCapability.id,
       input: capabilityInput,
     } : { kind: "message", text: trimmed };
-    let newlyCreatedConversation: Conversation | undefined;
+    let newlyCreatedConversation: UiConversation | undefined;
     let runAccepted = false;
     try {
       if (!conversationId) {
-        newlyCreatedConversation = await api<Conversation>("/conversations", { method: "POST", body: "{}" });
+        newlyCreatedConversation = await api<UiConversation>("/conversations", { method: "POST", body: "{}" });
         if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== null) {
           await api(`/conversations/${encodeURIComponent(newlyCreatedConversation.conversationId)}`, { method: "DELETE" }).catch(() => undefined);
           return;
@@ -388,7 +470,7 @@ export default function HomePage() {
           if (token === navigationTokenRef.current && selectedConversationIdRef.current === newlyCreatedConversation.conversationId) {
             selectedConversationIdRef.current = null;
             localStorage.removeItem("pi-workbench-conversation");
-            setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply("");
+            setConversation(null); setActiveRun(null); setRuns([]); setSelectedRunId(null); setEvents([]); setDraftReply(""); setAttachments([]); setCurrentProject(null);
             setIsNewConversationDraft(true);
           }
           void refreshSidebar().catch(() => undefined);
@@ -434,6 +516,123 @@ export default function HomePage() {
       setEvents([]); setDraftReply(""); connectEvents(next.runId);
     } catch (error) { setNotice(error instanceof Error ? error.message : "继续运行失败。"); }
   }
+  async function openPicker(mode: "project" | "attachment") {
+    setPickerMode(mode); setPickerDirectory(null); setSelectedFileTokens([]); setSelectedFileBytes(0); setPickerNotice(""); setPickerSkipped([]); setProjectName("");
+    setShowProjectPicker(true);
+    try {
+      const [rootResult, projectResult] = await Promise.all([
+        pickerApi<{ roots: PickerRoot[] }>(`/picker/roots?mode=${mode}`), pickerApi<{ projects: LocalProject[] }>("/projects"),
+      ]);
+      setPickerRoots(rootResult.roots); setProjects(projectResult.projects);
+    } catch (error) { setPickerNotice(error instanceof Error ? error.message : "无法打开本地目录选择器。"); }
+  }
+  async function browsePicker(token: string) {
+    try {
+      const result = await pickerApi<PickerDirectory>("/picker/browse", { method: "POST", body: JSON.stringify({ schemaVersion: 2, mode: pickerMode, directoryToken: token }) });
+      setPickerDirectory(result); setPickerNotice("");
+    } catch (error) { setPickerNotice(error instanceof Error ? error.message : "无法浏览该目录。"); }
+  }
+  async function openSelectedProject() {
+    if (!pickerDirectory?.canSelectProject) return;
+    try {
+      const selection = await pickerApi<{ selectionToken: string }>("/picker/project-selection", {
+        method: "POST", body: JSON.stringify({ schemaVersion: 2, directoryToken: pickerDirectory.directoryToken }),
+      });
+      const opened = await pickerApi<{ project: LocalProject; conversation: UiConversation }>("/picker/open-project", {
+        method: "POST", body: JSON.stringify({ schemaVersion: 2, selectionToken: selection.selectionToken, ...(projectName.trim() ? { displayName: projectName.trim() } : {}) }),
+      });
+      setProjects((items) => [opened.project, ...items.filter((item) => item.projectId !== opened.project.projectId)]);
+      setShowProjectPicker(false); setPickerDirectory(null); setPickerNotice("");
+      await refreshSidebar(); await loadConversation(opened.conversation.conversationId);
+      setNotice(`已打开项目：${opened.project.displayName}`);
+    } catch (error) { setPickerNotice(error instanceof Error ? error.message : "无法打开项目。"); }
+  }
+  async function startProjectConversation(projectId: string) {
+    try {
+      const created = await pickerApi<UiConversation>(`/projects/${encodeURIComponent(projectId)}/conversations`, { method: "POST", body: "{}" });
+      setShowProjectPicker(false); await refreshSidebar(); await loadConversation(created.conversationId);
+    } catch (error) { setPickerNotice(error instanceof Error ? error.message : "无法重新打开项目。"); }
+  }
+  function toggleFileToken(token: string, byteSize: number) {
+    if (selectedFileTokens.includes(token)) {
+      setSelectedFileTokens((items) => items.filter((item) => item !== token)); setSelectedFileBytes((bytes) => Math.max(0, bytes - byteSize));
+    } else if (selectedFileTokens.length >= 100) setPickerNotice("一次最多选择 100 个文件。");
+    else { setSelectedFileTokens((items) => [...items, token]); setSelectedFileBytes((bytes) => bytes + byteSize); }
+  }
+  async function importSelectedFiles(directoryToken?: string) {
+    if (!selectedFileTokens.length && !directoryToken) return;
+    let conversationId = conversation?.conversationId;
+    let createdConversation: UiConversation | undefined;
+    try {
+      if (!conversationId) {
+        createdConversation = await api<UiConversation>("/conversations", { method: "POST", body: "{}" });
+        conversationId = createdConversation.conversationId;
+      }
+      const result = await pickerApi<{ attachments: LocalAttachment[]; skipped: Array<{ path: string; reason: string }>; totalBytes: number }>(
+        `/conversations/${encodeURIComponent(conversationId)}/attachments/import`, {
+          method: "POST", body: JSON.stringify({ schemaVersion: 2, fileTokens: directoryToken ? [] : selectedFileTokens, ...(directoryToken ? { directoryToken } : {}) }),
+        });
+      setPickerSkipped(result.skipped);
+      const reasonLabel: Record<string, string> = {
+        symbolic_link: "符号链接已跳过", excluded_directory: "受限目录已跳过", sensitive_file: "敏感文件已跳过",
+        unsupported_file_type: "非支持的文本类型已跳过", not_utf8_text: "非 UTF-8 文本已跳过", binary_content: "二进制文件已跳过",
+        total_size_limit: "超过 20 MiB 总量限制", file_count_limit: "超过 100 个文件限制", scan_limit: "目录项目过多，扫描已停止",
+      };
+      if (createdConversation && result.attachments.length === 0) {
+        await api(`/conversations/${encodeURIComponent(createdConversation.conversationId)}`, { method: "DELETE" });
+      } else if (createdConversation) {
+        setShowProjectPicker(false); await refreshSidebar(); await loadConversation(createdConversation.conversationId);
+      } else {
+        const updated = await pickerApi<{ attachments: LocalAttachment[] }>(`/conversations/${encodeURIComponent(conversationId)}/attachments`);
+        setAttachments(updated.attachments);
+      }
+      setSelectedFileTokens([]); setSelectedFileBytes(0);
+      setPickerNotice(result.attachments.length ? `已导入 ${result.attachments.length} 个文本附件（${formatBytes(result.totalBytes)}）。${result.skipped.length ? `跳过 ${result.skipped.length} 项。` : ""}`
+        : result.skipped.length ? "没有导入附件；请查看跳过原因。" : "没有可导入的文件。");
+      if (result.skipped.length) setPickerSkipped(result.skipped.map((item) => ({ ...item, reason: reasonLabel[item.reason] ?? item.reason })));
+    } catch (error) {
+      if (createdConversation) await api(`/conversations/${encodeURIComponent(createdConversation.conversationId)}`, { method: "DELETE" }).catch(() => undefined);
+      setPickerNotice(error instanceof Error ? error.message : "附件导入失败，没有完成保存。");
+    }
+  }
+  async function openProjectRules() {
+    if (!currentProject) return;
+    setPickerMode("rules"); setShowProjectPicker(true); setRulesPreviewToken(null); setProjectRules(null); setRulesAccepted(false); setPickerNotice("");
+    try {
+      const saved = await pickerApi<{ rules: ProjectRuleView | null }>(`/projects/${encodeURIComponent(currentProject.projectId)}/rules`);
+      if (saved.rules) { setProjectRules(saved.rules); setRulesAccepted(true); return; }
+      const preview = await pickerApi<{ previewToken: string; sourcePath: string; content: string; sourceSha256: string; sourceVersion: string }>(
+        `/projects/${encodeURIComponent(currentProject.projectId)}/rules/preview`, { method: "POST", body: "{}" });
+      setRulesPreviewToken(preview.previewToken);
+      setProjectRules({ schemaVersion: 2, projectId: currentProject.projectId, sourcePath: preview.sourcePath, sourceSha256: preview.sourceSha256,
+        sourceVersion: preview.sourceVersion, content: preview.content, acceptedAt: "", revokedAt: null });
+    } catch (error) { setPickerNotice(error instanceof Error ? error.message : "无法预览项目规则。"); }
+  }
+  async function acceptProjectRules() {
+    if (!currentProject || !rulesPreviewToken) return;
+    try {
+      const result = await pickerApi<{ rules: ProjectRuleView }>(`/projects/${encodeURIComponent(currentProject.projectId)}/rules/accept`, {
+        method: "POST", body: JSON.stringify({ schemaVersion: 2, previewToken: rulesPreviewToken }),
+      });
+      setProjectRules(result.rules); setRulesAccepted(true); setRulesPreviewToken(null); setPickerNotice("规则已保存为用户确认的本地记录；当前运行不会自动加载它。");
+    } catch (error) { setPickerNotice(error instanceof Error ? error.message : "规则确认失败。"); }
+  }
+  async function revokeProjectRules() {
+    if (!currentProject) return;
+    try {
+      await pickerApi(`/projects/${encodeURIComponent(currentProject.projectId)}/rules`, { method: "DELETE" });
+      setProjectRules(null); setRulesAccepted(false); setRulesPreviewToken(null); setPickerNotice("项目规则确认已撤回。");
+    } catch (error) { setPickerNotice(error instanceof Error ? error.message : "撤回项目规则失败。"); }
+  }
+  async function downloadAttachment(item: LocalAttachment) {
+    try {
+      if (!pickerCsrfToken) await openPickerSession();
+      const response = await fetch(`${API}/conversations/${encodeURIComponent(item.conversationId)}/attachments/${encodeURIComponent(item.attachmentId)}`, { headers: { "x-csrf-token": pickerCsrfToken! } });
+      if (!response.ok) throw new Error("附件不可用或本地会话已过期。");
+      const file = await response.blob();
+      const url = URL.createObjectURL(file); const anchor = document.createElement("a"); anchor.href = url; anchor.download = item.fileName; anchor.click(); URL.revokeObjectURL(url);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "无法读取附件。"); }
+  }
   const filteredCapabilities = capabilities.filter((capability) => `${capability.name} ${capability.id}`.toLowerCase().includes(pickerQuery.toLowerCase()));
   const isWelcome = !conversation?.messages.length && !activeRun;
   const canCompose = conversation !== null || isNewConversationDraft;
@@ -449,7 +648,9 @@ export default function HomePage() {
         <div className="nav-caption">工作区</div>
         <button className="nav-item" onClick={() => textareaRef.current?.focus()}><Icon name="chat" /><span>对话</span></button>
         <button className="nav-item" onClick={() => { setPickerQuery(""); setShowPicker((current) => !current); textareaRef.current?.focus(); }}><Icon name="grid" /><span>能力中心</span></button>
+        <button className="nav-item" onClick={() => void openPicker("project")}><Icon name="folder" /><span>打开项目</span></button>
       </nav>
+      {currentProject && <div className="project-sidebar-card"><div className="project-sidebar-label">当前项目</div><strong title={currentProject.canonicalRoot}>{currentProject.displayName}</strong><button onClick={() => void startProjectConversation(currentProject.projectId)}><Icon name="plus" />新建项目对话</button></div>}
       <div className="section-heading"><span>最近对话</span><button className="icon-button" aria-label="新建对话" onClick={beginNewConversation}><Icon name="plus" /></button></div>
       <div className="conversation-list">
         {conversations.map((item) => <div className={`conversation-row ${item.conversationId === conversation?.conversationId ? "current" : ""}`} key={item.conversationId}>
@@ -462,9 +663,9 @@ export default function HomePage() {
     </aside>
     {mobileOpen && <button className="sidebar-backdrop" aria-label="关闭导航" onClick={() => setMobileOpen(false)} />}
     <main className="main-area">
-      <header className="topbar"><button className="mobile-menu" aria-label="打开导航" onClick={() => setMobileOpen(true)}><Icon name="chat" /></button><div className="mobile-brand">PI Workbench</div><div className={`mode-pill ${mode === "fake" ? "offline" : "online"}`}><span className="status-dot" />{mode === "fake" ? "离线演示" : "DeepSeek Flash"}</div></header>
+      <header className="topbar"><button className="mobile-menu" aria-label="打开导航" onClick={() => setMobileOpen(true)}><Icon name="chat" /></button><div className="mobile-brand">PI Workbench</div>{currentProject && <div className="project-location" title={currentProject.canonicalRoot}><Icon name="folder" /><span>{currentProject.canonicalRoot}</span><button onClick={() => void openProjectRules()}>项目规则</button></div>}<div className={`mode-pill ${mode === "fake" ? "offline" : "online"}`}><span className="status-dot" />{mode === "fake" ? "离线演示" : "DeepSeek Flash"}</div></header>
       <div className={`content-shell ${isWelcome ? "welcome-view" : "conversation-view"}`}>
-        {loading ? <div className="loading-state"><span className="loader" /> 正在打开工作台</div> : <>
+        {loading ? <div className="loading-state" role="status"><span className="loader" /> 正在连接本地工作台…</div> : startupError ? <section className="welcome-block" role="alert"><h1>暂时无法连接工作台</h1><p>本地服务尚未就绪或连接已中断。请检查启动终端后重试。</p><button className="quiet-button" onClick={() => setStartupAttempt((current) => current + 1)}>重新连接</button></section> : <>
           {isWelcome ? <section className="welcome-block"><div className="welcome-mark"><Icon name="spark" /></div><h1>你好，今天想解决什么问题？</h1><p>直接描述你的目标，PI Workbench 会通过对话协助你。<br className="wide-break" />需要读取公开仓库时，可以在输入框中用 <kbd>@</kbd> 显式选择“仓库分析”。</p></section> : <section className="transcript" aria-label="对话记录">
             {conversation?.messages.map((message) => <article key={message.id} className={`message-row ${message.role === "assistant" ? "assistant" : "user"}`}><div className="message-avatar">{message.role === "assistant" ? <span>PI</span> : "你"}</div><div className="message-body"><div className="message-role">{message.role === "assistant" ? "PI Workbench" : message.role === "capability" ? "能力调用" : "你"}</div><div className="message-text">{message.text}</div>{message.role === "capability" && <div className="capability-chip">@{capabilities.find((cap) => cap.id === message.capabilityId)?.name ?? "能力"}</div>}</div></article>)}
             {busy && selectedIsActive && <article className="message-row assistant"><div className="message-avatar"><span>PI</span></div><div className="message-body"><div className="message-role">PI Workbench</div>{draftReply ? <div className="message-text">{draftReply}</div> : <div className="thinking"><span /><span /><span /> 正在处理你的请求</div>}</div></article>}
@@ -480,10 +681,11 @@ export default function HomePage() {
           </section>}
           <section className="composer-zone">
             {selectedCapability && <div className="capability-fields"><div className="capability-form-head"><div><span className="capability-kicker">已选择能力</span><strong>@{selectedCapability.name}</strong></div><button className="icon-button" aria-label="移除能力" onClick={clearCapability}><Icon name="close" /></button></div><div className="field-grid">{selectedCapability.inputs.map((field) => <label className="capability-input-field" key={field.id}><span>{field.label}{field.required ? "（必填）" : "（可选）"}</span>{field.control === "textarea" ? <textarea value={capabilityValues[field.id] ?? ""} maxLength={field.maxLength} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} rows={3} /> : <input value={capabilityValues[field.id] ?? ""} maxLength={field.maxLength} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} />}</label>)}</div>{selectedCapability.id === "public_repository_analysis" && mode === "fake" && <p className="offline-capability-note">离线演示只使用合成的 Harborlight 仓库，不会分析真实仓库；其他地址会被拒绝。真实分析需切换在线模式。</p>}</div>}
+            {attachments.length > 0 && <div className="attachment-chips" aria-label="当前对话附件">{attachments.map((item) => <button key={item.attachmentId} title={`${item.relativePath} · ${item.byteSize} bytes`} onClick={() => void downloadAttachment(item)}><Icon name="paperclip" /><span>{item.fileName}</span><small>{formatBytes(item.byteSize)}</small></button>)}</div>}
             <div className="composer-wrap">
               {showPicker && <div className="capability-picker"><div className="picker-title">选择已注册能力</div>{filteredCapabilities.length ? filteredCapabilities.map((capability) => <button key={capability.id} className="picker-option" onMouseDown={(event) => event.preventDefault()} onClick={() => chooseCapability(capability)}><span className="picker-icon"><Icon name="spark" /></span><span><strong>@{capability.name}</strong><small>{capability.description}</small></span><kbd>↵</kbd></button>) : <div className="picker-empty">没有匹配的已注册能力</div>}</div>}
               <textarea ref={textareaRef} value={text} onChange={(event) => onComposerChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !showPicker) { event.preventDefault(); void submit(); } if (event.key === "Escape" && showPicker) setShowPicker(false); }} placeholder={!canCompose ? "请先新建对话" : selectedCapability ? "能力参数请填写在上方；普通提示可移除能力后单独发送" : "给 PI Workbench 一个任务；输入 @ 可显式调用已注册能力"} rows={2} aria-label="输入你的任务" disabled={!canCompose || selectedCapability !== null} />
-              <div className="composer-toolbar"><div className="composer-tools"><button className="tool-button" title="附件入口将在后续版本提供" aria-label="附件"><Icon name="paperclip" /></button><span className="tool-separator" /><span className="composer-hint">Enter 发送 · Shift + Enter 换行</span></div><button className={`send-button ${busy ? "cancel" : ""}`} onClick={() => busy ? void cancel() : void submit()} aria-label={busy ? "取消运行" : "发送"} disabled={!canCompose && !busy}>{busy ? <Icon name="stop" /> : <Icon name="send" />}</button></div>
+              <div className="composer-toolbar"><div className="composer-tools"><button className="tool-button" title="导入本地文本附件" aria-label="附件" onClick={() => void openPicker("attachment")} disabled={!canCompose}><Icon name="paperclip" /></button><span className="tool-separator" /><span className="composer-hint">Enter 发送 · Shift + Enter 换行</span></div><button className={`send-button ${busy ? "cancel" : ""}`} onClick={() => busy ? void cancel() : void submit()} aria-label={busy ? "取消运行" : "发送"} disabled={!canCompose && !busy}>{busy ? <Icon name="stop" /> : <Icon name="send" />}</button></div>
               </div>
             {isWelcome && canCompose && <div className="suggestions">{SUGGESTIONS.map((suggestion, index) => <button key={suggestion} className="suggestion" onClick={() => setText(suggestion)}>{index === 0 && <Icon name="spark" />}{suggestion}</button>)}</div>}
             {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")} aria-label="关闭提示"><Icon name="close" /></button></div>}
@@ -492,6 +694,27 @@ export default function HomePage() {
         </>}
       </div>
     </main>
+    {showProjectPicker && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowProjectPicker(false); }}><section className="project-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="project-picker-title">
+      <div className="dialog-head"><div><h2 id="project-picker-title">{pickerMode === "project" ? "打开项目" : pickerMode === "attachment" ? "导入附件" : "项目规则"}</h2><p>{pickerMode === "project" ? "选择本机目录并确认授权。取消不会创建项目或对话。" : pickerMode === "attachment" ? "附件会复制到本地对象库；来源文件不会被修改。" : "只有你明确确认的规则会保存为本地记录；不会自动加载到 Agent。"}</p></div><button className="icon-button" onClick={() => setShowProjectPicker(false)} aria-label="关闭"><Icon name="close" /></button></div>
+      {pickerMode === "rules" ? <div className="rules-preview-panel">
+        {projectRules ? <><div className="rules-source">来源：{projectRules.sourcePath} · {projectRules.sourceVersion}</div><pre>{projectRules.content}</pre><div className="dialog-actions">{rulesAccepted ? <button className="quiet-button" onClick={() => void revokeProjectRules()}>撤回确认</button> : <button className="primary-action" onClick={() => void acceptProjectRules()} disabled={!rulesPreviewToken}>确认并保存规则</button>}<button className="quiet-button" onClick={() => setShowProjectPicker(false)}>关闭</button></div></> : <p className="picker-empty">{pickerNotice || "正在读取项目规则…"}</p>}
+      </div> : <>
+        {pickerMode === "project" && !pickerDirectory && <div className="recent-projects"><h3>最近项目</h3>{projects.length ? projects.map((project) => <button key={project.projectId} disabled={project.validationState !== "valid"} onClick={() => void startProjectConversation(project.projectId)}><Icon name="folder" /><span><strong>{project.displayName}</strong><small title={project.canonicalRoot}>{project.canonicalRoot}</small></span><em>{project.validationState === "valid" ? "打开新对话" : project.validationState === "missing" ? "目录不存在" : "需要重新确认"}</em></button>) : <p>还没有已打开的项目。</p>}</div>}
+        {!pickerDirectory ? <div className="picker-root-list"><h3>{pickerMode === "project" ? "选择允许目录" : "选择文件或文件夹"}</h3>{pickerRoots.map((root) => <button key={root.token} onClick={() => void browsePicker(root.token)}><Icon name="folder" /><span>{root.label}</span><small>浏览</small></button>)}{pickerRoots.length === 0 && <p>没有可用的允许目录。可通过 PI_WORKBENCH_PICKER_ROOTS 配置本地目录后重启服务。</p>}</div> : <div className="picker-browser">
+          <div className="picker-path-row">{pickerDirectory.parentToken && <button onClick={() => void browsePicker(pickerDirectory.parentToken!)}>‹ 上级</button>}<code title={pickerDirectory.displayPath}>{pickerDirectory.displayPath}</code></div>
+          <div className="picker-entry-list">{pickerDirectory.entries.map((entry) => <div className={`picker-entry ${entry.kind}`} key={`${entry.name}-${entry.token ?? entry.reason}`}>
+            {pickerMode === "attachment" && entry.kind === "file" && entry.token ? <input type="checkbox" checked={selectedFileTokens.includes(entry.token)} onChange={() => toggleFileToken(entry.token!, entry.byteSize ?? 0)} aria-label={`选择 ${entry.name}`} /> : <span className="picker-entry-icon"><Icon name={entry.kind === "directory" ? "folder" : entry.kind === "file" ? "paperclip" : "close"} /></span>}
+            {entry.kind === "directory" && entry.token ? <button className="picker-entry-name" onClick={() => void browsePicker(entry.token!)}>{entry.name}<small>文件夹</small></button> : <span className="picker-entry-name static">{entry.name}<small>{entry.kind === "file" ? formatBytes(entry.byteSize ?? 0) : entry.reason ?? "已跳过"}</small></span>}
+          </div>)}{pickerDirectory.entries.length === 0 && <p className="picker-empty">此目录为空。</p>}</div>
+          {pickerDirectory.truncated && <p className="picker-limit-note">目录项目超过 500 项，仅显示前 500 项。导入文件夹时仍会按服务器扫描上限处理。</p>}
+          {pickerMode === "attachment" && <p className="picker-limit-note">已选择 {selectedFileTokens.length}/100 个文件 · {formatBytes(selectedFileBytes)} / 20 MiB。仅导入文本文件；敏感、二进制和超限项目会显示跳过原因。</p>}
+          {pickerMode === "project" && pickerDirectory.canSelectProject && <label className="project-name-field"><span>项目名称</span><input value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder={pickerDirectory.displayPath.split(/[\\/]/u).filter(Boolean).at(-1) ?? "项目"} maxLength={256} /></label>}
+        </div>}
+        {pickerNotice && <div className="picker-feedback" role="status">{pickerNotice}</div>}
+        {pickerSkipped.length > 0 && <div className="picker-skipped"><strong>跳过项目</strong>{pickerSkipped.slice(0, 12).map((item, index) => <div key={`${item.path}-${index}`}><span>{item.path}</span><small>{item.reason}</small></div>)}</div>}
+        <div className="dialog-actions"><button className="quiet-button" onClick={() => setShowProjectPicker(false)}>取消</button>{pickerMode === "project" ? <button className="primary-action" onClick={() => void openSelectedProject()} disabled={!pickerDirectory?.canSelectProject}>打开此项目</button> : <><button className="quiet-button" onClick={() => void importSelectedFiles(pickerDirectory?.parentToken ? pickerDirectory.directoryToken : undefined)} disabled={!pickerDirectory?.parentToken}>导入此文件夹</button><button className="primary-action" onClick={() => void importSelectedFiles()} disabled={!selectedFileTokens.length}>导入所选文件（{selectedFileTokens.length}）</button></>}</div>
+      </>}
+    </section></div>}
     {showSettings && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSettings(false); }}><section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="dialog-head"><h2 id="settings-title">设置和更多</h2><button className="icon-button" onClick={() => setShowSettings(false)} aria-label="关闭"><Icon name="close" /></button></div><div className="settings-row"><div><strong>模型模式</strong><p>{mode === "fake" ? "离线模拟，无真实模型调用" : "DeepSeek Flash；密钥仅由服务端读取"}</p></div><span className={`mode-pill ${mode === "fake" ? "offline" : "online"}`}>{mode === "fake" ? "离线演示" : "在线"}</span></div><div className="settings-row"><div><strong>对话存储</strong><p>保存在本机数据目录的 SQLite 数据库中；服务重启后保留</p></div></div><p className="settings-footnote">本地 API 默认绑定 127.0.0.1。此页面不会读取或保存 API Key。</p></section></div>}
   </div>;
 }

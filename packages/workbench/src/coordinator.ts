@@ -4,9 +4,9 @@ import path from "node:path";
 import { StorageError, openStorage, resolveDataDirectory, type JsonValue, type Storage, type WorkerIdentityRecord } from "@pi-workbench/storage";
 import {
   parse, parseV2Error, parseV2Run, parseV2RunEvent, parseV2EventCursor, parseWorkbenchEvent, parseWorkbenchResult,
-  RunSubmissionSchema, WorkbenchRunSchema, WorkbenchStreamResetSchema,
+  RunSubmissionSchema, V2ImportResultSchema, V2ProjectSchema, V2ProjectRulesSchema, WorkbenchRunSchema, WorkbenchStreamResetSchema,
   type Conversation, type ConversationMessage, type ConversationSummary, type RunSubmission, type V2Conversation,
-  type V2ConversationSummary, type V2Error, type V2EventCursor, type V2Run, type V2RunEvent, type V2RunStatus,
+  type V2ConversationSummary, type V2Error, type V2EventCursor, type V2ImportResult, type V2Project, type V2ProjectRules, type V2Run, type V2RunEvent, type V2RunStatus,
   type WorkbenchArtifact, type WorkbenchEvent, type WorkbenchResult, type WorkbenchRun, type WorkbenchRunStatus, type WorkbenchStreamReset,
 } from "@pi-workbench/protocol";
 import type { ConversationSessionSnapshot } from "@pi-workbench/agent-runtime";
@@ -14,6 +14,7 @@ import { WorkerClient, type WorkerTaskResult } from "./worker-client.js";
 import type { WorkerEventPayload } from "./worker-ipc.js";
 import { publicRepositoryCapability } from "./registry.js";
 import type { WorkbenchMode } from "./model-config.js";
+import { ProjectPickerService, type PickerSessionStart } from "./project-picker.js";
 
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
 const EVENT_LIMIT = 1000;
@@ -21,7 +22,7 @@ const KEY_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
 
 export interface WorkbenchServiceOptions {
   mode: WorkbenchMode; apiKey?: string; githubToken?: string; dataDirectory?: string; fixtureRoot?: string;
-  workerEntryPath?: string; workerStartupTimeoutMs?: number;
+  workerEntryPath?: string; workerStartupTimeoutMs?: number; pickerRoots?: string[];
 }
 export interface WorkbenchError extends Error {
   statusCode: number;
@@ -101,6 +102,8 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   const fixtureRoot = path.resolve(options.fixtureRoot ?? path.join(process.cwd(), "fixtures", "synthetic-ts-repo"));
   const workerEntryPath = path.resolve(options.workerEntryPath ?? new URL("../../../apps/worker/src/main.ts", import.meta.url).pathname);
   const storage = openStorage({ dataDirectory: { dataDirectory } });
+  const picker = new ProjectPickerService(storage, dataDirectory, options.pickerRoots ?? []);
+  await picker.initialize();
   const subscribers = new Map<string, Set<(event: V2RunEvent) => void>>();
   let worker: WorkerClient | undefined;
   let activeExecution: Promise<void> | undefined;
@@ -139,14 +142,14 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     });
     const last = messages.at(-1);
     return {
-      schemaVersion: 2, conversationId, title: record.title, createdAt: record.createdAt, updatedAt: record.updatedAt,
+      schemaVersion: 2, conversationId, title: record.title, projectId: record.projectId, createdAt: record.createdAt, updatedAt: record.updatedAt,
       preview: (last?.content ?? "").replace(/\s+/gu, " ").slice(0, 256), messageCount: messages.length, messages,
     };
   }
   function v2Summary(conversationId: string): V2ConversationSummary {
     const conversation = v2Conversation(conversationId);
     return {
-      schemaVersion: 2, conversationId, title: conversation.title, createdAt: conversation.createdAt,
+      schemaVersion: 2, conversationId, title: conversation.title, projectId: conversation.projectId, createdAt: conversation.createdAt,
       updatedAt: conversation.updatedAt, preview: conversation.preview, messageCount: conversation.messageCount,
     };
   }
@@ -509,18 +512,18 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     return { result: parseWorkbenchResult(value.result), ...(value.artifacts ? { artifacts: value.artifacts } : {}) };
   }
   function v2RunWithResult(runId: string): V2Run { return v2Run(runId); }
-  function createConversationV2(): V2Conversation { return createConversationRecord(); }
-  function createConversationRecord(): V2Conversation {
+  function createConversationV2(): V2Conversation { return createConversationRecord(null); }
+  function createConversationRecord(projectId: string | null): V2Conversation {
     const id = randomUUID();
     const createdAt = now();
-    storage.conversations.create({ id, projectId: null, piSessionId: null, title: "新对话", createdAt, updatedAt: createdAt });
+    storage.conversations.create({ id, projectId, piSessionId: null, title: "新对话", createdAt, updatedAt: createdAt });
     return v2Conversation(id);
   }
   function listConversationV2(): V2ConversationSummary[] {
     return storage.conversations.list().map((item) => v2Summary(item.id));
   }
   function deleteConversation(conversationId: string): void {
-    try { storage.conversations.deletePermanently(conversationId); }
+    try { storage.conversations.deletePermanently(conversationId); void picker.flushGarbage().catch(() => undefined); }
     catch (error) { translateError(error); }
   }
   function listRunsV2(conversationId: string): V2Run[] {
@@ -594,6 +597,40 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     if (createHash("sha256").update(bytes).digest("hex") !== location.sha256) throw makeError("not_found", "Artifact integrity validation failed.", 404);
     return { bytes, contentType: kind.endsWith(".json") ? "application/json; charset=utf-8" : "text/plain; charset=utf-8" };
   }
+  function v2Project(record: ReturnType<typeof storage.projects.get>): V2Project {
+    if (!record) throw makeError("not_found", "Project not found.", 404);
+    return parse(V2ProjectSchema, { schemaVersion: 2, projectId: record.id, displayName: record.displayName,
+      canonicalRoot: record.canonicalRoot, validationState: record.validationState, createdAt: record.createdAt, lastAccessedAt: record.lastAccessedAt });
+  }
+  function v2ProjectRules(record: ReturnType<typeof storage.projectRules.get>): V2ProjectRules | null {
+    if (!record || record.revokedAt) return null;
+    return parse(V2ProjectRulesSchema, { schemaVersion: 2, projectId: record.projectId, sourcePath: record.sourcePath,
+      sourceSha256: record.sourceSha256, sourceVersion: record.sourceVersion, content: record.content, acceptedAt: record.acceptedAt, revokedAt: null });
+  }
+  async function openProject(sessionId: string, token: string, displayName?: string) {
+    const project = await picker.openProject(sessionId, token, displayName);
+    return { schemaVersion: 2 as const, project: v2Project(project), conversation: createConversationRecord(project.id) };
+  }
+  async function createProjectConversation(projectId: string) {
+    const project = await picker.reopenProject(projectId);
+    return createConversationRecord(project.id);
+  }
+  async function importAttachments(sessionId: string, conversationId: string, fileTokens: string[], directoryToken?: string): Promise<V2ImportResult> {
+    getConversationRecord(conversationId);
+    const imported = await picker.importAttachments(sessionId, conversationId, fileTokens, directoryToken);
+    const value = parse(V2ImportResultSchema, { schemaVersion: 2,
+      attachments: imported.attachments.map((item) => ({ schemaVersion: 2, attachmentId: item.id, conversationId: item.conversationId,
+        fileName: item.fileName, relativePath: item.relativePath, byteSize: item.byteSize, mediaType: item.mediaType, createdAt: item.createdAt })),
+      skipped: imported.skipped, totalBytes: imported.totalBytes,
+    });
+    return value;
+  }
+  async function readConversationAttachment(conversationId: string, attachmentId: string) {
+    getConversationRecord(conversationId);
+    const attachment = storage.attachments.getForConversation(attachmentId, conversationId);
+    if (!attachment) throw makeError("not_found", "Attachment not found.", 404);
+    return { attachment, bytes: await picker.readAttachment(attachment) };
+  }
   function translateError(error: unknown): never {
     if (error instanceof StorageError) {
       const status = error.code === "not_found" ? 404 : error.code === "active_task" ? 409 : error.code === "db_busy" ? 503 : error.code === "db_readonly" ? 503 : 409;
@@ -608,7 +645,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     mode: options.mode,
     get workerReady() { return Boolean(worker && worker.isAlive && !workerUnavailable); },
     listCapabilities: () => [structuredClone(publicRepositoryCapability)],
-    createConversation: () => legacyConversation(createConversationRecord().conversationId),
+    createConversation: () => legacyConversation(createConversationRecord(null).conversationId),
     listConversations: () => listConversationV2().map((item) => legacySummary(item.conversationId)),
     getConversation: (id: string) => legacyConversation(id),
     deleteConversation,
@@ -620,6 +657,27 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     subscribeEvents: subscribeLegacy,
     readArtifact,
     createConversationV2,
+    createConversationRecord,
+    createPickerSession: (origin: string): PickerSessionStart => picker.startSession(origin),
+    validatePickerSession: picker.validateSession.bind(picker),
+    pickerRoots: picker.listRoots.bind(picker),
+    browsePickerDirectory: picker.browse.bind(picker),
+    prepareProjectSelection: picker.prepareProjectSelection.bind(picker),
+    openProject,
+    listProjects: async () => (await picker.recentProjects()).map((record) => v2Project(record)),
+    createProjectConversation,
+    listConversationAttachments: (conversationId: string) => {
+      getConversationRecord(conversationId);
+      return storage.attachments.list(conversationId).map((item) => ({ schemaVersion: 2 as const, attachmentId: item.id,
+        conversationId: item.conversationId, fileName: item.fileName, relativePath: item.relativePath, byteSize: item.byteSize,
+        mediaType: item.mediaType, createdAt: item.createdAt }));
+    },
+    importAttachments,
+    readConversationAttachment,
+    projectRules: (projectId: string) => v2ProjectRules(storage.projectRules.get(projectId)),
+    previewProjectRules: picker.previewRules.bind(picker),
+    acceptProjectRules: picker.acceptRules.bind(picker),
+    revokeProjectRules: picker.revokeRules.bind(picker),
     listConversationV2,
     getConversationV2: v2Conversation,
     deleteConversationV2: deleteConversation,

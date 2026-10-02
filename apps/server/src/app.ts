@@ -1,6 +1,9 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import { isIP } from "node:net";
 import {
   parse, V2ErrorSchema, V2EventCursorSchema, V2SubmitRunRequestSchema,
+  V2AttachmentImportRequestSchema, V2PickerBrowseRequestSchema, V2PickerOpenProjectRequestSchema,
+  V2PickerSelectProjectRequestSchema, V2ProjectRulesAcceptRequestSchema,
   WorkbenchApiErrorSchema, type V2Error, type V2SubmitRunRequest,
 } from "@pi-workbench/protocol";
 import { createWorkbenchService, type WorkbenchServiceOptions, type ServiceError } from "./service.js";
@@ -8,6 +11,49 @@ import { createWorkbenchService, type WorkbenchServiceOptions, type ServiceError
 function parseRequest(value: unknown): V2SubmitRunRequest {
   try { return parse(V2SubmitRunRequestSchema, value); }
   catch { throw Object.assign(new Error("请求字段或协议版本无效。"), { statusCode: 400, code: "invalid_request" }); }
+}
+function parsePickerBody<T>(schema: Parameters<typeof parse>[0], value: unknown): T {
+  try { return parse(schema, value) as T; }
+  catch { throw Object.assign(new Error("请求字段或协议版本无效。"), { statusCode: 400, code: "invalid_request" }); }
+}
+function header(request: { headers: Record<string, string | string[] | undefined> }, name: string): string | undefined {
+  const value = request.headers[name]; return Array.isArray(value) ? value[0] : value;
+}
+function localHostname(hostname: string): boolean {
+  const normalized = hostname.replace(/^\[|\]$/gu, "").toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+function localHostHeader(value: string | undefined): boolean {
+  if (!value) return false;
+  try { return localHostname(new URL(`http://${value}`).hostname); } catch { return false; }
+}
+function localSocket(address: string | undefined): boolean {
+  if (!address) return false;
+  const normalized = address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
+  if (normalized === "::1") return true;
+  return isIP(normalized) === 4 && normalized.startsWith("127.");
+}
+function checkedOrigin(request: import("fastify").FastifyRequest, required: boolean): string | undefined {
+  const origin = header(request, "origin");
+  if (!origin && !required) return undefined;
+  if (!origin || !localSocket(request.raw.socket.remoteAddress) || !localHostHeader(header(request, "host")) || !localHostHeader(header(request, "x-forwarded-host")) && header(request, "x-forwarded-host") !== undefined) {
+    throw Object.assign(new Error("仅允许来自本机工作台的请求。"), { statusCode: 403, code: "invalid_request" });
+  }
+  if (header(request, "sec-fetch-site") === "cross-site") throw Object.assign(new Error("已拒绝跨站本地请求。"), { statusCode: 403, code: "invalid_request" });
+  let parsed: URL;
+  try { parsed = new URL(origin); } catch { throw Object.assign(new Error("请求来源无效。"), { statusCode: 403, code: "invalid_request" }); }
+  if (!localHostname(parsed.hostname) || !["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+    throw Object.assign(new Error("仅允许来自本机工作台的请求。"), { statusCode: 403, code: "invalid_request" });
+  }
+  return parsed.origin;
+}
+function sessionCookie(request: import("fastify").FastifyRequest): string | undefined {
+  const cookie = header(request, "cookie");
+  for (const pair of cookie?.split(";") ?? []) {
+    const [name, ...value] = pair.trim().split("=");
+    if (name === "piwb_picker_session") return value.join("=");
+  }
+  return undefined;
 }
 
 export async function createWorkbenchApp(options: WorkbenchServiceOptions): Promise<FastifyInstance> {
@@ -62,6 +108,67 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
   }
 
   app.get("/api/v2/health", async () => ({ schemaVersion: 2, status: "ok", mode: service.mode, workerReady: service.workerReady }));
+  app.post("/api/v2/picker/session", async (request, reply) => {
+    const origin = checkedOrigin(request, true)!;
+    const session = service.createPickerSession(origin);
+    const secure = origin.startsWith("https:") ? "; Secure" : "";
+    reply.header("set-cookie", `piwb_picker_session=${session.sessionId}; HttpOnly; SameSite=Strict; Path=/api/v2; Max-Age=14400${secure}`);
+    reply.header("cache-control", "no-store");
+    return { schemaVersion: 2, csrfToken: session.csrfToken, expiresAt: session.expiresAt };
+  });
+  function requirePickerSession(request: import("fastify").FastifyRequest, unsafe = false): string {
+    const origin = checkedOrigin(request, unsafe);
+    const sessionId = sessionCookie(request);
+    service.validatePickerSession(sessionId, header(request, "x-csrf-token"), origin);
+    return sessionId!;
+  }
+  app.get<{ Querystring: { mode?: "project" | "attachment" } }>("/api/v2/picker/roots", async (request) => {
+    const mode = request.query.mode;
+    if (mode !== "project" && mode !== "attachment") throw Object.assign(new Error("选择器模式无效。"), { statusCode: 400, code: "invalid_request" });
+    return service.pickerRoots(requirePickerSession(request), mode);
+  });
+  app.post("/api/v2/picker/browse", async (request) => {
+    const sessionId = requirePickerSession(request, true);
+    const body = parsePickerBody<{ schemaVersion: 2; mode: "project" | "attachment"; directoryToken: string }>(V2PickerBrowseRequestSchema, request.body);
+    return service.browsePickerDirectory(sessionId, body.directoryToken, body.mode);
+  });
+  app.post("/api/v2/picker/project-selection", async (request) => {
+    const sessionId = requirePickerSession(request, true);
+    const body = parsePickerBody<{ schemaVersion: 2; directoryToken: string }>(V2PickerSelectProjectRequestSchema, request.body);
+    return { schemaVersion: 2, ...service.prepareProjectSelection(sessionId, body.directoryToken) };
+  });
+  app.post("/api/v2/picker/open-project", async (request, reply) => {
+    const sessionId = requirePickerSession(request, true);
+    const body = parsePickerBody<{ schemaVersion: 2; selectionToken: string; displayName?: string }>(V2PickerOpenProjectRequestSchema, request.body);
+    return reply.code(201).send(await service.openProject(sessionId, body.selectionToken, body.displayName));
+  });
+  app.get("/api/v2/projects", async (request) => {
+    requirePickerSession(request);
+    return { schemaVersion: 2, projects: await service.listProjects() };
+  });
+  app.post<{ Params: { projectId: string } }>("/api/v2/projects/:projectId/conversations", async (request, reply) => {
+    requirePickerSession(request, true);
+    return reply.code(201).send(await service.createProjectConversation(request.params.projectId));
+  });
+  app.get<{ Params: { projectId: string } }>("/api/v2/projects/:projectId/rules", async (request) => {
+    requirePickerSession(request);
+    return { schemaVersion: 2, rules: service.projectRules(request.params.projectId) };
+  });
+  app.post<{ Params: { projectId: string } }>("/api/v2/projects/:projectId/rules/preview", async (request) => {
+    const sessionId = requirePickerSession(request, true);
+    return { schemaVersion: 2, ...await service.previewProjectRules(sessionId, request.params.projectId) };
+  });
+  app.post<{ Params: { projectId: string } }>("/api/v2/projects/:projectId/rules/accept", async (request) => {
+    const sessionId = requirePickerSession(request, true);
+    const body = parsePickerBody<{ schemaVersion: 2; previewToken: string }>(V2ProjectRulesAcceptRequestSchema, request.body);
+    const accepted = await service.acceptProjectRules(sessionId, body.previewToken, request.params.projectId);
+    return { schemaVersion: 2, rules: service.projectRules(accepted.projectId) };
+  });
+  app.delete<{ Params: { projectId: string } }>("/api/v2/projects/:projectId/rules", async (request) => {
+    requirePickerSession(request, true);
+    service.revokeProjectRules(request.params.projectId);
+    return { schemaVersion: 2, revoked: true, projectId: request.params.projectId };
+  });
   app.get("/api/v2/capabilities", async () => ({ schemaVersion: 2, capabilities: service.listCapabilities() }));
   app.get("/api/v2/conversations", async () => ({ schemaVersion: 2, conversations: service.listConversationV2() }));
   app.post("/api/v2/conversations", async (_request, reply) => reply.code(201).send(service.createConversationV2()));
@@ -71,6 +178,22 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
     return { schemaVersion: 2, deleted: true, conversationId: request.params.conversationId };
   });
   app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/runs", async (request) => ({ schemaVersion: 2, runs: service.listRunsV2(request.params.conversationId) }));
+  app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/attachments", async (request) => {
+    requirePickerSession(request);
+    return { schemaVersion: 2, attachments: service.listConversationAttachments(request.params.conversationId) };
+  });
+  app.post<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/attachments/import", async (request) => {
+    const sessionId = requirePickerSession(request, true);
+    const body = parsePickerBody<{ schemaVersion: 2; fileTokens: string[]; directoryToken?: string }>(V2AttachmentImportRequestSchema, request.body);
+    return service.importAttachments(sessionId, request.params.conversationId, body.fileTokens, body.directoryToken);
+  });
+  app.get<{ Params: { conversationId: string; attachmentId: string } }>("/api/v2/conversations/:conversationId/attachments/:attachmentId", async (request, reply) => {
+    requirePickerSession(request);
+    const item = await service.readConversationAttachment(request.params.conversationId, request.params.attachmentId);
+    const fileName = encodeURIComponent(item.attachment.fileName).replaceAll("'", "%27");
+    return reply.type(item.attachment.mediaType).header("content-disposition", `attachment; filename*=UTF-8''${fileName}`)
+      .header("x-content-type-options", "nosniff").header("cache-control", "no-store").send(item.bytes);
+  });
   app.post<{ Headers: { "idempotency-key"?: string } }>("/api/v2/runs", async (request, reply) => {
     const body = parseRequest(request.body);
     const submitted = service.submitV2(body.conversationId, body.input, request.headers["idempotency-key"] ?? "");

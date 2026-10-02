@@ -36,13 +36,31 @@ test("stable data directory honors override, XDG, and home fallback", () => {
 
 test("new database migrates to WAL/FULL with foreign keys, and repeated open preserves schema", () => withDb((_root, path) => {
   const first = openStorage({ path });
-  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 2 });
+  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 3 });
   assert.equal(first.projects.list().length, 0);
   first.close();
   const reopened = openStorage({ path });
-  assert.equal(reopened.diagnostics.schemaVersion, 2);
+  assert.equal(reopened.diagnostics.schemaVersion, 3);
   assert.equal(reopened.projects.list().length, 0);
   reopened.close();
+}));
+
+test("attachment references stay scoped and conversation deletion queues only unshared objects", () => withDb((_root, path) => {
+  const store = openStorage({ path });
+  store.conversations.create({ id: "conversation_one", projectId: null, piSessionId: null, title: "One" });
+  store.conversations.create({ id: "conversation_two", projectId: null, piSessionId: null, title: "Two" });
+  const shared = "a".repeat(64); const unique = "b".repeat(64);
+  store.attachments.add({ id: "attachment_one", conversationId: "conversation_one", objectSha256: shared, fileName: "shared.txt", relativePath: "shared.txt", byteSize: 7, mediaType: "text/plain; charset=utf-8" });
+  store.attachments.add({ id: "attachment_unique", conversationId: "conversation_one", objectSha256: unique, fileName: "unique.txt", relativePath: "unique.txt", byteSize: 6, mediaType: "text/plain; charset=utf-8" });
+  store.attachments.add({ id: "attachment_two", conversationId: "conversation_two", objectSha256: shared, fileName: "shared-copy.txt", relativePath: "shared.txt", byteSize: 7, mediaType: "text/plain; charset=utf-8" });
+  assert.equal(store.attachments.getForConversation("attachment_two", "conversation_one"), undefined);
+  store.conversations.deletePermanently("conversation_one");
+  assert.equal(store.attachments.list("conversation_one").length, 0);
+  assert.equal(store.attachments.list("conversation_two").length, 1);
+  assert.deepEqual(store.garbage.list().filter((item) => item.kind === "attachment_object").map((item) => item.objectRef), [unique]);
+  store.conversations.deletePermanently("conversation_two");
+  assert.deepEqual(store.garbage.list().filter((item) => item.kind === "attachment_object").map((item) => item.objectRef).sort(), [shared, unique].sort());
+  store.close();
 }));
 
 test("nested repository calls participate in the outer storage transaction", () => withDb((_root, path) => {
