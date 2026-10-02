@@ -27,12 +27,14 @@ export function loadCoreMigrations(): readonly StorageMigration[] {
   const projectAttachments = readFileSync(new URL("./migrations/003_project_attachments.sql", import.meta.url), "utf8");
   const fileChanges = readFileSync(new URL("./migrations/004_file_changes.sql", import.meta.url), "utf8");
   const filePostIdentity = readFileSync(new URL("./migrations/005_file_post_identity.sql", import.meta.url), "utf8");
+  const capabilityStates = readFileSync(new URL("./migrations/006_capability_states.sql", import.meta.url), "utf8");
   return [
     { version: 1, name: "core", sql: core },
     { version: 2, name: "worker_recovery", sql: worker },
     { version: 3, name: "project_attachments", sql: projectAttachments },
     { version: 4, name: "file_changes", sql: fileChanges },
     { version: 5, name: "file_post_identity", sql: filePostIdentity },
+    { version: 6, name: "capability_states", sql: capabilityStates },
   ];
 }
 

@@ -4,18 +4,20 @@ import path from "node:path";
 import { StorageError, openStorage, resolveDataDirectory, type JsonValue, type Storage, type WorkerIdentityRecord } from "@pi-workbench/storage";
 import {
   parse, parseV2Error, parseV2Run, parseV2RunEvent, parseV2EventCursor, parseWorkbenchEvent, parseWorkbenchResult,
-  RunSubmissionSchema, V2ImportResultSchema, V2ProjectSchema, V2ProjectRulesSchema, V2ChangesetSchema, V2ChangesetSummarySchema,
+  RunSubmissionSchema, V2CreateRunSubmissionSchema, V2RunSubmissionSchema, V2ImportResultSchema, V2ProjectSchema, V2ProjectRulesSchema, V2ChangesetSchema, V2ChangesetSummarySchema,
   V2FileOperationSchema, V2FileDiffSchema, V2AttachmentResultSchema, V2CleanupPreviewSchema, V2CleanupResultSchema, V2ChangesetUndoResultSchema,
-  WorkbenchRunSchema, WorkbenchStreamResetSchema,
-  type Conversation, type ConversationMessage, type ConversationSummary, type RunSubmission, type V2Conversation,
-  type V2ConversationSummary, type V2Error, type V2EventCursor, type V2ImportResult, type V2Project, type V2ProjectRules, type V2Run, type V2RunEvent, type V2RunStatus,
+  WorkbenchStreamResetSchema,
+  type Conversation, type ConversationMessage, type ConversationSummary, type V2Conversation,
+  type V2ConversationSummary, type V2CreateRunSubmission, type V2Error, type V2EventCursor, type V2ImportResult, type V2Project, type V2ProjectRules, type V2Run, type V2RunEvent, type V2RunStatus, type V2RunSubmission,
   type V2Changeset, type V2ChangesetSummary, type V2AttachmentResult, type V2CleanupPreview, type V2CleanupResult, type V2ChangesetUndoResult,
   type WorkbenchArtifact, type WorkbenchEvent, type WorkbenchResult, type WorkbenchRun, type WorkbenchRunStatus, type WorkbenchStreamReset,
 } from "@pi-workbench/protocol";
 import type { ConversationSessionSnapshot } from "@pi-workbench/agent-runtime";
 import { WorkerClient, type WorkerTaskResult } from "./worker-client.js";
 import type { WorkerEventPayload } from "./worker-ipc.js";
-import { publicRepositoryCapability } from "./registry.js";
+import { createCapabilityRegistry, CapabilityRegistryError, publicRepositoryCapability } from "./registry.js";
+import { createPublicRepositoryAnalysisExtension } from "./public-repository-extension.js";
+import { createDevelopmentGreetingExtension } from "./development-extension.js";
 import type { WorkbenchMode } from "./model-config.js";
 import { ProjectPickerService, type PickerSessionStart } from "./project-picker.js";
 import { recoverPreparedFileOperations } from "./file-journal.js";
@@ -53,16 +55,26 @@ function makeError(code: WorkbenchError["code"], message: string, statusCode: nu
 function now(): string { return new Date().toISOString(); }
 function hash(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
 function terminal(status: V2RunStatus): boolean { return ["completed", "failed", "cancelled", "interrupted"].includes(status); }
+function extensionPrompt(input: Extract<V2RunSubmission, { kind: "capability" }>): string {
+  return input.prompt ?? (typeof input.input.goal === "string" ? input.input.goal : "");
+}
+function workerFailureError(code: string, message: string): V2Error {
+  const extensionCodes = new Set([
+    "unknown_extension", "extension_disabled", "extension_unconfigured", "extension_incompatible",
+    "extension_permission_denied", "extension_invalid_input", "extension_invalid_config",
+  ]);
+  return parseV2Error({ schemaVersion: 2, code: extensionCodes.has(code) ? code : "internal_error", message: message.slice(0, 512) || "Run failed.", retryable: false });
+}
 function legacyStatus(status: V2RunStatus): WorkbenchRunStatus {
   if (status === "accepted") return "queued";
   if (status === "interrupted") throw makeError("upgrade_required", "This run uses the v2 interrupted state; use the v2 API.", 426);
   return status;
 }
-function displayText(input: RunSubmission): string {
-  return input.kind === "message" ? input.text : `已请求“${publicRepositoryCapability.name}”：${input.input.goal}`;
+function displayText(input: V2CreateRunSubmission | V2RunSubmission, capabilityName: string): string {
+  return input.kind === "message" ? input.text : `已请求“${capabilityName}”：${extensionPrompt(input)}`;
 }
-function titleFor(input: RunSubmission): string {
-  const text = input.kind === "message" ? input.text : `${publicRepositoryCapability.name}：${input.input.goal}`;
+function titleFor(input: V2CreateRunSubmission | V2RunSubmission, capabilityName: string): string {
+  const text = input.kind === "message" ? input.text : `${capabilityName}：${extensionPrompt(input)}`;
   return text.replace(/\s+/gu, " ").trim().slice(0, 72) || "新对话";
 }
 type CapabilityConversationMessage = Extract<ConversationMessage, { role: "capability" }>;
@@ -75,8 +87,16 @@ function parseCapabilityMessage(record: { role: string; content: string; extensi
     return input.kind === "capability" ? { capabilityId: input.capabilityId, input: input.input } : undefined;
   } catch { return undefined; }
 }
-function serializeCapabilityContent(input: Extract<RunSubmission, { kind: "capability" }>): string {
-  return JSON.stringify({ display: displayText(input), input: input.input });
+function storedCapabilityMessage(record: { role: string; content: string; extensionId: string | null }): { capabilityId: string; input: Record<string, unknown>; display: string } | undefined {
+  if (record.role !== "capability" || !record.extensionId) return undefined;
+  try {
+    const parsed = JSON.parse(record.content) as { display?: unknown; input?: unknown };
+    if (typeof parsed.display !== "string" || !parsed.input || typeof parsed.input !== "object" || Array.isArray(parsed.input)) return undefined;
+    return { capabilityId: record.extensionId, input: parsed.input as Record<string, unknown>, display: parsed.display };
+  } catch { return undefined; }
+}
+function serializeCapabilityContent(input: Extract<V2RunSubmission, { kind: "capability" }>, capabilityName: string): string {
+  return JSON.stringify({ display: displayText(input, capabilityName), input: input.input });
 }
 
 function procStart(pid: number): Promise<string | undefined> {
@@ -111,6 +131,10 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   const storage = openStorage({ dataDirectory: { dataDirectory } });
   const picker = new ProjectPickerService(storage, dataDirectory, options.pickerRoots ?? []);
   await picker.initialize();
+  const capabilityRegistry = createCapabilityRegistry([
+    createPublicRepositoryAnalysisExtension({ mode: options.mode, dataDirectory, fixtureRoot, apiKey: options.apiKey, githubToken: options.githubToken }),
+    createDevelopmentGreetingExtension(),
+  ]);
   const subscribers = new Map<string, Set<(event: V2RunEvent) => void>>();
   let worker: WorkerClient | undefined;
   let activeExecution: Promise<void> | undefined;
@@ -134,6 +158,8 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
       if (message.role === "capability") {
         const restored = parseCapabilityMessage(message);
         if (restored) return { schemaVersion: 1 as const, id: message.id, role: "capability" as const, text: JSON.parse(message.content).display as string, createdAt: message.createdAt, ...restored };
+        const generic = storedCapabilityMessage(message);
+        if (generic) return { schemaVersion: 1 as const, id: message.id, role: "assistant" as const, text: generic.display.slice(0, 16_000), createdAt: message.createdAt };
       }
       return { schemaVersion: 1 as const, id: message.id, role: message.role as "user" | "assistant", text: message.content.slice(0, 16_000), createdAt: message.createdAt };
     });
@@ -141,11 +167,11 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   function v2Conversation(conversationId: string): V2Conversation {
     const record = getConversationRecord(conversationId);
     const messages = storage.messages.list(conversationId).map((message) => {
-      const input = parseCapabilityMessage(message);
+      const capability = storedCapabilityMessage(message);
       return {
         schemaVersion: 2 as const, messageId: message.id, conversationId, sequence: message.sequence,
-        role: message.role, content: message.role === "capability" && input ? JSON.parse(message.content).display as string : message.content,
-        createdAt: message.createdAt, extensionId: message.extensionId, ...(input ? { capabilityInput: input.input } : {}),
+        role: message.role, content: capability ? capability.display : message.content,
+        createdAt: message.createdAt, extensionId: message.extensionId, ...(capability ? { capabilityInput: capability.input } : {}),
       };
     });
     const last = messages.at(-1);
@@ -164,7 +190,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   function v2Run(runId: string): V2Run {
     const record = getRunRecord(runId);
     const { request, ...base } = record;
-    const input = parse(RunSubmissionSchema, request);
+    const input = parse(V2RunSubmissionSchema, request);
     const stored = storage.results.get(runId) as { result?: unknown; artifacts?: unknown } | undefined;
     const result = stored?.result ? parseWorkbenchResult(stored.result) : undefined;
     const currentAttempt = storage.attempts.list(runId).at(-1);
@@ -184,10 +210,19 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   }
   function legacyRun(runId: string): WorkbenchRun {
     const run = v2Run(runId);
+    const input = run.input?.kind === "capability"
+      ? (run.input.capabilityId === publicRepositoryCapability.id
+        ? { kind: "capability" as const, capabilityId: publicRepositoryCapability.id as "public_repository_analysis", input: {
+          repositoryUrl: String(run.input.input.repositoryUrl ?? "https://github.com/demo/harborlight"),
+          ...(typeof run.input.input.ref === "string" ? { ref: run.input.input.ref } : {}),
+          goal: run.input.prompt ?? (typeof run.input.input.goal === "string" ? run.input.input.goal : "扩展运行记录"),
+        } }
+        : { kind: "message" as const, text: `已调用扩展 ${run.input.capabilityId}：${run.input.prompt ?? ""}` })
+      : run.input!;
     return {
       schemaVersion: 1, runId: run.runId, conversationId: run.conversationId,
       status: legacyStatus(run.status), createdAt: run.createdAt, updatedAt: run.updatedAt,
-      input: run.input!, ...(run.retryOfRunId ? { retryOfRunId: run.retryOfRunId } : {}), ...(run.result ? { result: run.result } : {}),
+      input, ...(run.retryOfRunId ? { retryOfRunId: run.retryOfRunId } : {}), ...(run.result ? { result: run.result } : {}),
     };
   }
 
@@ -376,7 +411,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
       ...(rulesRecord && !rulesRecord.revokedAt ? { acceptedRules: { sourcePath: rulesRecord.sourcePath, sourceSha256: rulesRecord.sourceSha256, content: rulesRecord.content } } : {}),
     } : undefined;
     try {
-      const result = await client.execute({ runId, attemptId: currentAttempt.attemptId, conversationId: run.conversationId, input: parse(RunSubmissionSchema, run.request),
+      const result = await client.execute({ runId, attemptId: currentAttempt.attemptId, conversationId: run.conversationId, input: parse(V2RunSubmissionSchema, run.request),
         ...(initialUsage ? { initialUsage } : {}), initialUsageComplete,
         ...(snapshot ? { snapshot } : {}), ...(project ? { project } : {}) }, {
         onEvent: (event) => { persistWorkerEvent(runId, event); },
@@ -446,11 +481,11 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
       storage.fileChangesets.finalizeRun(runId, terminalAt);
       storage.results.save(runId, { result, artifacts: locations.map((entry) => ({ kind: entry.kind, path: entry.path, sha256: entry.sha256 })) }, terminalAt);
       if (attempt.status === "running") {
-        const error = result.status === "failed" ? parseV2Error({ schemaVersion: 2, code: "internal_error", message: result.error.message.slice(0, 512) || "Run failed.", retryable: false }) : undefined;
+        const error = result.status === "failed" ? workerFailureError(result.error.code, result.error.message) : undefined;
         storage.attempts.finish(attempt.attemptId, result.status, terminalAt, error, Boolean(task.usage) && task.usageComplete !== false);
       }
       if (result.status === "completed") published.push(appendV2(runId, { type: "run.completed", data: { resultRef: runId } }, false));
-      else if (result.status === "failed") published.push(appendV2(runId, { type: "run.failed", data: { error: parseV2Error({ schemaVersion: 2, code: "internal_error", message: result.error.message.slice(0, 512) || "Run failed.", retryable: false }) } }, false));
+      else if (result.status === "failed") published.push(appendV2(runId, { type: "run.failed", data: { error: workerFailureError(result.error.code, result.error.message) } }, false));
       else published.push(appendV2(runId, { type: "run.cancelled", data: { reason: result.reason } }, false));
       storage.runs.updateStatus(runId, status, terminalAt, terminalAt);
       storage.activeSlot.release({ runId, claimToken: slot.claimToken, generation: slot.generation });
@@ -464,25 +499,43 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     if (fileMutationActive) throw makeError("active_task", "当前正在撤销文件修改，暂不能启动新任务。", 409);
     getConversationRecord(conversationId);
     if (typeof key !== "string" || !KEY_PATTERN.test(key)) throw makeError("invalid_request", "A valid Idempotency-Key header is required.", 400);
-    const input = parse(RunSubmissionSchema, rawInput);
+    const submitted = parse(V2CreateRunSubmissionSchema, rawInput);
+    let input: V2RunSubmission = submitted;
+    let capabilityName = "";
+    if (submitted.kind === "capability") {
+      try {
+        const definition = capabilityRegistry.get(submitted.capabilityId);
+        capabilityName = definition.manifest.name;
+        const permissions = new Set<import("@pi-workbench/protocol").CapabilityPermission>(["results.write"]);
+        if (submitted.capabilityId === publicRepositoryCapability.id) permissions.add("public_repository.read");
+        input = capabilityRegistry.prepareInvocation(submitted, storage.capabilityStates.get(submitted.capabilityId), permissions);
+      }
+      catch (error) {
+        if (!(error instanceof CapabilityRegistryError)) throw error;
+        const status = error.code === "extension_permission_denied" ? 403
+          : error.code === "unknown_extension" || error.code === "extension_invalid_input" || error.code === "extension_invalid_config" ? 400 : 409;
+        throw makeError(error.code, error.message, status);
+      }
+    }
     if (workerUnavailable || !worker?.isAlive) throw makeError("worker_unavailable", "The Worker is not confirmed ready; no run was accepted.", 503, true);
     const createdAt = now();
     const scope = conversationId;
     const endpoint = retryOfRunId ? "POST /api/v2/runs/:id/retry" : "POST /api/v2/runs";
     const workerClient = worker;
     const heartbeatAt = now();
-    const title = getConversationRecord(conversationId).title === "新对话" ? titleFor(input) : getConversationRecord(conversationId).title;
+    const title = getConversationRecord(conversationId).title === "新对话" ? titleFor(input, capabilityName) : getConversationRecord(conversationId).title;
     let created: ReturnType<typeof storage.runs.createIdempotent>;
     try {
       created = storage.runs.createIdempotent({
-        runId: randomUUID(), conversationId, request: input, ...(retryOfRunId ? { retryOfRunId } : {}), createdAt,
+        runId: randomUUID(), conversationId, extensionId: input.kind === "capability" ? input.capabilityId : null,
+        request: input, ...(retryOfRunId ? { retryOfRunId } : {}), createdAt,
       }, { scope, endpoint, key }, {
         attemptId: randomUUID(), claimToken: randomUUID(), workerBootId: workerClient.bootId,
         heartbeatAt, leaseExpiresAt: new Date(Date.parse(heartbeatAt) + 5_000).toISOString(), updatedAt: heartbeatAt,
         conversationTitle: title, acceptedEventId: randomUUID(), startedEventId: randomUUID(),
         message: {
           id: randomUUID(), role: input.kind === "message" ? "user" : "capability",
-          content: input.kind === "message" ? input.text : serializeCapabilityContent(input),
+          content: input.kind === "message" ? input.text : serializeCapabilityContent(input, capabilityName),
           extensionId: input.kind === "capability" ? input.capabilityId : null, createdAt,
         },
       });
@@ -536,7 +589,16 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   function legacyEvent(event: V2RunEvent): WorkbenchEvent | undefined {
     const run = getRunRecord(event.runId);
     const common = { schemaVersion: 1 as const, eventId: event.eventId, runId: event.runId, conversationId: run.conversationId, sequence: event.sequence, timestamp: event.timestamp };
-    if (event.type === "run.started") return parseWorkbenchEvent({ ...common, type: "run.started", data: { input: parse(RunSubmissionSchema, run.request), ...(run.retryOfRunId ? { retryOfRunId: run.retryOfRunId } : {}) } });
+    if (event.type === "run.started") {
+      const input = parse(V2RunSubmissionSchema, run.request);
+      const legacyInput = input.kind === "message" ? input : input.capabilityId === publicRepositoryCapability.id
+        ? { kind: "capability" as const, capabilityId: publicRepositoryCapability.id, input: {
+          repositoryUrl: String(input.input.repositoryUrl ?? "https://github.com/demo/harborlight"),
+          ...(typeof input.input.ref === "string" ? { ref: input.input.ref } : {}), goal: input.prompt ?? (typeof input.input.goal === "string" ? input.input.goal : "扩展运行记录"),
+        } }
+        : { kind: "message" as const, text: `已调用扩展 ${input.capabilityId}：${input.prompt ?? ""}` };
+      return parseWorkbenchEvent({ ...common, type: "run.started", data: { input: parse(RunSubmissionSchema, legacyInput), ...(run.retryOfRunId ? { retryOfRunId: run.retryOfRunId } : {}) } });
+    }
     if (event.type === "message.delta") return parseWorkbenchEvent({ ...common, type: "message.delta", data: event.data });
     if (event.type === "tool.started") return parseWorkbenchEvent({ ...common, type: "tool.started", data: { toolCallId: event.data.toolCallId, toolName: event.data.toolName } });
     if (event.type === "tool.finished") return parseWorkbenchEvent({ ...common, type: "tool.finished", data: { toolCallId: event.data.toolCallId, toolName: event.data.toolName, isError: event.data.isError } });
@@ -595,7 +657,8 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   function retryV2(runId: string, key: string): { run: V2Run; replayed: boolean } {
     const previous = getRunRecord(runId);
     if (!(previous.status === "failed" || previous.status === "cancelled")) throw makeError("conflict", "Only failed or cancelled runs can be retried.", 409);
-    const input = parse(RunSubmissionSchema, previous.request);
+    const stored = parse(V2RunSubmissionSchema, previous.request);
+    const input = stored.kind === "message" ? stored : { kind: "capability" as const, capabilityId: stored.capabilityId, input: stored.input, prompt: stored.prompt };
     const admitted = admit(previous.conversationId, input, key, previous.runId);
     return { run: v2Run(admitted.runId), replayed: admitted.replayed };
   }
@@ -774,6 +837,24 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     void picker.flushGarbage().catch(() => undefined);
     return parse(V2CleanupResultSchema, { schemaVersion: 2, ...result });
   }
+  function capabilityStates() {
+    return new Map(storage.capabilityStates.list().map((state) => [state.capabilityId, state]));
+  }
+  function updateCapabilityState(capabilityId: string, patch: { enabled?: boolean; config?: Record<string, unknown> }) {
+    try {
+      const definition = capabilityRegistry.get(capabilityId);
+      const state = capabilityRegistry.updateState(definition, storage.capabilityStates.get(capabilityId), patch);
+      storage.capabilityStates.set(state);
+      return capabilityRegistry.catalog(capabilityStates()).find((entry) => entry.manifest.id === capabilityId)!;
+    } catch (error) {
+      if (error instanceof CapabilityRegistryError) {
+        const status = error.code === "unknown_extension" || error.code === "extension_invalid_config" ? 400 : 409;
+        throw makeError(error.code, error.message, status);
+      }
+      if (error instanceof TypeError) throw makeError("invalid_request", "能力状态更新无效。", 400);
+      throw error;
+    }
+  }
   async function undoFileChangeset(conversationId: string, changesetId: string): Promise<V2ChangesetUndoResult> {
     getConversationRecord(conversationId);
     if (storage.activeSlot.get().runId || fileMutationActive) throw makeError("active_task", "当前有运行中的任务或文件撤销；停止后才能撤销文件修改。", 409);
@@ -837,7 +918,15 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   return {
     mode: options.mode,
     get workerReady() { return Boolean(worker && worker.isAlive && !workerUnavailable); },
-    listCapabilities: () => [structuredClone(publicRepositoryCapability)],
+    listCapabilities: () => capabilityRegistry.catalog(capabilityStates()),
+    listLegacyCapabilities: () => [{
+      id: publicRepositoryCapability.id, name: publicRepositoryCapability.name, description: publicRepositoryCapability.description,
+      inputs: [
+        { id: "repositoryUrl", label: "公开 GitHub 仓库", required: true, description: "填写仓库 HTTPS 地址。", control: "text" as const, maxLength: 512 },
+        { id: "ref", label: "分支、标签或提交", required: false, description: "可选；留空时分析默认分支的当前提交。", control: "text" as const, maxLength: 256 },
+      ],
+    }],
+    updateCapabilityState,
     createConversation: () => legacyConversation(createConversationRecord(null).conversationId),
     listConversations: () => listConversationV2().map((item) => legacySummary(item.conversationId)),
     getConversation: (id: string) => legacyConversation(id),

@@ -57,6 +57,9 @@ export interface ProjectRulesRecord {
   projectId: string; sourcePath: string; sourceSha256: string; sourceVersion: string; content: string;
   acceptedAt: string; revokedAt: string | null;
 }
+export interface CapabilityStateRecord {
+  capabilityId: string; apiVersion: string; enabled: boolean; config: Record<string, JsonValue>; updatedAt: string;
+}
 export interface GarbageRecord { kind: "attachment_object" | "run_artifacts" | "file_backup_object"; objectRef: string; attempts: number; }
 export interface ContentObjectRecord { sha256: string; byteSize: number; createdAt: string; }
 export interface FileChangesetRecord {
@@ -130,6 +133,7 @@ export class Storage {
   readonly fileChangesets: FileChangesetRepository;
   readonly fileOperations: FileOperationRepository;
   readonly projectRules: ProjectRulesRepository;
+  readonly capabilityStates: CapabilityStateRepository;
   readonly garbage: GarbageRepository;
   readonly conversations: ConversationRepository;
   readonly messages: MessageRepository;
@@ -156,6 +160,7 @@ export class Storage {
     this.fileChangesets = new FileChangesetRepository(context);
     this.fileOperations = new FileOperationRepository(context);
     this.projectRules = new ProjectRulesRepository(context);
+    this.capabilityStates = new CapabilityStateRepository(context);
     this.garbage = new GarbageRepository(context);
     this.conversations = new ConversationRepository(context);
     this.messages = new MessageRepository(context);
@@ -613,6 +618,42 @@ export class ProjectRulesRepository {
     const result = this.context.atomic((db) => db.prepare("UPDATE project_rules SET revoked_at = ? WHERE project_id = ? AND revoked_at IS NULL").run(revokedAt, projectId));
     if (result.changes !== 1) throw new StorageError("not_found", "Active project rules were not found");
     return this.get(projectId)!;
+  }
+}
+
+export class CapabilityStateRepository {
+  constructor(private readonly context: Context) {}
+  get(capabilityId: string): CapabilityStateRecord | undefined {
+    assertId(capabilityId, "Capability id");
+    const row = this.context.db.prepare("SELECT capability_id, api_version, enabled, config_json, updated_at FROM capability_states WHERE capability_id = ?")
+      .get(capabilityId) as { capability_id: string; api_version: string; enabled: number; config_json: string; updated_at: string } | undefined;
+    if (!row) return undefined;
+    const config = parseJson(row.config_json);
+    if (!config || Array.isArray(config) || typeof config !== "object") throw new StorageError("conflict", "Stored capability configuration is invalid");
+    return { capabilityId: row.capability_id, apiVersion: row.api_version, enabled: row.enabled === 1, config, updatedAt: row.updated_at };
+  }
+  list(): CapabilityStateRecord[] {
+    const rows = this.context.db.prepare("SELECT capability_id, api_version, enabled, config_json, updated_at FROM capability_states ORDER BY capability_id")
+      .all() as Array<{ capability_id: string; api_version: string; enabled: number; config_json: string; updated_at: string }>;
+    return rows.map((row) => {
+      const config = parseJson(row.config_json);
+      if (!config || Array.isArray(config) || typeof config !== "object") throw new StorageError("conflict", "Stored capability configuration is invalid");
+      return { capabilityId: row.capability_id, apiVersion: row.api_version, enabled: row.enabled === 1, config, updatedAt: row.updated_at };
+    });
+  }
+  set(input: Omit<CapabilityStateRecord, "updatedAt"> & { updatedAt?: string }): CapabilityStateRecord {
+    assertId(input.capabilityId, "Capability id");
+    if (!/^[0-9]+\.[0-9]+$/.test(input.apiVersion) || typeof input.enabled !== "boolean") throw new StorageError("invalid_input", "Capability state is invalid");
+    const normalized = normalizeJson(input.config, 0);
+    if (!normalized || Array.isArray(normalized) || typeof normalized !== "object") throw new StorageError("invalid_input", "Capability configuration must be a JSON object");
+    const updatedAt = input.updatedAt ?? new Date().toISOString();
+    assertTimestamp(updatedAt);
+    this.context.atomic((db) => db.prepare(`INSERT INTO capability_states(capability_id, api_version, enabled, config_json, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(capability_id) DO UPDATE SET api_version=excluded.api_version, enabled=excluded.enabled,
+      config_json=excluded.config_json, updated_at=excluded.updated_at`)
+      .run(input.capabilityId, input.apiVersion, input.enabled ? 1 : 0, safeJson(normalized), updatedAt));
+    return this.get(input.capabilityId)!;
   }
 }
 

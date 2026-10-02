@@ -1,5 +1,6 @@
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
+import { ExtensionResultSchema } from "./extensions.js";
 
 const object = <T extends Record<string, import("typebox").TSchema>>(properties: T) => Type.Object(properties, { additionalProperties: false });
 const id = Type.String({ minLength: 1, maxLength: 128, pattern: "^[a-zA-Z0-9_-]+$" });
@@ -67,7 +68,7 @@ export const WorkbenchResultSchema = Type.Union([
   object({
     schemaVersion: Type.Literal(1), status: Type.Literal("completed"), runId: id, conversationId: id, endedAt: timestamp,
     reply: Type.String({ maxLength: 16_000 }), artifacts: Type.Optional(Type.Array(WorkbenchArtifactSchema, { maxItems: 16 })),
-    capabilityResult: Type.Optional(CapabilityResultSchema),
+    capabilityResult: Type.Optional(CapabilityResultSchema), extensionResult: Type.Optional(ExtensionResultSchema),
   }),
   object({
     schemaVersion: Type.Literal(1), status: Type.Literal("failed"), runId: id, conversationId: id, endedAt: timestamp,
@@ -90,7 +91,7 @@ const eventEnvelope = { schemaVersion: Type.Literal(1), eventId: id, runId: id, 
 export const WorkbenchEventSchema = Type.Union([
   object({ ...eventEnvelope, type: Type.Literal("run.started"), data: object({ input: RunSubmissionSchema, retryOfRunId: Type.Optional(id) }) }),
   object({ ...eventEnvelope, type: Type.Literal("message.delta"), data: object({ text: Type.String({ minLength: 1, maxLength: 8192 }) }) }),
-  object({ ...eventEnvelope, type: Type.Literal("capability.started"), data: object({ capabilityId: Type.Literal("public_repository_analysis"), label: Type.String({ minLength: 1, maxLength: 128 }) }) }),
+  object({ ...eventEnvelope, type: Type.Literal("capability.started"), data: object({ capabilityId: id, label: Type.String({ minLength: 1, maxLength: 128 }) }) }),
   object({ ...eventEnvelope, type: Type.Literal("tool.started"), data: object({ toolCallId: id, toolName: id }) }),
   object({ ...eventEnvelope, type: Type.Literal("tool.finished"), data: object({ toolCallId: id, toolName: id, isError: Type.Boolean() }) }),
   object({ ...eventEnvelope, type: Type.Literal("run.cancelling"), data: object({ reason: Type.Union([Type.Literal("user"), Type.Literal("timeout"), Type.Literal("token_limit"), Type.Literal("call_limit"), Type.Literal("tool_limit"), Type.Literal("cost_limit")]) }) }),

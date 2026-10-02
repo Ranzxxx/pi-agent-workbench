@@ -1,4 +1,4 @@
-import type { RunSubmission, Usage, WorkbenchEvent, WorkbenchResult } from "@pi-workbench/protocol";
+import type { V2RunSubmission, Usage, WorkbenchEvent, WorkbenchResult } from "@pi-workbench/protocol";
 import type { ConversationSessionSnapshot } from "@pi-workbench/agent-runtime";
 
 export type WorkerEventPayload = {
@@ -21,7 +21,7 @@ export interface WorkerProjectContext {
 }
 
 export type WorkerCommand =
-  | { type: "execute"; runId: string; attemptId: string; conversationId: string; input: RunSubmission; initialUsage?: Usage; initialUsageComplete?: boolean; snapshot?: ConversationSessionSnapshot; project?: WorkerProjectContext }
+  | { type: "execute"; runId: string; attemptId: string; conversationId: string; input: V2RunSubmission; initialUsage?: Usage; initialUsageComplete?: boolean; snapshot?: ConversationSessionSnapshot; project?: WorkerProjectContext }
   | { type: "cancel"; runId: string }
   | { type: "shutdown" };
 
@@ -33,7 +33,7 @@ export type WorkerInbound =
   | { type: "worker_error"; message: string };
 
 export type WorkerOutbound =
-  | { type: "execute"; runId: string; attemptId: string; conversationId: string; input: RunSubmission; initialUsage?: Usage; initialUsageComplete?: boolean; snapshot?: ConversationSessionSnapshot; project?: WorkerProjectContext }
+  | { type: "execute"; runId: string; attemptId: string; conversationId: string; input: V2RunSubmission; initialUsage?: Usage; initialUsageComplete?: boolean; snapshot?: ConversationSessionSnapshot; project?: WorkerProjectContext }
   | { type: "cancel"; runId: string }
   | { type: "shutdown" }
   | { type: "ack"; requestId: string; ok: boolean; error?: string };

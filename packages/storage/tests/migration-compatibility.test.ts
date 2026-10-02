@@ -40,7 +40,7 @@ for (const version of [4, 5]) {
       assert.throws(() => openStorage({ path, readOnly: true }), StorageSchemaError);
 
       const store = openStorage({ path });
-      assert.equal(store.diagnostics.schemaVersion, 5);
+      assert.equal(store.diagnostics.schemaVersion, 6);
       assert.equal(store.projects.list().length, 1);
       assert.equal(store.messages.list("conversation")[0]?.content, "Preserved message");
       const operation = store.fileOperations.list("changeset")[0]!;

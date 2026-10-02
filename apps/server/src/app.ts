@@ -5,6 +5,7 @@ import {
   V2AttachmentImportRequestSchema, V2PickerBrowseRequestSchema, V2PickerOpenProjectRequestSchema,
   V2PickerSelectProjectRequestSchema, V2ProjectRulesAcceptRequestSchema,
   V2ChangesetUndoRequestSchema, V2CleanupRequestSchema,
+  UpdateCapabilityStateRequestSchema,
   WorkbenchApiErrorSchema, type V2Error, type V2SubmitRunRequest,
 } from "@pi-workbench/protocol";
 import { createWorkbenchService, type WorkbenchServiceOptions, type ServiceError } from "./service.js";
@@ -70,6 +71,8 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
       const allowed = new Set<V2Error["code"]>([
         "invalid_request", "not_found", "active_task", "idempotency_conflict", "upgrade_required", "db_busy", "db_readonly",
         "unknown_schema", "conflict", "busy", "worker_unavailable", "interrupted", "internal_error", "migration_failed",
+        "unknown_extension", "extension_disabled", "extension_unconfigured", "extension_incompatible",
+        "extension_permission_denied", "extension_invalid_input", "extension_invalid_config",
       ]);
       const payload = parse(V2ErrorSchema, {
         schemaVersion: 2, code: allowed.has(code as V2Error["code"]) ? code : "internal_error",
@@ -90,7 +93,7 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
   });
 
   app.get("/api/v1/health", async () => ({ schemaVersion: 1, status: "ok", mode: service.mode }));
-  app.get("/api/v1/capabilities", async () => ({ schemaVersion: 1, capabilities: service.listCapabilities() }));
+  app.get("/api/v1/capabilities", async () => ({ schemaVersion: 1, capabilities: service.listLegacyCapabilities() }));
   app.get("/api/v1/conversations", async () => ({ schemaVersion: 1, conversations: service.listConversations() }));
   app.get<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversationId", async (request) => service.getConversation(request.params.conversationId));
   app.get<{ Params: { conversationId: string } }>("/api/v1/conversations/:conversationId/runs", async (request) => ({ schemaVersion: 1, runs: service.listConversationRuns(request.params.conversationId) }));
@@ -171,6 +174,12 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
     return { schemaVersion: 2, revoked: true, projectId: request.params.projectId };
   });
   app.get("/api/v2/capabilities", async () => ({ schemaVersion: 2, capabilities: service.listCapabilities() }));
+  app.patch<{ Params: { capabilityId: string } }>("/api/v2/capabilities/:capabilityId/state", async (request) => {
+    requirePickerSession(request, true);
+    const body = parsePickerBody<{ schemaVersion: 2; enabled?: boolean; config?: Record<string, unknown> }>(UpdateCapabilityStateRequestSchema, request.body);
+    if (body.enabled === undefined && body.config === undefined) throw Object.assign(new Error("至少需要更新启用状态或配置。"), { statusCode: 400, code: "invalid_request" });
+    return { schemaVersion: 2, capability: service.updateCapabilityState(request.params.capabilityId, body) };
+  });
   app.get("/api/v2/conversations", async () => ({ schemaVersion: 2, conversations: service.listConversationV2() }));
   app.post("/api/v2/conversations", async (_request, reply) => reply.code(201).send(service.createConversationV2()));
   app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId", async (request) => service.getConversationV2(request.params.conversationId));

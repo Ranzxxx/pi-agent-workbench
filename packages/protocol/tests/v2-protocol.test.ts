@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   parse, V2AttachmentResultSchema, V2ChangesetSchema, V2CleanupPreviewSchema,
+  CapabilityCatalogSchema, CapabilityManifestSchema, ExtensionResultSchema, UpdateCapabilityStateRequestSchema,
+  V2CreateRunSubmissionSchema, V2RunSubmissionSchema,
   parseV2AttemptIdentity, parseV2Error, parseV2EventCursor, parseV2IdempotencyRequest,
   parseV2Run, parseV2RunAttempt, parseV2RunEvent, parseV2RunEventPage,
 } from "../src/index.js";
@@ -17,6 +19,28 @@ const acceptedEvent = {
   schemaVersion: 2, eventId: "event_1", runId: "run_1", attemptId: "attempt_1", sequence: 1,
   timestamp, type: "run.accepted", data: { conversationId: "conversation_1", requestHash: "a".repeat(64) },
 };
+
+test("extension manifest, catalog, state patch, invocation snapshots, and result are versioned and closed", () => {
+  const manifest = {
+    id: "sample_extension", apiVersion: "1.0", name: "Sample", description: "A local test extension.", kind: "tools",
+    configSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
+    inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
+    outputSchema: { type: "object", properties: {}, required: [], additionalProperties: false }, requiredPermissions: [],
+  };
+  assert.equal(parse(CapabilityManifestSchema, manifest).id, "sample_extension");
+  const catalog = parse(CapabilityCatalogSchema, { schemaVersion: 2, capabilities: [{
+    manifest, enabled: false, configured: true, compatible: true, status: "disabled", config: {}, missingConfiguration: [],
+  }] });
+  assert.equal(catalog.capabilities[0]?.status, "disabled");
+  assert.equal(parse(UpdateCapabilityStateRequestSchema, { schemaVersion: 2, enabled: true }).enabled, true);
+  assert.throws(() => parse(UpdateCapabilityStateRequestSchema, { schemaVersion: 2, apiKey: "secret" }));
+  const request = { kind: "capability", capabilityId: "sample_extension", input: {}, prompt: "Call the sample extension." };
+  assert.equal(parse(V2CreateRunSubmissionSchema, request).kind, "capability");
+  assert.throws(() => parse(V2CreateRunSubmissionSchema, { ...request, apiVersion: "1.0" }));
+  assert.equal(parse(V2RunSubmissionSchema, { ...request, apiVersion: "1.0", configSnapshot: {} }).kind, "capability");
+  assert.equal(parse(ExtensionResultSchema, { extensionId: "sample_extension", title: "Done", summary: "Validated", output: {} }).extensionId, "sample_extension");
+  assert.throws(() => parse(ExtensionResultSchema, { extensionId: "bad id", title: "Done", summary: "Validated", output: {} }));
+});
 
 test("v2 run, attempt, error, and idempotency contracts require their own schema version", () => {
   assert.equal(parseV2Run(run).status, "accepted");

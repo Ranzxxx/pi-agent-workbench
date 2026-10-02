@@ -45,7 +45,7 @@ function textFromMessage(message: unknown): string {
 }
 
 /** Deterministic browser-safe fake model. Sentinels exist only to exercise failure/cancel paths in fake mode. */
-export function createFakeChatConfiguration(): ModelConfiguration {
+export function createFakeChatConfiguration(configurationOptions: { allowDevelopmentGreetingTool?: boolean } = {}): ModelConfiguration {
   const fake = fauxProvider({ api: "workbench-fake", provider: `workbench_fake_${randomUUID().replaceAll("-", "")}`, models: [{ id: "offline-demo" }], tokenSize: { min: 8, max: 8 } });
   const original = fake.provider.streamSimple.bind(fake.provider);
   const provider: Provider = {
@@ -63,6 +63,11 @@ export function createFakeChatConfiguration(): ModelConfiguration {
           });
           return fauxAssistantMessage("", { stopReason: "aborted" });
         }]);
+      } else if (configurationOptions.allowDevelopmentGreetingTool && prompt.includes("[[demo:greeting-tool]]")) {
+        fake.setResponses([
+          fauxAssistantMessage(fauxToolCall("development_greeting_tool__make_greeting", { name: "PI Workbench" }), { stopReason: "toolUse" }),
+          fauxAssistantMessage("已调用示例问候工具。"),
+        ]);
       } else {
         fake.setResponses([fauxAssistantMessage(`这是离线模拟回复，没有调用真实模型。你提到的内容是：${prompt.slice(0, 700)}`)]);
       }
