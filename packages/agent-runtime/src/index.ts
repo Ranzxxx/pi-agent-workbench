@@ -37,12 +37,20 @@ export interface RuntimeOptions {
   budget: Budget;
   /** USD per million tokens; callers must supply a known, versioned price table. */
   pricing: Pricing;
+  /** Stable IDs supplied by the run coordinator for continuation and persistence. */
+  runId?: string;
+  attemptId?: string;
+  /** Previously persisted attempts for this same run; usage returned by this session remains attempt-local. */
+  initialUsage?: Usage;
+  initialUsageComplete?: boolean;
+  compactionSettings?: { reserveTokens: number; keepRecentTokens: number };
   /**
    * 应用层的成功门：先校验报告内容/证据，再发布产物并返回引用。
    * 运行时只校验引用协议；不能仅凭模型 stop 就认定业务完成。
    */
   finalize: (input: { text: string; signal: AbortSignal; usage: Usage }) => Promise<Artifact[]>;
   onEvent?: (event: RunEvent) => void;
+  onRuntimeStatus?: (status: { phase: "compaction"; state: "started" | "completed" | "aborted" | "failed"; reason: "manual" | "threshold" | "overflow" }) => void;
   cancellationGraceMs?: number;
 }
 
@@ -64,12 +72,15 @@ function blockedStream(model: Model<string>): AssistantMessageEventStream {
 }
 
 export async function createSession(options: RuntimeOptions) {
-  const ledger = new BudgetLedger(options.budget, options.pricing);
+  const ledger = new BudgetLedger(options.budget, options.pricing, options.initialUsage, options.initialUsageComplete);
   // 配置必须由应用显式注入，避免悄悄退回用户本机的模型配置或提示词。
   if (!options.credentials || typeof options.credentials.read !== "function") throw new Error("Explicit credentials are required");
   const graceMs = options.cancellationGraceMs ?? 1000;
   if (!Number.isInteger(graceMs) || graceMs < 1 || graceMs > 1000) throw new Error("Invalid cancellation grace");
   if (!options.systemPrompt.trim()) throw new Error("An explicit system prompt is required");
+  if (options.compactionSettings && [options.compactionSettings.reserveTokens, options.compactionSettings.keepRecentTokens].some((value) => !Number.isSafeInteger(value) || value < 1 || value > 100_000)) {
+    throw new Error("Invalid compaction settings");
+  }
   const tools = [...options.tools];
   if (new Set(tools.map((tool) => tool.name)).size !== tools.length) throw new Error("Duplicate tool name");
   if (tools.some((tool) => !/^[a-zA-Z0-9_-]{1,128}$/.test(tool.name))) throw new Error("Invalid tool name");
@@ -83,13 +94,15 @@ export async function createSession(options: RuntimeOptions) {
       cwd: options.cwd, agentDir: options.cwd, modelRuntime: runtime, model: options.model,
       resourceLoader: resources(options.systemPrompt), tools: tools.map((tool) => tool.name), customTools: tools,
       sessionManager: SessionManager.inMemory(options.cwd),
-      settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+      // PI's built-in compaction preserves the public session transcript and is
+      // enabled only after the workbench wraps its model stream with the budget gate.
+      settingsManager: SettingsManager.inMemory({ compaction: { enabled: true, ...options.compactionSettings }, retry: { enabled: false } }),
     }));
   } catch (error) {
     runtime.unregisterProvider(options.provider.id);
     throw error;
   }
-  const runId = randomUUID(), attemptId = randomUUID();
+  const runId = options.runId ?? randomUUID(), attemptId = options.attemptId ?? randomUUID();
   let state: RunState = "queued";
   let sequence = 0, observerErrors = 0;
   let cancelReason: CancelReason | undefined;
@@ -120,6 +133,7 @@ export async function createSession(options: RuntimeOptions) {
     cancelReason = reason;
     state = "cancelling";
     finalization.abort();
+    session.abortCompaction();
     session.agent.abort();
     graceTimer = setTimeout(() => {
       if (state === "cancelling") {
@@ -143,7 +157,7 @@ export async function createSession(options: RuntimeOptions) {
     if (reason) { abort(reason); return blockedStream(model); }
     return originalStream(model, context, {
       ...streamOptions,
-      maxTokens: Math.min(model.maxTokens, ledger.budget.maxOutputTokens, ledger.budget.maxTokens - ledger.snapshot().totalTokens),
+      maxTokens: Math.min(model.maxTokens, ledger.budget.maxOutputTokens, ledger.remainingTokens()),
     });
   };
   // Admission is recorded on tool_execution_start (including invalid arguments).
@@ -163,8 +177,23 @@ export async function createSession(options: RuntimeOptions) {
       // 用 provider 返回的实际 usage 累加预算；思考 Token 已包含在输出 Token 中。
       lastAssistant = event.message;
       ledger.record(event.message.usage);
+      if ((event.message.stopReason === "error" || event.message.stopReason === "aborted") && event.message.usage.totalTokens === 0 && ledger.snapshot().modelCalls > 0) {
+        ledger.markIncomplete();
+      }
       const reason = ledger.exhausted();
       if (reason) abort(reason);
+    } else if (event.type === "compaction_start") {
+      try { options.onRuntimeStatus?.({ phase: "compaction", state: "started", reason: event.reason }); } catch { observerErrors++; }
+    } else if (event.type === "compaction_end") {
+      // The SDK exposes compaction usage on this public event; it does not emit
+      // a normal agent message_end for its direct summarization call.
+      if (event.result?.usage) {
+        const usage = event.result.usage;
+        ledger.record({ input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite });
+        const reason = ledger.exhausted();
+        if (reason && !cancelReason) abort(reason);
+      } else ledger.markIncomplete();
+      try { options.onRuntimeStatus?.({ phase: "compaction", state: event.aborted ? "aborted" : event.errorMessage ? "failed" : "completed", reason: event.reason }); } catch { observerErrors++; }
     } else if (event.type === "tool_execution_start") {
       // 在 SDK 校验工具参数前计数，因而无效参数也消耗一次配额；执行体仍由 beforeToolCall 控门。
       checkDeadline();
@@ -182,7 +211,7 @@ export async function createSession(options: RuntimeOptions) {
     }
   }
   const unsubscribe = session.subscribe((event) => {
-    try { record(event); } catch { eventError = true; session.agent.abort(); }
+    try { record(event); } catch { eventError = true; ledger.markIncomplete(); session.agent.abort(); }
   });
   function cleanup(): void {
     // 结束时统一撤销监听、释放会话并注销 provider；重复清理保持安全。
@@ -229,6 +258,7 @@ export async function createSession(options: RuntimeOptions) {
   }
   return {
     runId, attemptId,
+    get usageComplete(): boolean { return ledger.usageComplete; },
     get state(): RunState { return state; },
     get observerErrors(): number { return observerErrors; },
     abort,

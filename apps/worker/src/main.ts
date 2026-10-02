@@ -32,7 +32,9 @@ async function execute(command: Extract<WorkerCommand, { type: "execute" }>): Pr
   const task = (async () => {
     try {
       const result = await executeWorkerTask({
-        runId: command.runId, conversationId: command.conversationId, input: command.input,
+        runId: command.runId, attemptId: command.attemptId, conversationId: command.conversationId, input: command.input,
+        ...(command.initialUsage ? { initialUsage: command.initialUsage } : {}),
+        ...(command.initialUsageComplete !== undefined ? { initialUsageComplete: command.initialUsageComplete } : {}),
         mode: process.env.WORKBENCH_MODE === "online" ? "online" : "fake",
         dataDirectory: process.env.PI_WORKBENCH_DATA_DIR ?? "",
         fixtureRoot: process.env.PI_WORKBENCH_FIXTURE_ROOT ?? "",
@@ -43,7 +45,7 @@ async function execute(command: Extract<WorkerCommand, { type: "execute" }>): Pr
       });
       const pending = queued.splice(0);
       await Promise.all(pending);
-      send({ type: "done", runId: command.runId, result: result.result, ...(result.usage ? { usage: result.usage } : {}), artifacts: result.artifacts,
+      send({ type: "done", runId: command.runId, result: result.result, ...(result.usage ? { usage: result.usage } : {}), ...(result.usageComplete !== undefined ? { usageComplete: result.usageComplete } : {}), artifacts: result.artifacts,
         ...(result.result.status === "completed" && finalSnapshot ? { snapshot: finalSnapshot } : {}) });
     } catch {
       send({ type: "done", runId: command.runId, result: {

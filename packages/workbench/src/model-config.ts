@@ -183,6 +183,7 @@ export async function createFakeRepositoryAnalysisConfiguration(repositoryRoot: 
       id: "fixture-service-summary", path: "README.md", startLine: 3, endLine: 5,
       excerpt: "Harborlight is a small TypeScript service fixture maintained for offline\nrepository-analysis tests. It exposes a health response and starts on port\n4317 when no port is supplied.",
     }), { stopReason: "toolUse" }),
+    fauxAssistantMessage('{"status":"complete"}'),
     fauxAssistantMessage(JSON.stringify({
       title: "Harborlight 仓库分析",
       claims: [{ id: "fixture-service-summary", kind: "fact", text: "这是一个用于离线仓库分析的 TypeScript 服务样例；说明文档写明默认端口为 4317。", evidenceIds: ["fixture-service-summary"] }],

@@ -33,3 +33,31 @@ test("cost is enforced before subsequent model and tool calls", () => {
   assert.equal(ledger.modelCall(), "cost_limit");
   assert.equal(ledger.toolCall(), "cost_limit");
 });
+
+test("continuation shares prior attempt budgets while reporting only this attempt's usage", () => {
+  const prior = {
+    modelCalls: 1, toolCalls: 1, inputTokens: 20, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0,
+    totalTokens: 30, estimatedCostUsd: 0.00003, pricingVersion: pricing.version,
+  };
+  const ledger = new BudgetLedger({ ...budget, maxModelCalls: 2, maxToolCalls: 2, maxTokens: 100 }, pricing, prior);
+  assert.equal(ledger.remainingTokens(), 70);
+  assert.deepEqual(ledger.snapshot(), {
+    modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    totalTokens: 0, estimatedCostUsd: 0, pricingVersion: pricing.version,
+  });
+  assert.equal(ledger.modelCall(), undefined);
+  assert.equal(ledger.modelCall(), "call_limit");
+  ledger.record({ input: 5, output: 5, cacheRead: 0, cacheWrite: 0 });
+  assert.equal(ledger.snapshot().totalTokens, 10);
+  assert.equal(ledger.usageComplete, true);
+});
+
+test("continuation stops before a model call when prior usage or pricing is not trusted", () => {
+  const prior = {
+    modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    totalTokens: 0, estimatedCostUsd: 0, pricingVersion: pricing.version,
+  };
+  const unknown = new BudgetLedger(budget, pricing, prior, false);
+  assert.equal(unknown.modelCall(), "cost_limit");
+  assert.throws(() => new BudgetLedger(budget, pricing, { ...prior, pricingVersion: "other" }), /pricing version/u);
+});

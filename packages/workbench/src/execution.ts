@@ -7,7 +7,7 @@ import {
   type CapabilityResult, type RepositoryAnalysisInput, type RunSubmission, type Usage, type WorkbenchArtifact, type WorkbenchEvent, type WorkbenchResult,
 } from "@pi-workbench/protocol";
 import { createConversationSession, createProjectFileTools, type ConversationSessionSnapshot } from "@pi-workbench/agent-runtime";
-import { runPublicRepositoryAnalysis } from "@pi-workbench/reporting";
+import { PublicAnalysisCancelledError, runPublicRepositoryAnalysis } from "@pi-workbench/reporting";
 import { createProjectFileAccess, SnapshotError } from "@pi-workbench/tools";
 import { openStorage, type AttachmentRecord, type Storage } from "@pi-workbench/storage";
 import { createCapabilityRegistry, publicRepositoryCapability, type RepositoryAnalysisContext, type RepositoryAnalysisOutput } from "./registry.js";
@@ -31,14 +31,15 @@ const FAKE_FIXTURE_URL = "https://github.com/demo/harborlight";
 const FAKE_FIXTURE_SHA = "7f06c6b2792349e4d9ccbd393008e5bf1f4d419a";
 
 export interface WorkerExecutionOptions {
-  runId: string; conversationId: string; input: RunSubmission; mode: WorkbenchMode;
+  runId: string; attemptId: string; conversationId: string; input: RunSubmission; mode: WorkbenchMode;
+  initialUsage?: Usage; initialUsageComplete?: boolean;
   dataDirectory: string; fixtureRoot: string; apiKey?: string; githubToken?: string;
   project?: WorkerProjectContext;
   snapshot?: ConversationSessionSnapshot; signal: AbortSignal;
   emit: (event: WorkerEventPayload) => Promise<void>;
   saveSnapshot: (snapshot: ConversationSessionSnapshot) => Promise<void>;
 }
-export interface WorkerExecutionResult { result: WorkbenchResult; usage?: Usage; artifacts: Array<{ kind: string; path: string; sha256: string }>; }
+export interface WorkerExecutionResult { result: WorkbenchResult; usage?: Usage; usageComplete?: boolean; artifacts: Array<{ kind: string; path: string; sha256: string }>; }
 
 function now(): string { return new Date().toISOString(); }
 function utf8Prefix(value: string, maximumBytes: number): string {
@@ -102,6 +103,7 @@ export async function executeWorkerTask(options: WorkerExecutionOptions): Promis
     const session = await createConversationSession({
       cwd: process.cwd(), credentials: configuration.credentials, provider: configuration.provider, model: configuration.model,
       systemPrompt: SYSTEM_PROMPT, budget: configuration.budget, pricing: configuration.pricing,
+      initialUsage: options.initialUsage, initialUsageComplete: options.initialUsageComplete,
       ...(options.snapshot ? { restoredSnapshot: options.snapshot } : {}),
       persistSnapshot: options.saveSnapshot,
     });
@@ -173,6 +175,7 @@ export async function executeWorkerTask(options: WorkerExecutionOptions): Promis
       const session = await createConversationSession({
         cwd: process.cwd(), credentials: configuration.credentials, provider: configuration.provider, model: configuration.model,
         systemPrompt, tools, budget: configuration.budget, pricing: configuration.pricing,
+        initialUsage: options.initialUsage, initialUsageComplete: options.initialUsageComplete,
         ...(options.snapshot ? { restoredSnapshot: options.snapshot } : {}), persistSnapshot: options.saveSnapshot,
       });
       try {
@@ -182,15 +185,17 @@ export async function executeWorkerTask(options: WorkerExecutionOptions): Promis
         }
         const turn = await session.prompt(options.input.text, {
           signal: options.signal,
+          initialUsage: options.initialUsage, initialUsageComplete: options.initialUsageComplete,
           onTextDelta(text) { void options.emit({ type: "message.delta", data: { text: text.slice(0, 8192) } }).catch(() => undefined); },
           onToolEvent(event) { void options.emit(event.phase === "started"
             ? { type: "tool.started", data: { toolCallId: event.toolCallId, toolName: event.toolName } }
             : { type: "tool.finished", data: { toolCallId: event.toolCallId, toolName: event.toolName, isError: Boolean(event.isError) } }).catch(() => undefined); },
           onCancellationPending() { void options.emit({ type: "run.warning", data: { code: "cancellation_pending" } }).catch(() => undefined); },
+          onCompactionStatus(status) { void options.emit({ type: "runtime_status", data: { phase: "compaction", ...status } }).catch(() => undefined); },
         });
-        if (turn.status === "cancelled") return { result: cancelled(options, turn.reason), usage: turn.usage, artifacts };
-        if (turn.status === "failed") return { result: failure(options, turn.error.code, turn.error.message), usage: turn.usage, artifacts };
-        return { result: parseWorkbenchResult({ schemaVersion: 1, status: "completed", runId: options.runId, conversationId: options.conversationId, endedAt: now(), reply: turn.text.trim() || "模型返回了空回复。" }), usage: turn.usage, artifacts };
+        if (turn.status === "cancelled") return { result: cancelled(options, turn.reason), usage: turn.usage, usageComplete: turn.usageComplete, artifacts };
+        if (turn.status === "failed") return { result: failure(options, turn.error.code, turn.error.message), usage: turn.usage, usageComplete: turn.usageComplete, artifacts };
+        return { result: parseWorkbenchResult({ schemaVersion: 1, status: "completed", runId: options.runId, conversationId: options.conversationId, endedAt: now(), reply: turn.text.trim() || "模型返回了空回复。" }), usage: turn.usage, usageComplete: turn.usageComplete, artifacts };
       } finally { await session.dispose(); }
       } finally { storage.close(); }
     }
@@ -203,12 +208,20 @@ export async function executeWorkerTask(options: WorkerExecutionOptions): Promis
     const registry = createCapabilityRegistry(async (request, context) => {
       const configuration = options.mode === "online" ? await createOnlineConfiguration(options.apiKey ?? "") : await createFakeRepositoryAnalysisConfiguration(options.fixtureRoot, FAKE_FIXTURE_SHA);
       const outputRoot = path.join(options.dataDirectory, "runs");
-      return runPublicRepositoryAnalysis({
+      const workflowStorage = openStorage({ dataDirectory: { dataDirectory: path.resolve(options.dataDirectory) } });
+      try { return await runPublicRepositoryAnalysis({
         repository: { url: request.repositoryUrl, ...(request.ref ? { ref: request.ref } : {}) },
         questions: [{ id: "analysis_goal", question: request.goal }],
         cacheDirectory: path.join(options.dataDirectory, "cache"), outputDirectory: outputRoot,
         credentials: configuration.credentials, provider: configuration.provider, model: configuration.model,
         budget: configuration.budget, pricing: configuration.pricing,
+        runId: options.runId, attemptId: options.attemptId,
+        initialUsage: options.initialUsage, initialUsageComplete: options.initialUsageComplete,
+        workflowDirectory: path.join(options.dataDirectory, "workflows", options.runId),
+        checkpointStore: {
+          list: (runId) => workflowStorage.checkpoints.list(runId),
+          create: (record) => workflowStorage.checkpoints.create(record),
+        },
         ...(options.mode === "online" && options.githubToken ? { githubToken: options.githubToken } : {}),
         ...(options.mode === "fake" ? { fetch: await createFakeSnapshotFetch({ repositoryRoot: options.fixtureRoot, sha: FAKE_FIXTURE_SHA }) } : {}),
         signal: context.signal,
@@ -218,7 +231,8 @@ export async function executeWorkerTask(options: WorkerExecutionOptions): Promis
           else if (event.type === "run.cancelling") void context.onEvent({ type: "run.cancelling", reason: event.data.reason });
           else if (event.type === "run.warning") void context.onEvent({ type: "run.warning", code: "cancellation_pending" });
         },
-      });
+        onWorkflowProgress(event) { context.onEvent(event); },
+      }); } finally { workflowStorage.close(); }
     });
     const summary = await registry.invoke(options.input.capabilityId, input, {
       signal: options.signal,
@@ -227,20 +241,26 @@ export async function executeWorkerTask(options: WorkerExecutionOptions): Promis
         : event.type === "tool.finished"
           ? { type: "tool.finished", data: { toolCallId: event.toolCallId, toolName: event.toolName, isError: Boolean(event.isError) } }
           : event.type === "run.cancelling"
-            ? { type: "run.cancelling", data: { reason: event.reason === "timeout" ? "timeout" : "user" } }
-            : { type: "run.warning", data: { code: "cancellation_pending" } }).catch(() => undefined); },
+            ? { type: "run.cancelling", data: { reason: event.reason } }
+            : event.type === "runtime_status" || event.type === "workflow_progress" || event.type === "checkpoint_saved"
+              ? event
+              : { type: "run.warning", data: { code: "cancellation_pending" } }).catch(() => undefined); },
     });
     if (summary.directory) for (const artifact of summary.artifacts) {
       const target = path.resolve(summary.directory, artifact.kind);
       if (target.startsWith(path.resolve(summary.directory) + path.sep)) artifacts.push({ kind: artifact.kind, path: target, sha256: artifact.sha256 });
     }
-    if (options.signal.aborted || summary.status === "cancelled") return { result: cancelled(options, "user"), artifacts };
-    if (summary.status !== "completed") return { result: failure(options, "analysis_failed", "仓库分析未完成，请检查输入后重试。"), artifacts };
+    if (options.signal.aborted || summary.status === "cancelled") {
+      const reason = summary.result.status === "cancelled" ? summary.result.reason : "user";
+      return { result: cancelled(options, reason), usage: summary.result.usage, usageComplete: summary.usageComplete, artifacts };
+    }
+    if (summary.status !== "completed") return { result: failure(options, "analysis_failed", "仓库分析未完成，请检查输入后重试。"), usage: summary.result.usage, usageComplete: summary.usageComplete, artifacts };
     const result = capabilityResult(summary);
     const reply = `${result.title}\n${result.summary}\n${result.claims.length} 条带来源的结论已加入对话，可继续追问。`;
     await persistSession(capabilityContext(result, artifacts.map((item) => ({ kind: item.kind as WorkbenchArtifact["kind"], sha256: item.sha256 }))));
-    return { result: parseWorkbenchResult({ schemaVersion: 1, status: "completed", runId: options.runId, conversationId: options.conversationId, endedAt: now(), reply, artifacts: artifacts.map((item) => ({ kind: item.kind as WorkbenchArtifact["kind"], sha256: item.sha256 })), capabilityResult: result }), usage: summary.result.usage, artifacts };
+    return { result: parseWorkbenchResult({ schemaVersion: 1, status: "completed", runId: options.runId, conversationId: options.conversationId, endedAt: now(), reply, artifacts: artifacts.map((item) => ({ kind: item.kind as WorkbenchArtifact["kind"], sha256: item.sha256 })), capabilityResult: result }), usage: summary.result.usage, usageComplete: summary.usageComplete, artifacts };
   } catch (error) {
+    if (error instanceof PublicAnalysisCancelledError) return { result: cancelled(options, error.reason), usage: error.usage, usageComplete: error.usageComplete, artifacts };
     if (options.signal.aborted) return { result: cancelled(options, "user"), artifacts };
     return { result: failure(options, error instanceof SnapshotError ? error.code : "runtime_error", error instanceof SnapshotError ? error.message : "运行失败；请检查服务端日志。未保留原始模型响应或凭据。"), artifacts };
   }

@@ -221,9 +221,14 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     else if (event.type === "file_change_prepared") appendV2(runId, { type: "file_change_prepared", data: event.data });
     else if (event.type === "file_change_applied") appendV2(runId, { type: "file_change_applied", data: event.data });
     else if (event.type === "file_change_conflict") appendV2(runId, { type: "file_change_conflict", data: event.data });
+    else if (event.type === "workflow_progress") appendV2(runId, { type: "run.progress", data: event.data });
+    else if (event.type === "checkpoint_saved") appendV2(runId, { type: "checkpoint.saved", data: event.data });
+    else if (event.type === "runtime_status") appendV2(runId, { type: "run.progress", data: {
+      phase: "compaction", message: `Context compaction ${event.data.state} (${event.data.reason}).`,
+    } });
     else if (event.type === "run.cancelling") {
       if (run.status !== "cancelling") storage.runs.updateStatus(runId, "cancelling");
-      appendV2(runId, { type: "run.cancelling", data: { reason: event.data.reason === "timeout" ? "timeout" : "user" } });
+      appendV2(runId, { type: "run.cancelling", data: { reason: event.data.reason } });
     } else if (event.type === "run.warning") appendV2(runId, { type: "run.progress", data: { phase: "cancellation", message: "Cancellation is waiting for active work to stop." } });
   }
 
@@ -335,6 +340,32 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     const client = worker;
     if (!client || workerUnavailable) throw makeError("worker_unavailable", "The Worker is not confirmed ready; no model call was started.", 503, true);
     const run = getRunRecord(runId);
+    const attempts = storage.attempts.list(runId);
+    const currentAttempt = attempts.at(-1);
+    if (!currentAttempt) throw makeError("conflict", "Run has no active attempt.", 409);
+    const priorAttempts = attempts.slice(0, -1);
+    let initialUsage: import("@pi-workbench/protocol").Usage | undefined;
+    let initialUsageComplete = true;
+    if (priorAttempts.length) {
+      const records = priorAttempts.map((attempt) => ({ attempt, usage: storage.usage.get(attempt.attemptId) }));
+      const pricingVersion = records.find((item) => item.usage?.pricingVersion)?.usage?.pricingVersion ?? "unknown-pricing";
+      initialUsageComplete = records.every((item) => item.attempt.usageComplete && item.usage && item.usage.costStatus !== "unknown" && item.usage.pricingVersion === pricingVersion);
+      if (records.every((item) => item.usage)) {
+        initialUsage = {
+          modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+          totalTokens: 0, estimatedCostUsd: 0, pricingVersion,
+        };
+        for (const { usage } of records) {
+          initialUsage.modelCalls += usage!.modelCalls; initialUsage.toolCalls += usage!.toolCalls;
+          initialUsage.inputTokens += usage!.inputTokens; initialUsage.outputTokens += usage!.outputTokens;
+          initialUsage.cacheReadTokens += usage!.cacheReadTokens; initialUsage.cacheWriteTokens += usage!.cacheWriteTokens;
+          initialUsage.totalTokens += usage!.totalTokens;
+          if (usage!.estimatedCostUsd !== null) initialUsage.estimatedCostUsd += usage!.estimatedCostUsd;
+          else initialUsageComplete = false;
+        }
+        if (!records.every((item) => item.usage?.pricingVersion === pricingVersion)) initialUsageComplete = false;
+      }
+    }
     const snapshotRecord = storage.snapshots.latest(run.conversationId);
     const snapshot = snapshotRecord?.snapshot as unknown as ConversationSessionSnapshot | undefined;
     const conversation = getConversationRecord(run.conversationId);
@@ -345,7 +376,9 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
       ...(rulesRecord && !rulesRecord.revokedAt ? { acceptedRules: { sourcePath: rulesRecord.sourcePath, sourceSha256: rulesRecord.sourceSha256, content: rulesRecord.content } } : {}),
     } : undefined;
     try {
-      const result = await client.execute({ runId, conversationId: run.conversationId, input: parse(RunSubmissionSchema, run.request), ...(snapshot ? { snapshot } : {}), ...(project ? { project } : {}) }, {
+      const result = await client.execute({ runId, attemptId: currentAttempt.attemptId, conversationId: run.conversationId, input: parse(RunSubmissionSchema, run.request),
+        ...(initialUsage ? { initialUsage } : {}), initialUsageComplete,
+        ...(snapshot ? { snapshot } : {}), ...(project ? { project } : {}) }, {
         onEvent: (event) => { persistWorkerEvent(runId, event); },
       });
       await finalizeRun(runId, result);
@@ -358,7 +391,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     }
   }
 
-  function usageUpdated(runId: string, usage: import("@pi-workbench/protocol").Usage): V2RunEvent | undefined {
+  function usageUpdated(runId: string, usage: import("@pi-workbench/protocol").Usage, usageComplete: boolean): V2RunEvent | undefined {
     const attempts = storage.attempts.list(runId);
     const attempt = attempts.at(-1);
     if (!attempt) return undefined;
@@ -367,12 +400,13 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
       attemptId: attempt.attemptId, modelId: null, modelCalls: usage.modelCalls, toolCalls: usage.toolCalls,
       inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens,
       cacheWriteTokens: usage.cacheWriteTokens, totalTokens: usage.totalTokens,
-      estimatedCostUsd: usage.estimatedCostUsd, costStatus: "estimate", pricingVersion: usage.pricingVersion, updatedAt,
+      estimatedCostUsd: usageComplete ? usage.estimatedCostUsd : null, costStatus: usageComplete ? "estimate" : "unknown",
+      pricingVersion: usageComplete ? usage.pricingVersion : null, updatedAt,
     });
     return appendV2(runId, { type: "usage.updated", data: {
       modelCalls: record.modelCalls, toolCalls: record.toolCalls, inputTokens: record.inputTokens, outputTokens: record.outputTokens,
       cacheReadTokens: record.cacheReadTokens, cacheWriteTokens: record.cacheWriteTokens, totalTokens: record.totalTokens,
-      costStatus: "estimate", estimatedCostUsd: record.estimatedCostUsd!,
+      costStatus: record.costStatus, ...(record.estimatedCostUsd !== null ? { estimatedCostUsd: record.estimatedCostUsd } : {}),
     } }, false);
   }
   async function finalizeRun(runId: string, task: WorkerTaskResult): Promise<void> {
@@ -406,18 +440,18 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
         storage.messages.append({ id: randomUUID(), conversationId: record.conversationId, runId, role: "assistant", content: result.reply, source: "agent", extensionId: null, createdAt: terminalAt });
       }
       if (task.usage) {
-        const usageEvent = usageUpdated(runId, task.usage);
+        const usageEvent = usageUpdated(runId, task.usage, task.usageComplete !== false);
         if (usageEvent) published.push(usageEvent);
       }
       storage.fileChangesets.finalizeRun(runId, terminalAt);
       storage.results.save(runId, { result, artifacts: locations.map((entry) => ({ kind: entry.kind, path: entry.path, sha256: entry.sha256 })) }, terminalAt);
       if (attempt.status === "running") {
         const error = result.status === "failed" ? parseV2Error({ schemaVersion: 2, code: "internal_error", message: result.error.message.slice(0, 512) || "Run failed.", retryable: false }) : undefined;
-        storage.attempts.finish(attempt.attemptId, result.status, terminalAt, error, Boolean(task.usage));
+        storage.attempts.finish(attempt.attemptId, result.status, terminalAt, error, Boolean(task.usage) && task.usageComplete !== false);
       }
       if (result.status === "completed") published.push(appendV2(runId, { type: "run.completed", data: { resultRef: runId } }, false));
       else if (result.status === "failed") published.push(appendV2(runId, { type: "run.failed", data: { error: parseV2Error({ schemaVersion: 2, code: "internal_error", message: result.error.message.slice(0, 512) || "Run failed.", retryable: false }) } }, false));
-      else published.push(appendV2(runId, { type: "run.cancelled", data: { reason: result.reason === "timeout" ? "timeout" : "user" } }, false));
+      else published.push(appendV2(runId, { type: "run.cancelled", data: { reason: result.reason } }, false));
       storage.runs.updateStatus(runId, status, terminalAt, terminalAt);
       storage.activeSlot.release({ runId, claimToken: slot.claimToken, generation: slot.generation });
       storage.workerIdentity.setStatus(worker.bootId, "idle", terminalAt);

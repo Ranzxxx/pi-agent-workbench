@@ -8,7 +8,7 @@ import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { parseEvent, parseManifest, parseReport, type RunEvent } from "@pi-workbench/protocol";
 import { InMemoryCredentialStore } from "@pi-workbench/agent-runtime";
-import { runPublicRepositoryAnalysis } from "../src/public-runner.js";
+import { PublicAnalysisCancelledError, runPublicRepositoryAnalysis, type WorkflowCheckpointRecord } from "../src/public-runner.js";
 
 const sha = "7c318bd1aa4b4affab29761f15a9604323fe2a3b";
 function octal(value: number, size: number): string { return value.toString(8).padStart(size - 1, "0") + "\0"; }
@@ -59,6 +59,7 @@ test("runs pinned public snapshot through faux PI provider and publishes evidenc
     fauxAssistantMessage(fauxToolCall("register_evidence", {
       id: "ev-license", path: "package.json", startLine: 3, endLine: 3, excerpt: "  \"license\": \"MIT\"",
     }), { stopReason: "toolUse" }),
+    fauxAssistantMessage('{"status":"complete"}'),
     fauxAssistantMessage(JSON.stringify({
       title: "Fixture package analysis",
       claims: [{ id: "license", kind: "fact", text: "The package declares the MIT license.", evidenceIds: ["ev-license"] }],
@@ -73,14 +74,14 @@ test("runs pinned public snapshot through faux PI provider and publishes evidenc
       credentials: new InMemoryCredentialStore(),
       provider: faux.provider,
       model: faux.getModel(),
-      budget: { timeoutMs: 5000, maxModelCalls: 4, maxToolCalls: 8, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
+      budget: { timeoutMs: 5000, maxModelCalls: 5, maxToolCalls: 8, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
       pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       fetch: fetcher,
       onEvent(event) { events.push(event); },
     });
     assert.equal(result.status, "completed");
     assert.equal(result.snapshot.sha, sha);
-    assert.equal(result.result.usage.modelCalls, 4);
+    assert.equal(result.result.usage.modelCalls, 5);
     assert.equal(result.result.usage.toolCalls, 3);
     assert.ok(result.directory);
     const report = parseReport(JSON.parse(await readFile(path.join(result.directory!, "report.json"), "utf8")));
@@ -210,4 +211,151 @@ test("external cancellation reaches the PI analysis session and stops further mo
     const finish = log.at(-1);
     assert.equal(finish?.type === "run.finished" ? finish.data.status : "", "cancelled");
   } finally { controller.abort(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("the workflow deadline also cancels fixed-snapshot download and preserves timeout reason", { timeout: 5000 }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-task014-deadline-"));
+  const faux = fauxProvider({ api: "workflow-timeout", provider: "workflow-timeout", models: [{ id: "test" }] });
+  let fetchStarted = false;
+  const fetcher: typeof fetch = async (_input, init) => {
+    fetchStarted = true;
+    const signal = init?.signal;
+    if (signal?.aborted) throw signal.reason;
+    return await new Promise<Response>((_resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  };
+  try {
+    await assert.rejects(runPublicRepositoryAnalysis({
+      repository: { url: "https://github.com/sindresorhus/slugify", ref: "main" },
+      cacheDirectory: path.join(root, "cache"), outputDirectory: path.join(root, "runs"),
+      credentials: new InMemoryCredentialStore(), provider: faux.provider, model: faux.getModel(),
+      budget: { timeoutMs: 30, maxModelCalls: 2, maxToolCalls: 2, maxTokens: 1000, maxOutputTokens: 200, maxCostUsd: 0.2 },
+      pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, fetch: fetcher,
+    }), (error: unknown) => error instanceof PublicAnalysisCancelledError && error.reason === "timeout");
+    assert.equal(fetchStarted, true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("continues from durable stage checkpoints with the same fixed snapshot and run budget", { timeout: 15000 }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-task014-recovery-"));
+  const archive = fixtureArchive();
+  let fetchCalls = 0;
+  const fetcher: typeof fetch = async (input) => {
+    fetchCalls++;
+    const url = String(input);
+    if (url === "https://api.github.com/repos/sindresorhus/slugify") return response(JSON.stringify({ default_branch: "main" }), url);
+    if (url.endsWith("/commits/main")) return response(JSON.stringify({ sha, commit: { sha } }), url);
+    if (url.endsWith("/legacy.tar.gz/" + sha)) return response(archive.buffer.slice(archive.byteOffset, archive.byteOffset + archive.byteLength) as ArrayBuffer, url);
+    return new Response("", { status: 404 });
+  };
+  const faux = fauxProvider({ api: "public-resume-test", provider: "public-resume-test", models: [{ id: "test" }], tokenSize: { min: 8, max: 8 } });
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("list_files", {}), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("read_file", { path: "package.json" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("register_evidence", { id: "ev-license", path: "package.json", startLine: 3, endLine: 3, excerpt: "  \"license\": \"MIT\"" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage('{"status":"complete"}'),
+    fauxAssistantMessage(JSON.stringify({ title: "Recovered fixture report", claims: [
+      { id: "license", kind: "fact", text: "The package declares the MIT license.", evidenceIds: ["ev-license"] },
+    ] })),
+  ]);
+  const checkpointRows: WorkflowCheckpointRecord[] = [];
+  const checkpointStore = {
+    list(runId: string) { return checkpointRows.filter((record) => record.runId === runId); },
+    create(record: WorkflowCheckpointRecord) { checkpointRows.push(record); return record; },
+  };
+  const controller = new AbortController();
+  const common = {
+    repository: { url: "https://github.com/sindresorhus/slugify", ref: "main" },
+    cacheDirectory: path.join(root, "cache"), outputDirectory: path.join(root, "runs"),
+    workflowDirectory: path.join(root, "workflows", "run-recovery"), checkpointStore,
+    credentials: new InMemoryCredentialStore(), provider: faux.provider, model: faux.getModel(),
+    budget: { timeoutMs: 5000, maxModelCalls: 6, maxToolCalls: 8, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
+    pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, fetch: fetcher,
+    runId: "run-recovery", attemptId: "attempt-one",
+  };
+  try {
+    const first = await runPublicRepositoryAnalysis({ ...common, signal: controller.signal, onWorkflowProgress(event) {
+      if (event.type === "checkpoint_saved" && event.data.phase === "validation") controller.abort();
+    } });
+    assert.equal(first.status, "cancelled");
+    assert.equal(first.result.usage.modelCalls, 5);
+    assert.equal(first.usageComplete, true);
+    const firstFetchCalls = fetchCalls;
+    assert.ok(checkpointRows.some((record) => record.phaseId === "snapshot" && record.status === "completed"));
+    assert.ok(checkpointRows.some((record) => record.phaseId === "evidence" && record.status === "completed"));
+    assert.ok(checkpointRows.some((record) => record.phaseId === "analysis" && record.status === "completed"));
+    assert.ok(checkpointRows.some((record) => record.phaseId === "validation" && record.status === "completed"));
+
+    const recovered = await runPublicRepositoryAnalysis({ ...common, attemptId: "attempt-two", initialUsage: first.result.usage,
+      initialUsageComplete: first.usageComplete, signal: new AbortController().signal });
+    assert.equal(recovered.status, "completed", JSON.stringify(recovered));
+    assert.equal(recovered.snapshot.sha, first.snapshot.sha);
+    assert.equal(fetchCalls, firstFetchCalls, "resume must use its stored immutable snapshot checkpoint");
+    assert.equal(recovered.result.usage.modelCalls, 0, "the result reports only the new attempt's usage");
+    assert.equal(checkpointRows.some((record) => record.phaseId === "validation" && record.status === "completed"), true);
+    assert.equal(checkpointRows.some((record) => record.phaseId === "publication" && record.status === "completed"), true);
+    assert.deepEqual((await readdir(path.join(root, "runs", "run-recovery"))).sort(), ["attempt-one", "final"].sort());
+    const eventLog = (await readFile(path.join(recovered.directory!, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line) as RunEvent);
+    assert.equal(eventLog[0]?.type, "run.started", "a cache-only resume still produces a valid attempt event log");
+    assert.equal(eventLog.at(-1)?.type, "run.finished");
+    const callCount = faux.state.callCount;
+    const checkpointCount = checkpointRows.length;
+    const replay = await runPublicRepositoryAnalysis({ ...common, attemptId: "attempt-two", initialUsage: first.result.usage,
+      initialUsageComplete: first.usageComplete, signal: new AbortController().signal });
+    assert.equal(replay.status, "completed");
+    assert.deepEqual(replay.artifacts, recovered.artifacts);
+    assert.deepEqual(replay.result.usage, recovered.result.usage);
+    assert.equal(faux.state.callCount, callCount, "idempotent replay must not call the model again");
+    assert.equal(checkpointRows.length, checkpointCount, "idempotent replay must not duplicate stage checkpoints");
+  } finally { controller.abort(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("analysis requests a bounded evidence refresh and invalidates downstream inputs", { timeout: 15000 }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-task014-evidence-refresh-"));
+  const archive = fixtureArchive();
+  const fetcher: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url === "https://api.github.com/repos/sindresorhus/slugify") return response(JSON.stringify({ default_branch: "main" }), url);
+    if (url.endsWith("/commits/" + sha)) return response(JSON.stringify({ sha, commit: { sha } }), url);
+    if (url.endsWith("/legacy.tar.gz/" + sha)) return response(archive.buffer.slice(archive.byteOffset, archive.byteOffset + archive.byteLength) as ArrayBuffer, url);
+    return new Response("", { status: 404 });
+  };
+  const faux = fauxProvider({ api: "public-evidence-refresh-test", provider: "public-evidence-refresh-test", models: [{ id: "test" }], tokenSize: { min: 8, max: 8 } });
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("list_files", {}), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("register_evidence", { id: "ev-license", path: "package.json", startLine: 3, endLine: 3, excerpt: "  \"license\": \"MIT\"" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage('{"status":"complete"}'),
+    fauxAssistantMessage(JSON.stringify({ title: "Draft", claims: [{ id: "license", kind: "fact", text: "License detail.", evidenceIds: ["ev-license"] }], evidenceRequests: ["Find the package name declaration."] })),
+    fauxAssistantMessage(fauxToolCall("search_text", { query: "name" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("register_evidence", { id: "ev-name", path: "package.json", startLine: 2, endLine: 2, excerpt: "  \"name\": \"fixture\"," }), { stopReason: "toolUse" }),
+    fauxAssistantMessage('{"status":"complete"}'),
+    fauxAssistantMessage(JSON.stringify({ title: "Fixture package", claims: [
+      { id: "license", kind: "fact", text: "License is MIT.", evidenceIds: ["ev-license"] },
+      { id: "name", kind: "fact", text: "The package name is fixture.", evidenceIds: ["ev-name"] },
+    ] })),
+  ]);
+  const checkpointRows: WorkflowCheckpointRecord[] = [];
+  const checkpointStore = {
+    list(runId: string) { return checkpointRows.filter((record) => record.runId === runId); },
+    create(record: WorkflowCheckpointRecord) { checkpointRows.push(record); return record; },
+  };
+  try {
+    const result = await runPublicRepositoryAnalysis({
+      repository: { url: "https://github.com/sindresorhus/slugify", ref: sha },
+      cacheDirectory: path.join(root, "cache"), outputDirectory: path.join(root, "runs"),
+      workflowDirectory: path.join(root, "workflows", "run-refresh"), checkpointStore,
+      credentials: new InMemoryCredentialStore(), provider: faux.provider, model: faux.getModel(),
+      budget: { timeoutMs: 8000, maxModelCalls: 9, maxToolCalls: 8, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
+      pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, fetch: fetcher,
+      runId: "run-refresh", attemptId: "attempt-refresh",
+    });
+    assert.equal(result.status, "completed");
+    assert.deepEqual(result.report?.evidence.map((item) => item.id).sort(), ["ev-license", "ev-name"]);
+    const completed = checkpointRows.filter((record) => record.status === "completed");
+    assert.equal(new Set(completed.filter((record) => record.phaseId === "evidence").map((record) => record.inputSha256)).size, 2);
+    assert.equal(new Set(completed.filter((record) => record.phaseId === "analysis").map((record) => record.inputSha256)).size, 2);
+    assert.equal(completed.filter((record) => record.phaseId === "validation").length, 1);
+    assert.equal(completed.filter((record) => record.phaseId === "publication").length, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

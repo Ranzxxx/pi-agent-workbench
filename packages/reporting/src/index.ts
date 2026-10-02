@@ -10,7 +10,10 @@ export {
 } from "./offline-runner.js";
 export { SYNTHETIC_SNAPSHOT_ID } from "./contracts.js";
 export {
+  PublicAnalysisCancelledError,
   runPublicRepositoryAnalysis,
   type PublicAnalysisOptions,
   type PublicAnalysisSummary,
+  type WorkflowCheckpointRecord,
+  type WorkflowCheckpointStore,
 } from "./public-runner.js";
