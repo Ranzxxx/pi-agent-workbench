@@ -18,6 +18,9 @@ export interface RepositoryAnalysisContext {
     | { type: "tool.started" | "tool.finished"; toolCallId: string; toolName: string; isError?: boolean }
     | { type: "run.cancelling"; reason: CancelReason }
     | { type: "run.warning"; code: "cancellation_pending" }
+    | { type: "workflow_progress"; data: { phase: string; message: string } }
+    | { type: "checkpoint_saved"; data: { checkpointId: string; phase: string } }
+    | { type: "runtime_status"; data: { phase: "compaction"; state: "started" | "completed" | "aborted" | "failed"; reason: "manual" | "threshold" | "overflow" } }
   ) => void;
 }
 

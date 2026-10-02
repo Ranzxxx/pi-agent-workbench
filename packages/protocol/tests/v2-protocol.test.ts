@@ -64,6 +64,10 @@ test("v2 event envelope and cursor enforce identities, positive sequence, and mo
     timestamp, type: "usage.updated", data: { modelCalls: 1, toolCalls: 0, inputTokens: 2, outputTokens: 3, cacheReadTokens: 1, cacheWriteTokens: 0, totalTokens: 6, costStatus: "unknown" },
   };
   assert.equal(parseV2RunEvent(usageEvent).type, "usage.updated");
+  for (const reason of ["token_limit", "call_limit", "tool_limit", "cost_limit"]) {
+    assert.equal(parseV2RunEvent({ ...second, type: "run.cancelling", data: { reason } }).type, "run.cancelling");
+    assert.equal(parseV2RunEvent({ ...second, type: "run.cancelled", data: { reason } }).type, "run.cancelled");
+  }
   assert.throws(() => parseV2RunEvent({ ...usageEvent, data: { ...usageEvent.data, totalTokens: 5 } }));
   assert.throws(() => parseV2RunEvent({ ...usageEvent, data: { ...usageEvent.data, costStatus: "estimate" } }));
   for (const bad of [

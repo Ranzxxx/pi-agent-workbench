@@ -22,6 +22,10 @@ export interface ConversationRuntimeOptions {
   tools?: ToolDefinition[];
   budget: Budget;
   pricing: Pricing;
+  /** A continuation shares limits with earlier attempts, while each turn reports its own usage. */
+  initialUsage?: Usage;
+  initialUsageComplete?: boolean;
+  compactionSettings?: { reserveTokens: number; keepRecentTokens: number };
   cancellationGraceMs?: number;
   sessionId?: string;
   restoredSnapshot?: ConversationSessionSnapshot;
@@ -39,15 +43,18 @@ export interface ConversationSessionSnapshot {
 
 export interface ConversationPromptOptions {
   signal?: AbortSignal;
+  initialUsage?: Usage;
+  initialUsageComplete?: boolean;
   onTextDelta?: (text: string) => void;
   onCancellationPending?: () => void;
+  onCompactionStatus?: (status: { state: "started" | "completed" | "aborted" | "failed"; reason: "manual" | "threshold" | "overflow" }) => void;
   onToolEvent?: (event: { phase: "started" | "finished"; toolCallId: string; toolName: string; isError?: boolean }) => void;
 }
 
 export type ConversationTurnResult =
-  | { status: "completed"; text: string; usage: Usage }
-  | { status: "failed"; error: { code: "model_error" | "runtime_error"; message: string }; usage: Usage }
-  | { status: "cancelled"; reason: CancelReason; usage: Usage };
+  | { status: "completed"; text: string; usage: Usage; usageComplete: boolean }
+  | { status: "failed"; error: { code: "model_error" | "runtime_error"; message: string }; usage: Usage; usageComplete: boolean }
+  | { status: "cancelled"; reason: CancelReason; usage: Usage; usageComplete: boolean };
 
 function blockedStream(model: Model<string>): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
@@ -68,6 +75,9 @@ function blockedStream(model: Model<string>): AssistantMessageEventStream {
 export async function createConversationSession(options: ConversationRuntimeOptions) {
   if (!options.credentials || typeof options.credentials.read !== "function") throw new Error("Explicit credentials are required");
   if (!options.systemPrompt.trim()) throw new Error("An explicit system prompt is required");
+  if (options.compactionSettings && [options.compactionSettings.reserveTokens, options.compactionSettings.keepRecentTokens].some((value) => !Number.isSafeInteger(value) || value < 1 || value > 100_000)) {
+    throw new Error("Invalid compaction settings");
+  }
   const graceMs = options.cancellationGraceMs ?? 1000;
   if (!Number.isInteger(graceMs) || graceMs < 1 || graceMs > 1000) throw new Error("Invalid cancellation grace");
   if (options.model.provider !== options.provider.id || !options.provider.getModels().some((item) => item.id === options.model.id && item.api === options.model.api)) {
@@ -106,7 +116,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
       cwd: options.cwd, agentDir: options.cwd, modelRuntime: runtime, model: options.model,
       resourceLoader: resources(options.systemPrompt), tools: (options.tools ?? []).map((tool) => tool.name), customTools: options.tools ?? [],
       sessionManager: SessionManager.inMemory(options.cwd, { id: sessionId }, sessionEntries),
-      settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+      settingsManager: SettingsManager.inMemory({ compaction: { enabled: true, ...options.compactionSettings }, retry: { enabled: false } }),
     }));
   } catch (error) {
     runtime.unregisterProvider(options.provider.id);
@@ -121,6 +131,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
     timer?: ReturnType<typeof setTimeout>;
     graceTimer?: ReturnType<typeof setTimeout>;
     eventError: boolean;
+    onCompactionStatus?: ConversationPromptOptions["onCompactionStatus"];
     onTextDelta?: (text: string) => void;
     onCancellationPending?: () => void;
     onToolEvent?: ConversationPromptOptions["onToolEvent"];
@@ -133,6 +144,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
   function abort(reason: CancelReason): boolean {
     if (!active || active.cancelReason) return false;
     active.cancelReason = reason;
+    session.abortCompaction();
     session.agent.abort();
     active.graceTimer = setTimeout(() => {
       if (active?.cancelReason) {
@@ -149,7 +161,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
     if (reason) { abort(reason); return blockedStream(model); }
     return originalStream(model, context, {
       ...streamOptions,
-      maxTokens: Math.min(model.maxTokens, turn.ledger.budget.maxOutputTokens, turn.ledger.budget.maxTokens - turn.ledger.snapshot().totalTokens),
+      maxTokens: Math.min(model.maxTokens, turn.ledger.budget.maxOutputTokens, turn.ledger.remainingTokens()),
     });
   };
   const admittedTools = new Set<string>();
@@ -176,12 +188,25 @@ export async function createConversationSession(options: ConversationRuntimeOpti
       turn.lastAssistant = event.message;
       try {
         turn.ledger.record(event.message.usage);
+        if ((event.message.stopReason === "error" || event.message.stopReason === "aborted") && event.message.usage.totalTokens === 0 && turn.ledger.snapshot().modelCalls > 0) {
+          turn.ledger.markIncomplete();
+        }
         const reason = turn.ledger.exhausted();
         if (reason) abort(reason);
       } catch {
         turn.eventError = true;
         session.agent.abort();
       }
+    } else if (event.type === "compaction_start") {
+      try { turn.onCompactionStatus?.({ state: "started", reason: event.reason }); } catch { /* UI observers do not control runtime. */ }
+    } else if (event.type === "compaction_end") {
+      if (event.result?.usage) {
+        const usage = event.result.usage;
+        turn.ledger.record({ input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite });
+        const reason = turn.ledger.exhausted();
+        if (reason && !turn.cancelReason) abort(reason);
+      } else turn.ledger.markIncomplete();
+      try { turn.onCompactionStatus?.({ state: event.aborted ? "aborted" : event.errorMessage ? "failed" : "completed", reason: event.reason }); } catch { /* UI observers do not control runtime. */ }
     } else if (event.type === "tool_execution_start") {
       const reason = turn.ledger.toolCall();
       if (reason) abort(reason);
@@ -200,7 +225,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
 
   const unsubscribe = session.subscribe((event) => {
     try { record(event); } catch {
-      if (active) active.eventError = true;
+      if (active) { active.eventError = true; active.ledger.markIncomplete(); }
       session.agent.abort();
     }
   });
@@ -227,8 +252,10 @@ export async function createConversationSession(options: ConversationRuntimeOpti
     if (active) throw new Error("Conversation session is busy");
     if (typeof text !== "string" || !text.trim() || Buffer.byteLength(text, "utf8") > 32 * 1024) throw new Error("Invalid conversation prompt");
     const turn: ActiveTurn = {
-      ledger: new BudgetLedger(options.budget, options.pricing),
+      ledger: new BudgetLedger(options.budget, options.pricing, promptOptions.initialUsage ?? options.initialUsage,
+        promptOptions.initialUsageComplete ?? options.initialUsageComplete),
       eventError: false,
+      onCompactionStatus: promptOptions.onCompactionStatus,
       onTextDelta: promptOptions.onTextDelta,
       onCancellationPending: promptOptions.onCancellationPending,
       onToolEvent: promptOptions.onToolEvent,
@@ -246,19 +273,19 @@ export async function createConversationSession(options: ConversationRuntimeOpti
           await session.agent.waitForIdle();
         }
         await persistSnapshot();
-        if (turn.cancelReason) return { status: "cancelled", reason: turn.cancelReason, usage: turn.ledger.snapshot() };
-        if (turn.eventError) return { status: "failed", error: { code: "runtime_error", message: "Conversation runtime event validation failed" }, usage: turn.ledger.snapshot() };
+        if (turn.cancelReason) return { status: "cancelled", reason: turn.cancelReason, usage: turn.ledger.snapshot(), usageComplete: turn.ledger.usageComplete };
+        if (turn.eventError) return { status: "failed", error: { code: "runtime_error", message: "Conversation runtime event validation failed" }, usage: turn.ledger.snapshot(), usageComplete: turn.ledger.usageComplete };
         if (!turn.lastAssistant || turn.lastAssistant.stopReason !== "stop") {
-          return { status: "failed", error: { code: "model_error", message: "Model did not complete the conversation turn" }, usage: turn.ledger.snapshot() };
+          return { status: "failed", error: { code: "model_error", message: "Model did not complete the conversation turn" }, usage: turn.ledger.snapshot(), usageComplete: turn.ledger.usageComplete };
         }
         const response = turn.lastAssistant.content.filter((part) => part.type === "text").map((part) => part.text).join("");
-        return { status: "completed", text: response.slice(0, 16_000), usage: turn.ledger.snapshot() };
+        return { status: "completed", text: response.slice(0, 16_000), usage: turn.ledger.snapshot(), usageComplete: turn.ledger.usageComplete };
       } catch {
         try { await persistSnapshot(); } catch {
-          return { status: "failed", error: { code: "runtime_error", message: "Conversation session could not be persisted" }, usage: turn.ledger.snapshot() };
+          return { status: "failed", error: { code: "runtime_error", message: "Conversation session could not be persisted" }, usage: turn.ledger.snapshot(), usageComplete: turn.ledger.usageComplete };
         }
-        if (turn.cancelReason) return { status: "cancelled", reason: turn.cancelReason, usage: turn.ledger.snapshot() };
-        return { status: "failed", error: { code: "runtime_error", message: "Conversation execution failed" }, usage: turn.ledger.snapshot() };
+        if (turn.cancelReason) return { status: "cancelled", reason: turn.cancelReason, usage: turn.ledger.snapshot(), usageComplete: turn.ledger.usageComplete };
+        return { status: "failed", error: { code: "runtime_error", message: "Conversation execution failed" }, usage: turn.ledger.snapshot(), usageComplete: turn.ledger.usageComplete };
       } finally {
         clearTimeout(turn.timer);
         clearTimeout(turn.graceTimer);

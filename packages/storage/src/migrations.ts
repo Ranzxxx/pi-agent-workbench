@@ -40,9 +40,55 @@ export function migrationChecksum(sql: string): string {
   return createHash("sha256").update(sql, "utf8").digest("hex");
 }
 
+// TASK-013's development database shipped before result_sha256 was added to 004.
+// Keep both identities pinned: this is a specific upgrade, never a checksum bypass.
+const legacyFileChangesChecksum = "6649247133cebd5f7bc79fa425bfa0e204c6792acf5923f2173ff5008c5b6a64";
+const currentFileChangesChecksum = "b8f53ed99693bafb3b8ff07352aadff636e7052d01e52bde1be214bdec06023e";
+const resultColumn = "  result_sha256 TEXT REFERENCES content_objects(sha256) ON DELETE RESTRICT,\n";
+type AppliedMigration = { version: number; name: string; checksum: string };
+
+function isLegacyFileChanges(record: AppliedMigration, migration: StorageMigration): boolean {
+  return record.version === 4 && record.name === "file_changes" && record.checksum === legacyFileChangesChecksum &&
+    migration.version === 4 && migration.name === record.name && migrationChecksum(migration.sql) === currentFileChangesChecksum;
+}
+
+function assertLegacySchema(db: DatabaseSync, sorted: readonly StorageMigration[], appliedCount: number): void {
+  const expected = new DatabaseSync(":memory:");
+  try {
+    for (const migration of sorted.slice(0, appliedCount)) {
+      const sql = migration.version === 4 ? migration.sql.replace(resultColumn, "") : migration.sql;
+      if (migration.version === 4 && migrationChecksum(sql) !== legacyFileChangesChecksum) throw new StorageSchemaError("Unknown legacy file migration");
+      expected.exec(sql);
+    }
+    const schema = "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name";
+    if (JSON.stringify(db.prepare(schema).all()) !== JSON.stringify(expected.prepare(schema).all())) {
+      throw new StorageSchemaError("Legacy migration 4 database structure does not match the known schema");
+    }
+  } finally { expected.close(); }
+}
+
 export function applyMigrations(db: DatabaseSync, migrations: readonly StorageMigration[]): void {
   const sorted = validateMigrationList(migrations);
-  const applied = readAndValidateAppliedMigrations(db, sorted);
+  let applied = readAndValidateAppliedMigrations(db, sorted);
+
+  if (applied.some((record, index) => isLegacyFileChanges(record, sorted[index]!))) {
+    begin(db);
+    try {
+      // Recheck after taking the write lock so another opener cannot race this repair.
+      const locked = readAndValidateAppliedMigrations(db, sorted);
+      const legacy = locked.find((record, index) => isLegacyFileChanges(record, sorted[index]!));
+      if (legacy) {
+        db.exec("ALTER TABLE file_operations ADD COLUMN result_sha256 TEXT REFERENCES content_objects(sha256) ON DELETE RESTRICT");
+        db.prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 4 AND name = 'file_changes' AND checksum = ?")
+          .run(currentFileChangesChecksum, legacyFileChangesChecksum);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      rollback(db);
+      throw new StorageMigrationError(4, error);
+    }
+    applied = readAndValidateAppliedMigrations(db, sorted);
+  }
 
   for (const migration of sorted.slice(applied.length)) {
     begin(db);
@@ -93,7 +139,7 @@ function tableExists(db: DatabaseSync, name: string): boolean {
   return db.prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
 }
 
-function readAndValidateAppliedMigrations(db: DatabaseSync, sorted: readonly StorageMigration[]): Array<{ version: number; name: string; checksum: string }> {
+function readAndValidateAppliedMigrations(db: DatabaseSync, sorted: readonly StorageMigration[]): AppliedMigration[] {
   const applied = tableExists(db, "schema_migrations")
     ? db.prepare("SELECT version, name, checksum FROM schema_migrations ORDER BY version").all() as Array<{ version: number; name: string; checksum: string }>
     : [];
@@ -104,10 +150,11 @@ function readAndValidateAppliedMigrations(db: DatabaseSync, sorted: readonly Sto
     const record = applied[index]!;
     const migration = sorted[index];
     if (!migration || migration.version !== record.version) throw new StorageSchemaError("Database migration history is incomplete or unknown");
-    if (record.name !== migration.name || record.checksum !== migrationChecksum(migration.sql)) {
+    if ((record.name !== migration.name || record.checksum !== migrationChecksum(migration.sql)) && !isLegacyFileChanges(record, migration)) {
       throw new StorageSchemaError(`Database migration ${record.version} does not match the installed migration`);
     }
   }
+  if (applied.some((record, index) => isLegacyFileChanges(record, sorted[index]!))) assertLegacySchema(db, sorted, applied.length);
   return applied;
 }
 

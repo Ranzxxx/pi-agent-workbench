@@ -202,10 +202,16 @@ export const V2RunEventSchema = Type.Union([
     changesetId: id, operationId: id, path: relativeFilePath, reason: smallText,
   }) }),
   object({ ...eventEnvelope, type: Type.Literal("usage.updated"), data: usage }),
-  object({ ...eventEnvelope, type: Type.Literal("run.cancelling"), data: object({ reason: Type.Union([Type.Literal("user"), Type.Literal("shutdown"), Type.Literal("timeout")]) }) }),
+  object({ ...eventEnvelope, type: Type.Literal("run.cancelling"), data: object({ reason: Type.Union([
+    Type.Literal("user"), Type.Literal("shutdown"), Type.Literal("timeout"), Type.Literal("token_limit"),
+    Type.Literal("call_limit"), Type.Literal("tool_limit"), Type.Literal("cost_limit"),
+  ]) }) }),
   object({ ...eventEnvelope, type: Type.Literal("run.completed"), data: object({ resultRef: Type.Optional(id) }) }),
   object({ ...eventEnvelope, type: Type.Literal("run.failed"), data: object({ error: V2ErrorSchema }) }),
-  object({ ...eventEnvelope, type: Type.Literal("run.cancelled"), data: object({ reason: Type.Union([Type.Literal("user"), Type.Literal("shutdown"), Type.Literal("timeout")]) }) }),
+  object({ ...eventEnvelope, type: Type.Literal("run.cancelled"), data: object({ reason: Type.Union([
+    Type.Literal("user"), Type.Literal("shutdown"), Type.Literal("timeout"), Type.Literal("token_limit"),
+    Type.Literal("call_limit"), Type.Literal("tool_limit"), Type.Literal("cost_limit"),
+  ]) }) }),
   object({ ...eventEnvelope, type: Type.Literal("run.interrupted"), data: object({ reason: Type.Union([Type.Literal("process_exit"), Type.Literal("state_uncertain")]) }) }),
   object({ ...eventEnvelope, type: Type.Literal("changeset_undone"), data: object({
     changesetId: id, status: Type.Union([Type.Literal("undone"), Type.Literal("partial"), Type.Literal("conflict")]),

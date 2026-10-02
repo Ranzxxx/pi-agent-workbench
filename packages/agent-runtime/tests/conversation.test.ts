@@ -123,3 +123,58 @@ test("ordinary conversation cancellation propagates and preserves the context se
     assert.equal(conversation.busy, false);
   } finally { await conversation.dispose(); }
 });
+
+test("PI compaction usage is budgeted and its summary is restored from the public session snapshot", { timeout: 10000 }, async () => {
+  const contexts: string[] = [];
+  const statuses: string[] = [];
+  const faux = fauxProvider({ api: "conversation-compaction-test", provider: "conversation-compaction-test",
+    models: [{ id: "test", contextWindow: 256, maxTokens: 64 }], tokenSize: { min: 8, max: 8 } });
+  faux.setResponses([
+    fauxAssistantMessage("old turn one response"),
+    fauxAssistantMessage("old turn two response"),
+    fauxAssistantMessage("A durable summary of old turn one."),
+  ]);
+  const original = faux.provider.streamSimple.bind(faux.provider);
+  const provider: Provider = { ...faux.provider, streamSimple(model, context, options) {
+    contexts.push(JSON.stringify(context.messages));
+    return original(model, context, options);
+  } };
+  const base = {
+    cwd: process.cwd(), credentials: new InMemoryCredentialStore(), provider, model: faux.getModel(),
+    systemPrompt: "Answer concisely.", budget: { ...budget, maxModelCalls: 8, maxTokens: 10000 },
+    pricing: { version: "compaction-test", input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    compactionSettings: { reserveTokens: 240, keepRecentTokens: 16 },
+  } satisfies ConversationRuntimeOptions;
+  const conversation = await createConversationSession(base);
+  let saved: ConversationSessionSnapshot | undefined;
+  try {
+    assert.equal((await conversation.prompt("old turn one prompt")).status, "completed");
+    const second = await conversation.prompt("old turn two prompt", { onCompactionStatus: (status) => statuses.push(status.state) });
+    assert.equal(second.status, "completed", JSON.stringify(second));
+    if (second.status === "completed") {
+      assert.equal(second.usage.modelCalls, 2);
+      assert.ok(second.usage.totalTokens >= 100);
+      assert.equal(second.usageComplete, true);
+    }
+    assert.ok(statuses.includes("started"));
+    assert.ok(statuses.includes("completed"));
+    saved = conversation.snapshot();
+  } finally { await conversation.dispose(); }
+
+  assert.ok(saved);
+  assert.match(JSON.stringify(saved.entries), /old turn one prompt/u);
+  const compactedEntry = saved.entries.find((entry) => entry.type === "compaction");
+  assert.ok(compactedEntry);
+  if (compactedEntry?.type === "compaction") assert.ok(compactedEntry.usage && compactedEntry.usage.totalTokens > 0);
+  faux.setResponses([fauxAssistantMessage("restored successfully")]);
+  const restored = await createConversationSession({ ...base, compactionSettings: { reserveTokens: 16, keepRecentTokens: 16 }, restoredSnapshot: saved });
+  try {
+    faux.setResponses([fauxAssistantMessage("restored successfully")]);
+    const result = await restored.prompt("continue after restart");
+    assert.equal(result.status, "completed");
+    const restoredContext = contexts.at(-1) ?? "";
+    assert.match(restoredContext, /A durable summary of old turn one/u);
+    assert.doesNotMatch(restoredContext, /old turn one prompt/u);
+    assert.match(restoredContext, /continue after restart/u);
+  } finally { await restored.dispose(); }
+});

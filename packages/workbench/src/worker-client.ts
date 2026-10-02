@@ -8,7 +8,7 @@ export interface WorkerClientOptions {
   entryPath: string; dataDirectory: string; fixtureRoot: string; mode: "fake" | "online";
   apiKey?: string; githubToken?: string; startupTimeoutMs?: number;
 }
-export interface WorkerTaskResult { result: WorkbenchResult; usage?: Usage; artifacts?: Array<{ kind: string; path: string; sha256: string }>; snapshot?: ConversationSessionSnapshot; }
+export interface WorkerTaskResult { result: WorkbenchResult; usage?: Usage; usageComplete?: boolean; artifacts?: Array<{ kind: string; path: string; sha256: string }>; snapshot?: ConversationSessionSnapshot; }
 export interface WorkerTaskHandlers {
   onEvent(event: WorkerEventPayload): void | Promise<void>;
 }
@@ -92,7 +92,7 @@ export class WorkerClient {
     finally { if (timer) clearTimeout(timer); }
   }
 
-  async execute(input: { runId: string; conversationId: string; input: RunSubmission; snapshot?: ConversationSessionSnapshot; project?: WorkerProjectContext }, handlers: WorkerTaskHandlers): Promise<WorkerTaskResult> {
+  async execute(input: { runId: string; attemptId: string; conversationId: string; input: RunSubmission; initialUsage?: Usage; initialUsageComplete?: boolean; snapshot?: ConversationSessionSnapshot; project?: WorkerProjectContext }, handlers: WorkerTaskHandlers): Promise<WorkerTaskResult> {
     if (this.closed || this.activeRunId) throw new Error("Worker is unavailable or busy");
     this.activeRunId = input.runId;
     const result = new Promise<WorkerTaskResult>((resolve, reject) => { this.taskResolve = resolve; this.taskReject = reject; });
@@ -127,7 +127,7 @@ export class WorkerClient {
       return;
     }
     if (message.type === "done") {
-      if (message.runId === this.activeRunId) this.taskResolve?.({ result: message.result, ...(message.usage ? { usage: message.usage } : {}), ...(message.artifacts ? { artifacts: message.artifacts } : {}), ...(message.snapshot ? { snapshot: message.snapshot } : {}) });
+      if (message.runId === this.activeRunId) this.taskResolve?.({ result: message.result, ...(message.usage ? { usage: message.usage } : {}), ...(message.usageComplete !== undefined ? { usageComplete: message.usageComplete } : {}), ...(message.artifacts ? { artifacts: message.artifacts } : {}), ...(message.snapshot ? { snapshot: message.snapshot } : {}) });
       return;
     }
     // Invoke the persistence handler inside a promise boundary. It may throw
