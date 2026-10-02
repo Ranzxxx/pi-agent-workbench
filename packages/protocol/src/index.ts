@@ -239,6 +239,25 @@ export {
 } from "./workbench.js";
 
 export {
+  CapabilityCatalogEntrySchema,
+  CapabilityCatalogSchema,
+  CapabilityManifestSchema,
+  CapabilityPermissionSchema,
+  ExtensionJsonSchemaSchema,
+  ExtensionResultSchema,
+  UpdateCapabilityStateRequestSchema,
+  parseCapabilityCatalog,
+  parseCapabilityManifest,
+  type CapabilityCatalog,
+  type CapabilityCatalogEntry,
+  type CapabilityManifest,
+  type CapabilityPermission,
+  type ExtensionJsonSchema,
+  type ExtensionResult,
+  type UpdateCapabilityStateRequest,
+} from "./extensions.js";
+
+export {
   V2AttemptIdentitySchema,
   V2ConversationMessageSchema,
   V2ConversationSchema,
@@ -276,6 +295,10 @@ export {
   V2RunIdentitySchema,
   V2RunSchema,
   V2RunStatusSchema,
+  V2RunSubmissionSchema,
+  V2CapabilityInvocationSchema,
+  V2CapabilityInvocationRequestSchema,
+  V2CreateRunSubmissionSchema,
   V2SubmitRunRequestSchema,
   parseV2AttemptIdentity,
   parseV2EventCursor,
@@ -324,5 +347,7 @@ export {
   type V2RunEventPage,
   type V2RunIdentity,
   type V2RunStatus,
+  type V2RunSubmission,
+  type V2CreateRunSubmission,
   type V2SubmitRunRequest,
 } from "./v2.js";

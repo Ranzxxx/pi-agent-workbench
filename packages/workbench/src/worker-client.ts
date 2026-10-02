@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { fork, type ChildProcess } from "node:child_process";
 import type { ConversationSessionSnapshot } from "@pi-workbench/agent-runtime";
-import type { RunSubmission, Usage, WorkbenchResult } from "@pi-workbench/protocol";
+import type { V2RunSubmission, Usage, WorkbenchResult } from "@pi-workbench/protocol";
 import type { WorkerCommand, WorkerEventPayload, WorkerInbound, WorkerOutbound, WorkerProjectContext } from "./worker-ipc.js";
 
 export interface WorkerClientOptions {
@@ -92,7 +92,7 @@ export class WorkerClient {
     finally { if (timer) clearTimeout(timer); }
   }
 
-  async execute(input: { runId: string; attemptId: string; conversationId: string; input: RunSubmission; initialUsage?: Usage; initialUsageComplete?: boolean; snapshot?: ConversationSessionSnapshot; project?: WorkerProjectContext }, handlers: WorkerTaskHandlers): Promise<WorkerTaskResult> {
+  async execute(input: { runId: string; attemptId: string; conversationId: string; input: V2RunSubmission; initialUsage?: Usage; initialUsageComplete?: boolean; snapshot?: ConversationSessionSnapshot; project?: WorkerProjectContext }, handlers: WorkerTaskHandlers): Promise<WorkerTaskResult> {
     if (this.closed || this.activeRunId) throw new Error("Worker is unavailable or busy");
     this.activeRunId = input.runId;
     const result = new Promise<WorkerTaskResult>((resolve, reject) => { this.taskResolve = resolve; this.taskReject = reject; });

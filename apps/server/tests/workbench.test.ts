@@ -132,6 +132,70 @@ await test("v2 Worker persists ordinary conversations and real SSE replays after
   assert.equal((await waitForRun(baseUrl, retried.runId, "failed")).status, "failed");
 });
 
+await test("capability catalog, guarded state updates, disabled rejection, and tool extension execution", { timeout: 30_000 }, async (t) => {
+  const root = await temporaryRoot();
+  const { app, baseUrl } = await createApp(root);
+  t.after(async () => { await app.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); });
+  assert.equal(await waitForWorker(baseUrl), true);
+
+  const catalog = await fetch(`${baseUrl}/api/v2/capabilities`).then((response) => response.json()) as {
+    capabilities: Array<{ manifest: { id: string; apiVersion: string; kind: string }; enabled: boolean; status: string }>;
+  };
+  assert.equal(catalog.capabilities.length, 2);
+  const greeting = catalog.capabilities.find((entry) => entry.manifest.id === "development_greeting_tool");
+  assert.equal(greeting?.manifest.kind, "tools");
+  assert.equal(greeting?.enabled, false);
+
+  const conversation = await createConversation(baseUrl);
+  const call = { schemaVersion: 2, conversationId: conversation.conversationId, input: {
+    kind: "capability", capabilityId: "development_greeting_tool", input: {}, prompt: "[[demo:greeting-tool]]",
+  } };
+  const disabled = await fetch(`${baseUrl}/api/v2/runs`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify(call),
+  });
+  assert.equal(disabled.status, 409);
+  assert.equal((await disabled.json() as { code: string }).code, "extension_disabled");
+
+  const denied = await fetch(`${baseUrl}/api/v2/capabilities/development_greeting_tool/state`, {
+    method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 2, enabled: true }),
+  });
+  assert.equal(denied.status, 403);
+  const headers = await pickerHeaders(baseUrl);
+  const enabled = await fetch(`${baseUrl}/api/v2/capabilities/development_greeting_tool/state`, {
+    method: "PATCH", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 2, enabled: true }),
+  });
+  assert.equal(enabled.status, 200);
+  assert.equal((await enabled.json() as { capability: { status: string } }).capability.status, "enabled");
+
+  const unknown = await fetch(`${baseUrl}/api/v2/runs`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() },
+    body: JSON.stringify({ ...call, input: { ...call.input, capabilityId: "unregistered_extension" } }),
+  });
+  assert.equal(unknown.status, 400);
+  assert.equal((await unknown.json() as { code: string }).code, "unknown_extension");
+
+  const submitted = await fetch(`${baseUrl}/api/v2/runs`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify(call),
+  });
+  assert.equal(submitted.status, 202);
+  const accepted = await submitted.json() as V2Run;
+  assert.equal(accepted.input?.kind, "capability");
+  if (accepted.input?.kind !== "capability") throw new Error("Expected a capability run");
+  assert.equal(accepted.input.apiVersion, "1.0");
+  assert.deepEqual(accepted.input.configSnapshot, {});
+  const completed = await waitForRun(baseUrl, accepted.runId, "completed");
+  assert.equal(completed.result?.status, "completed");
+  if (completed.result?.status !== "completed") throw new Error("Expected a completed tool run");
+  assert.equal(completed.result.extensionResult?.extensionId, "development_greeting_tool");
+  const output = completed.result.extensionResult?.output as { toolCalls?: Array<{ toolName: string; result: { message: string } }> };
+  assert.equal(output.toolCalls?.[0]?.toolName, "development_greeting_tool__make_greeting");
+  assert.equal(output.toolCalls?.[0]?.result.message, "Hello, PI Workbench.");
+
+  const persisted = openStorage({ path: resolveDatabasePath({ dataDirectory: root }), readOnly: true });
+  assert.equal(persisted.capabilityStates.get("development_greeting_tool")?.enabled, true);
+  persisted.close();
+});
+
 await test("global Worker slot serializes runs; cancellation waits for stop and conversation deletion is permanent", { timeout: 30_000 }, async (t) => {
   const root = await temporaryRoot();
   let { app, baseUrl } = await createApp(root);

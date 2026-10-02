@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CapabilityInfo, Conversation, ConversationSummary, WorkbenchEvent, WorkbenchRun, V2AttachmentResult, V2Changeset, V2ChangesetSummary, V2Conversation, V2ConversationSummary, V2Run, V2CleanupPreview, V2ChangesetUndoResult } from "@pi-workbench/protocol";
+import type { CapabilityCatalogEntry, Conversation, ConversationSummary, WorkbenchEvent, WorkbenchRun, V2AttachmentResult, V2Changeset, V2ChangesetSummary, V2Conversation, V2ConversationSummary, V2Run, V2RunSubmission, V2CleanupPreview, V2ChangesetUndoResult } from "@pi-workbench/protocol";
 import { RunArtifacts } from "./run-artifacts";
 import { retryStartupRead } from "./startup";
 
@@ -11,9 +11,11 @@ const EVENT_TYPES = ["run.accepted", "run.started", "run.progress", "message.del
 const API_REQUEST_TIMEOUT_MS = 30_000;
 const REPOSITORY_URL_PATTERN = /^https:\/\/github\.com\/[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/u;
 const FAKE_REPOSITORY_SHA = "7f06c6b2792349e4d9ccbd393008e5bf1f4d419a";
+type CapabilityField = { id: string; title: string; description: string; type: "string" | "number" | "integer" | "boolean" | "object" | "array"; required: boolean; maxLength: number; control: "text" | "textarea" | "json"; enum?: unknown[] };
 type V2StreamReset = { schemaVersion: 2; type: "stream.reset"; runId: string; data: { reason: "event_history_expired"; earliestAvailableSequence: number; latestSequence: number; latestEventId?: string } };
 type UiConversation = Conversation & { projectId?: string | null };
 type UiConversationSummary = ConversationSummary & { projectId?: string | null };
+type UiRun = Omit<WorkbenchRun, "input"> & { input: V2RunSubmission };
 type LocalProject = { schemaVersion: 2; projectId: string; displayName: string; canonicalRoot: string; validationState: "valid" | "missing" | "needs_review"; createdAt: string; lastAccessedAt: string };
 type PickerDirectory = { schemaVersion: 2; directoryToken: string; parentToken?: string; displayPath: string; canSelectProject: boolean; truncated: boolean; entries: Array<{ name: string; kind: "directory" | "file" | "excluded"; token?: string; byteSize?: number; reason?: string }> };
 type PickerRoot = { label: string; token: string };
@@ -29,14 +31,33 @@ function normalizeConversation(value: V2Conversation): UiConversation {
     projectId: value.projectId ?? null,
     createdAt: value.createdAt, updatedAt: value.updatedAt, preview: value.preview, messageCount: value.messageCount,
     messages: value.messages.map((message) => message.role === "capability" && message.capabilityInput
-      ? { schemaVersion: 1, id: message.messageId, role: "capability", text: message.content, createdAt: message.createdAt, capabilityId: "public_repository_analysis", input: message.capabilityInput }
+      ? { schemaVersion: 1, id: message.messageId, role: "capability", text: message.content, createdAt: message.createdAt, capabilityId: message.extensionId ?? "extension", input: message.capabilityInput } as unknown as Conversation["messages"][number]
       : { schemaVersion: 1, id: message.messageId, role: message.role === "capability" ? "assistant" : message.role, text: message.content, createdAt: message.createdAt }),
   };
+}
+function schemaFields(schema: Record<string, unknown>, includePrompt = false): CapabilityField[] {
+  const properties = schema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return [];
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  return Object.entries(properties as Record<string, unknown>).flatMap(([id, raw]) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const item = raw as Record<string, unknown>;
+    if (item.type !== "string" && item.type !== "number" && item.type !== "integer" && item.type !== "boolean" && item.type !== "object" && item.type !== "array") return [];
+    if (!includePrompt && item["x-ui"] === "prompt") return [];
+    return [{
+      id, title: typeof item.title === "string" ? item.title : id,
+      description: typeof item.description === "string" ? item.description : "",
+      type: item.type as CapabilityField["type"], required: required.includes(id),
+      maxLength: typeof item.maxLength === "number" ? item.maxLength : 1024,
+      control: item.type === "object" || item.type === "array" ? "json" as const : item["x-ui"] === "textarea" ? "textarea" as const : "text" as const,
+      ...(Array.isArray(item.enum) ? { enum: item.enum } : {}),
+    }];
+  });
 }
 function normalizeSummary(value: V2ConversationSummary): UiConversationSummary {
   return { schemaVersion: 1, conversationId: value.conversationId, title: value.title.slice(0, 128), projectId: value.projectId ?? null, createdAt: value.createdAt, updatedAt: value.updatedAt, preview: value.preview, messageCount: value.messageCount };
 }
-function normalizeRun(value: V2Run): WorkbenchRun {
+function normalizeRun(value: V2Run): UiRun {
   if (!value.input) throw new Error("服务器返回的运行缺少输入记录");
   const status = value.status === "accepted" ? "queued" : value.status;
   return {
@@ -134,14 +155,19 @@ export default function HomePage() {
   const [conversations, setConversations] = useState<UiConversationSummary[]>([]);
   const [conversation, setConversation] = useState<UiConversation | null>(null);
   const [isNewConversationDraft, setIsNewConversationDraft] = useState(true);
-  const [capabilities, setCapabilities] = useState<CapabilityInfo[]>([]);
+  const [capabilities, setCapabilities] = useState<CapabilityCatalogEntry[]>([]);
   const [text, setText] = useState("");
-  const [selectedCapability, setSelectedCapability] = useState<CapabilityInfo | null>(null);
+  const [selectedCapability, setSelectedCapability] = useState<CapabilityCatalogEntry | null>(null);
   const [capabilityValues, setCapabilityValues] = useState<Record<string, string>>({});
   const [showPicker, setShowPicker] = useState(false);
   const [pickerQuery, setPickerQuery] = useState("");
-  const [activeRun, setActiveRun] = useState<WorkbenchRun | null>(null);
-  const [runs, setRuns] = useState<WorkbenchRun[]>([]);
+  const [pickerIndex, setPickerIndex] = useState(0);
+  const [activeView, setActiveView] = useState<"conversation" | "capabilities">("conversation");
+  const [capabilitySearch, setCapabilitySearch] = useState("");
+  const [configDrafts, setConfigDrafts] = useState<Record<string, Record<string, unknown>>>({});
+  const [capabilityNotice, setCapabilityNotice] = useState("");
+  const [activeRun, setActiveRun] = useState<UiRun | null>(null);
+  const [runs, setRuns] = useState<UiRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [events, setEvents] = useState<WorkbenchEvent[]>([]);
   const [draftReply, setDraftReply] = useState("");
@@ -206,7 +232,7 @@ export default function HomePage() {
     setAttachments([]); setAttachmentResults([]); setFileChangesets([]); setChangesetDetail(null);
     const [loaded, runResult] = await Promise.all([
       api<UiConversation>(`/conversations/${encodeURIComponent(id)}`, { signal }),
-      api<{ runs: WorkbenchRun[] }>(`/conversations/${encodeURIComponent(id)}/runs`, { signal }),
+      api<{ runs: UiRun[] }>(`/conversations/${encodeURIComponent(id)}/runs`, { signal }),
     ]);
     if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== id) return;
     localStorage.setItem("pi-workbench-conversation", id);
@@ -252,7 +278,7 @@ export default function HomePage() {
         if (payload.type === "stream.reset") {
           const reset = payload as unknown as V2StreamReset;
           source.close();
-          void api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}`).then((snapshot) => {
+          void api<UiRun>(`/runs/${encodeURIComponent(runId)}`).then((snapshot) => {
             if (!isCurrent()) return;
             setActiveRun(snapshot);
             setRuns((current) => current.map((item) => item.runId === runId ? snapshot : item));
@@ -289,7 +315,7 @@ export default function HomePage() {
         if (eventType === "checkpoint.saved" || eventType === "usage.updated") return;
         if (["run.completed", "run.failed", "run.cancelled", "run.interrupted"].includes(String(eventType))) {
           source.close();
-          void api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}`).then((snapshot) => {
+          void api<UiRun>(`/runs/${encodeURIComponent(runId)}`).then((snapshot) => {
             if (!isCurrent()) return;
             setActiveRun((current) => current?.runId === runId ? snapshot : current);
             setRuns((current) => current.map((item) => item.runId === runId ? snapshot : item));
@@ -335,7 +361,7 @@ export default function HomePage() {
         const [health, caps, listed] = await retryStartupRead(async (signal) => {
           const health = await api<{ mode: "fake" | "online" }>("/health", { signal });
           const [caps, listed] = await Promise.all([
-            api<{ capabilities: CapabilityInfo[] }>("/capabilities", { signal }),
+            api<{ capabilities: CapabilityCatalogEntry[] }>("/capabilities", { signal }),
             api<{ conversations: UiConversationSummary[] }>("/conversations", { signal }),
           ]);
           return [health, caps, listed] as const;
@@ -358,6 +384,8 @@ export default function HomePage() {
   useEffect(() => { if (isNewConversationDraft && !loading) textareaRef.current?.focus(); }, [isNewConversationDraft, loading]);
 
   function beginNewConversation() {
+    setActiveView("conversation");
+    setMobileOpen(false);
     navigationTokenRef.current++;
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
@@ -459,11 +487,16 @@ export default function HomePage() {
     setText(value);
     const at = value.lastIndexOf("@");
     if (at >= 0 && (at === 0 || /\s/u.test(value[at - 1] ?? "")) && value.slice(at + 1).split(/\s/u).length <= 1) {
-      setPickerQuery(value.slice(at + 1)); setShowPicker(true);
+      setPickerQuery(value.slice(at + 1)); setPickerIndex(0); setShowPicker(true);
     } else setShowPicker(false);
   }
-  function chooseCapability(capability: CapabilityInfo) {
-    setSelectedCapability(capability); setCapabilityValues({}); setText(""); setPickerQuery(""); setShowPicker(false);
+  function chooseCapability(capability: CapabilityCatalogEntry) {
+    if (!capability.enabled || !capability.configured || !capability.compatible) return;
+    const at = text.lastIndexOf("@");
+    const suffix = at >= 0 ? text.slice(at + 1).replace(/^\S*/u, "") : "";
+    setText(at >= 0 ? `${text.slice(0, at)}${suffix}` : text);
+    setSelectedCapability(capability); setCapabilityValues({}); setPickerQuery(""); setShowPicker(false);
+    textareaRef.current?.focus();
   }
   function clearCapability() { setSelectedCapability(null); setCapabilityValues({}); }
   async function submit() {
@@ -471,18 +504,36 @@ export default function HomePage() {
     let conversationId = conversation?.conversationId;
     const token = navigationTokenRef.current;
     const trimmed = text.trim();
-    let capabilityInput: Record<string, string> | undefined;
+    let capabilityInput: Record<string, unknown> | undefined;
     if (selectedCapability) {
+      if (!trimmed) { setNotice("请在输入框中填写本次能力请求的提示。"); return; }
       capabilityInput = {};
-      for (const field of selectedCapability.inputs) {
-        const value = capabilityValues[field.id]?.trim() ?? "";
-        if (field.required && !value) { setNotice(`请填写“${field.label}”。`); return; }
-        if (value.length > field.maxLength) { setNotice(`“${field.label}”最多 ${field.maxLength} 个字符。`); return; }
-        if (value) capabilityInput[field.id] = value;
+      const fields = schemaFields(selectedCapability.manifest.inputSchema);
+      for (const field of fields) {
+        const rawValue = capabilityValues[field.id] ?? "";
+        let value: unknown = field.type === "string" ? rawValue.trim() : rawValue;
+        if (field.control === "json" && rawValue.trim()) {
+          try { value = JSON.parse(rawValue) as unknown; }
+          catch { setNotice(`“${field.title}”必须是有效 JSON。`); return; }
+          if (field.type === "array" ? !Array.isArray(value) : !value || typeof value !== "object" || Array.isArray(value)) {
+            setNotice(`“${field.title}”必须是 JSON${field.type === "array" ? " 数组" : " 对象"}。`); return;
+          }
+        }
+        const missing = value === "" || value === undefined || value === null;
+        if (field.required && missing) { setNotice(`请填写“${field.title}”。`); return; }
+        if (field.type === "string" && typeof value === "string" && value.length > field.maxLength) { setNotice(`“${field.title}”最多 ${field.maxLength} 个字符。`); return; }
+        if (!missing) {
+          if (field.type === "integer" || field.type === "number") {
+            const numberValue = Number(String(value));
+            if (!Number.isFinite(numberValue) || (field.type === "integer" && !Number.isInteger(numberValue))) { setNotice(`“${field.title}”必须填写有效数字。`); return; }
+            capabilityInput[field.id] = numberValue;
+          } else if (field.type === "boolean") capabilityInput[field.id] = value === "true";
+          else capabilityInput[field.id] = value;
+        }
       }
-      if (selectedCapability.id === "public_repository_analysis") {
-        const repository = capabilityInput.repositoryUrl ?? "";
-        const ref = capabilityInput.ref ?? "";
+      if (selectedCapability.manifest.id === "public_repository_analysis") {
+        const repository = typeof capabilityInput.repositoryUrl === "string" ? capabilityInput.repositoryUrl : "";
+        const ref = typeof capabilityInput.ref === "string" ? capabilityInput.ref : "";
         if (!REPOSITORY_URL_PATTERN.test(repository)) {
           setNotice("仓库地址格式无效，请填写完整的公开 GitHub 地址，例如 https://github.com/用户名/仓库名。"); return;
         }
@@ -494,8 +545,8 @@ export default function HomePage() {
     submissionInFlightRef.current = true;
     setNotice(""); setDraftReply(""); setEvents([]);
     const input = selectedCapability ? {
-      kind: "capability", capabilityId: selectedCapability.id,
-      input: capabilityInput,
+      kind: "capability", capabilityId: selectedCapability.manifest.id,
+      input: capabilityInput ?? {}, prompt: trimmed,
     } : { kind: "message", text: trimmed };
     let newlyCreatedConversation: UiConversation | undefined;
     let runAccepted = false;
@@ -512,7 +563,7 @@ export default function HomePage() {
         setIsNewConversationDraft(false);
         localStorage.setItem("pi-workbench-conversation", conversationId);
       }
-      const created = await api<WorkbenchRun>("/runs", {
+      const created = await api<UiRun>("/runs", {
         method: "POST", headers: { "Idempotency-Key": key() }, body: JSON.stringify({ schemaVersion: 2, conversationId, input }),
       });
       runAccepted = true;
@@ -561,7 +612,7 @@ export default function HomePage() {
     if (!activeRun || !busy) return;
     const runId = activeRun.runId;
     try {
-      const snapshot = await api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST", body: "{}" });
+      const snapshot = await api<UiRun>(`/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST", body: "{}" });
       setActiveRun((current) => {
         if (current?.runId !== runId) return current;
         // The SSE terminal event can arrive before this HTTP response. Keep that
@@ -577,7 +628,7 @@ export default function HomePage() {
     const conversationId = selectedConversationIdRef.current;
     const token = navigationTokenRef.current;
     try {
-      const next = await api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: { "Idempotency-Key": key() }, body: "{}" });
+      const next = await api<UiRun>(`/runs/${encodeURIComponent(runId)}/retry`, { method: "POST", headers: { "Idempotency-Key": key() }, body: "{}" });
       if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== conversationId) return;
       setActiveRun(next); setRuns((current) => [next, ...current].slice(0, 32)); setSelectedRunId(next.runId);
       setEvents([]); setDraftReply(""); connectEvents(next.runId);
@@ -588,7 +639,7 @@ export default function HomePage() {
     const conversationId = selectedConversationIdRef.current;
     const token = navigationTokenRef.current;
     try {
-      const next = await api<WorkbenchRun>(`/runs/${encodeURIComponent(runId)}/continue`, { method: "POST", headers: { "Idempotency-Key": key() }, body: "{}" });
+      const next = await api<UiRun>(`/runs/${encodeURIComponent(runId)}/continue`, { method: "POST", headers: { "Idempotency-Key": key() }, body: "{}" });
       if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== conversationId) return;
       setActiveRun(next); setRuns((current) => [next, ...current.filter((run) => run.runId !== next.runId)].slice(0, 32)); setSelectedRunId(next.runId);
       setEvents([]); setDraftReply(""); connectEvents(next.runId);
@@ -720,7 +771,46 @@ export default function HomePage() {
       const url = URL.createObjectURL(file); const anchor = document.createElement("a"); anchor.href = url; anchor.download = item.fileName; anchor.click(); URL.revokeObjectURL(url);
     } catch (error) { setNotice(error instanceof Error ? error.message : "无法下载结果文件。"); }
   }
-  const filteredCapabilities = capabilities.filter((capability) => `${capability.name} ${capability.id}`.toLowerCase().includes(pickerQuery.toLowerCase()));
+  const filteredCapabilities = capabilities.filter((capability) => capability.enabled && capability.configured && capability.compatible &&
+    `${capability.manifest.name} ${capability.manifest.id} ${capability.manifest.description}`.toLowerCase().includes(pickerQuery.toLowerCase()));
+  const capabilityGroups = [
+    { kind: "workflow", label: "工作流", entries: filteredCapabilities.filter((entry) => entry.manifest.kind === "workflow") },
+    { kind: "tools", label: "工具扩展", entries: filteredCapabilities.filter((entry) => entry.manifest.kind === "tools") },
+  ].filter((group) => group.entries.length > 0);
+  const visibleCapabilities = capabilities.filter((capability) =>
+    `${capability.manifest.name} ${capability.manifest.id} ${capability.manifest.description}`.toLowerCase().includes(capabilitySearch.toLowerCase()));
+  async function saveCapabilityState(capabilityId: string, patch: { enabled?: boolean; config?: Record<string, unknown> }) {
+    try {
+      const response = await pickerApi<{ capability: CapabilityCatalogEntry }>(`/capabilities/${encodeURIComponent(capabilityId)}/state`, {
+        method: "PATCH", body: JSON.stringify({ schemaVersion: 2, ...patch }),
+      });
+      setCapabilities((current) => current.map((entry) => entry.manifest.id === capabilityId ? response.capability : entry));
+      if (patch.enabled === false && selectedCapability?.manifest.id === capabilityId) clearCapability();
+      if (patch.config) setConfigDrafts((current) => ({ ...current, [capabilityId]: response.capability.config }));
+      setCapabilityNotice("能力设置已保存。");
+    } catch (error) { setCapabilityNotice(error instanceof Error ? error.message : "无法保存能力设置。"); }
+  }
+  async function saveCapabilityConfig(capabilityId: string, draft: Record<string, unknown>, fields: CapabilityField[]) {
+    const config = { ...draft };
+    for (const field of fields) {
+      const value = config[field.id];
+      if (!field.required && field.enum && value === "") { delete config[field.id]; continue; }
+      if (field.required && (value === undefined || value === null || value === "")) {
+        setCapabilityNotice(`请填写“${field.title}”。`); return;
+      }
+      if (field.control === "json" && typeof value === "string") {
+        if (!value.trim()) { delete config[field.id]; continue; }
+        try { config[field.id] = JSON.parse(value) as unknown; }
+        catch { setCapabilityNotice(`“${field.title}”必须是有效 JSON。`); return; }
+        const parsed = config[field.id];
+        if (field.type === "array" ? !Array.isArray(parsed) : !parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          setCapabilityNotice(`“${field.title}”必须是 JSON${field.type === "array" ? " 数组" : " 对象"}。`); return;
+        }
+      }
+      if (value === undefined) delete config[field.id];
+    }
+    await saveCapabilityState(capabilityId, { config });
+  }
   const isWelcome = !conversation?.messages.length && !activeRun;
   const canCompose = conversation !== null || isNewConversationDraft;
   const selectedRun = selectedRunId === activeRun?.runId ? activeRun : runs.find((run) => run.runId === selectedRunId) ?? activeRun;
@@ -731,10 +821,10 @@ export default function HomePage() {
     <aside className={`sidebar ${mobileOpen ? "mobile-open" : ""}`}>
       <div className="brand-row"><a className="brand" href="#home" aria-label="PI Workbench">PI <span>Workbench</span></a><button className="collapse" aria-label="收起导航" onClick={() => setMobileOpen(false)}>‹</button></div>
       <nav className="primary-nav" aria-label="主导航">
-        <button className="nav-item selected" onClick={beginNewConversation}><Icon name="plus" /><span>新对话</span></button>
+        <button className={`nav-item ${activeView === "conversation" && isNewConversationDraft ? "selected" : ""}`} onClick={beginNewConversation}><Icon name="plus" /><span>新对话</span></button>
         <div className="nav-caption">工作区</div>
-        <button className="nav-item" onClick={() => textareaRef.current?.focus()}><Icon name="chat" /><span>对话</span></button>
-        <button className="nav-item" onClick={() => { setPickerQuery(""); setShowPicker((current) => !current); textareaRef.current?.focus(); }}><Icon name="grid" /><span>能力中心</span></button>
+        <button className={`nav-item ${activeView === "conversation" ? "selected" : ""}`} onClick={() => { setMobileOpen(false); setActiveView("conversation"); window.setTimeout(() => textareaRef.current?.focus(), 0); }}><Icon name="chat" /><span>对话</span></button>
+        <button className={`nav-item ${activeView === "capabilities" ? "selected" : ""}`} onClick={() => { setMobileOpen(false); setShowPicker(false); setCapabilityNotice(""); setActiveView("capabilities"); }}><Icon name="grid" /><span>能力中心</span></button>
         <button className="nav-item" onClick={() => void openPicker("project")}><Icon name="folder" /><span>打开项目</span></button>
       </nav>
       {currentProject && <div className="project-sidebar-card"><div className="project-sidebar-label">当前项目</div><strong title={currentProject.canonicalRoot}>{currentProject.displayName}</strong><button onClick={() => void startProjectConversation(currentProject.projectId)}><Icon name="plus" />新建项目对话</button></div>}
@@ -751,17 +841,44 @@ export default function HomePage() {
     {mobileOpen && <button className="sidebar-backdrop" aria-label="关闭导航" onClick={() => setMobileOpen(false)} />}
     <main className="main-area">
       <header className="topbar"><button className="mobile-menu" aria-label="打开导航" onClick={() => setMobileOpen(true)}><Icon name="chat" /></button><div className="mobile-brand">PI Workbench</div>{currentProject && <div className="project-location" title={currentProject.canonicalRoot}><Icon name="folder" /><span>{currentProject.canonicalRoot}</span><button onClick={() => void openProjectRules()}>项目规则</button></div>}<div className={`mode-pill ${mode === "fake" ? "offline" : "online"}`}><span className="status-dot" />{mode === "fake" ? "离线演示" : "DeepSeek Flash"}</div></header>
-      <div className={`content-shell ${isWelcome ? "welcome-view" : "conversation-view"}`}>
-        {loading ? <div className="loading-state" role="status"><span className="loader" /> 正在连接本地工作台…</div> : startupError ? <section className="welcome-block" role="alert"><h1>暂时无法连接工作台</h1><p>本地服务尚未就绪或连接已中断。请检查启动终端后重试。</p><button className="quiet-button" onClick={() => setStartupAttempt((current) => current + 1)}>重新连接</button></section> : <>
+      <div className={`content-shell ${activeView === "capabilities" ? "capability-center-shell" : isWelcome ? "welcome-view" : "conversation-view"}`}>
+        {loading ? <div className="loading-state" role="status"><span className="loader" /> 正在连接本地工作台…</div> : startupError ? <section className="welcome-block" role="alert"><h1>暂时无法连接工作台</h1><p>本地服务尚未就绪或连接已中断。请检查启动终端后重试。</p><button className="quiet-button" onClick={() => setStartupAttempt((current) => current + 1)}>重新连接</button></section> : activeView === "capabilities" ? <section className="capability-center" aria-labelledby="capability-center-title">
+          <header className="capability-center-heading"><div><span className="eyebrow">已注册能力</span><h1 id="capability-center-title">能力中心</h1><p>管理本机工作台中明确注册的扩展。只有启用且完成配置的能力会出现在对话的 @ 菜单中。</p></div><button className="quiet-button" onClick={() => { setMobileOpen(false); setActiveView("conversation"); window.setTimeout(() => textareaRef.current?.focus(), 0); }}>返回对话</button></header>
+          <label className="capability-search"><span className="sr-only">搜索能力</span><input value={capabilitySearch} onChange={(event) => setCapabilitySearch(event.target.value)} placeholder="搜索名称、ID 或说明" /></label>
+          {capabilityNotice && <div className="capability-center-notice" role="status">{capabilityNotice}</div>}
+          <div className="capability-center-list">{visibleCapabilities.map((entry) => {
+            const id = entry.manifest.id;
+            const draft = configDrafts[id] ?? entry.config as Record<string, unknown>;
+            const fields = schemaFields(entry.manifest.configSchema, true);
+            const status = !entry.compatible ? "版本不兼容" : !entry.enabled ? "已停用" : !entry.configured ? "需要配置" : "已启用";
+            return <article className="capability-center-card" key={id}>
+              <div className="capability-center-card-head"><div className="capability-center-icon"><Icon name={entry.manifest.icon === "grid" ? "grid" : "spark"} /></div><div className="capability-center-title"><div><h2>{entry.manifest.name}</h2><span className={`capability-status ${entry.status}`}>{status}</span></div><code>{id} · API {entry.manifest.apiVersion}</code></div><label className="capability-switch"><span>{entry.enabled ? "启用" : "停用"}</span><input type="checkbox" checked={entry.enabled} disabled={!entry.compatible} onChange={(event) => void saveCapabilityState(id, { enabled: event.target.checked })} aria-label={`${entry.enabled ? "停用" : "启用"}${entry.manifest.name}`} /></label></div>
+              <p className="capability-center-description">{entry.manifest.description}</p>
+              <div className="capability-center-meta"><span>{entry.manifest.kind === "workflow" ? "工作流" : "工具扩展"}</span>{entry.manifest.requiredPermissions.map((permission) => <code key={permission}>{permission}</code>)}{entry.manifest.requiredPermissions.length === 0 && <span>不需要额外权限</span>}</div>
+              {fields.length ? <div className="capability-config-fields">{fields.map((field) => {
+                const value = draft[field.id];
+                return <label className="capability-input-field" key={field.id}><span>{field.title}{field.required ? "（必填）" : "（可选）"}</span>
+                  {field.control === "json" ? <textarea value={typeof value === "string" ? value : JSON.stringify(value ?? (field.type === "array" ? [] : {}), null, 2)} onChange={(event) => setConfigDrafts((current) => ({ ...current, [id]: { ...draft, [field.id]: event.target.value } }))} placeholder={field.description} rows={4} />
+                    : field.type === "boolean" ? <input type="checkbox" checked={Boolean(value)} onChange={(event) => setConfigDrafts((current) => ({ ...current, [id]: { ...draft, [field.id]: event.target.checked } }))} />
+                    : field.enum ? <select value={String(value ?? "")} onChange={(event) => setConfigDrafts((current) => ({ ...current, [id]: { ...draft, [field.id]: field.enum?.find((item) => String(item) === event.target.value) ?? event.target.value } }))}><option value="">选择…</option>{field.enum.map((item) => <option key={String(item)} value={String(item)}>{String(item)}</option>)}</select>
+                      : field.control === "textarea" ? <textarea value={value === undefined ? "" : String(value)} maxLength={field.type === "string" ? field.maxLength : undefined} placeholder={field.description} rows={3} onChange={(event) => setConfigDrafts((current) => ({ ...current, [id]: { ...draft, [field.id]: event.target.value } }))} />
+                        : <input type={field.type === "number" || field.type === "integer" ? "number" : "text"} value={value === undefined ? "" : String(value)} maxLength={field.type === "string" ? field.maxLength : undefined} placeholder={field.description} onChange={(event) => setConfigDrafts((current) => ({ ...current, [id]: { ...draft, [field.id]: field.type === "number" || field.type === "integer" ? (event.target.value === "" ? undefined : Number(event.target.value)) : event.target.value } }))} />}
+                </label>;
+              })}<button className="quiet-button" onClick={() => void saveCapabilityConfig(id, draft, fields)}>保存配置</button></div> : <p className="capability-no-config">此能力无需额外配置。</p>}
+              <details className="capability-contract"><summary>查看配置、输入与输出契约</summary><pre>{JSON.stringify({ config: entry.manifest.configSchema, input: entry.manifest.inputSchema, output: entry.manifest.outputSchema }, null, 2)}</pre></details>
+            </article>;
+          })}{visibleCapabilities.length === 0 && <p className="empty-sidebar">没有匹配的已注册能力。</p>}</div>
+        </section> : <>
           {isWelcome ? <section className="welcome-block"><div className="welcome-mark"><Icon name="spark" /></div><h1>你好，今天想解决什么问题？</h1><p>直接描述你的目标，PI Workbench 会通过对话协助你。<br className="wide-break" />需要读取公开仓库时，可以在输入框中用 <kbd>@</kbd> 显式选择“仓库分析”。</p></section> : <section className="transcript" aria-label="对话记录">
-            {conversation?.messages.map((message) => <article key={message.id} className={`message-row ${message.role === "assistant" ? "assistant" : "user"}`}><div className="message-avatar">{message.role === "assistant" ? <span>PI</span> : "你"}</div><div className="message-body"><div className="message-role">{message.role === "assistant" ? "PI Workbench" : message.role === "capability" ? "能力调用" : "你"}</div><div className="message-text">{message.text}</div>{message.role === "capability" && <div className="capability-chip">@{capabilities.find((cap) => cap.id === message.capabilityId)?.name ?? "能力"}</div>}</div></article>)}
+            {conversation?.messages.map((message) => <article key={message.id} className={`message-row ${message.role === "assistant" ? "assistant" : "user"}`}><div className="message-avatar">{message.role === "assistant" ? <span>PI</span> : "你"}</div><div className="message-body"><div className="message-role">{message.role === "assistant" ? "PI Workbench" : message.role === "capability" ? "能力调用" : "你"}</div><div className="message-text">{message.text}</div>{message.role === "capability" && <div className="capability-chip">@{capabilities.find((entry) => entry.manifest.id === message.capabilityId)?.manifest.name ?? "能力"}</div>}</div></article>)}
             {busy && selectedIsActive && <article className="message-row assistant"><div className="message-avatar"><span>PI</span></div><div className="message-body"><div className="message-role">PI Workbench</div>{draftReply ? <div className="message-text">{draftReply}</div> : <div className="thinking"><span /><span /><span /> 正在处理你的请求</div>}</div></article>}
             {runs.length > 0 && <div className="run-history" aria-label="运行记录"><span>运行记录</span>{runs.map((run) => <button key={run.runId} className={`run-history-item ${selectedRun?.runId === run.runId ? "current" : ""}`} onClick={() => setSelectedRunId(run.runId)} aria-pressed={selectedRun?.runId === run.runId}>{run.input.kind === "capability" ? "能力" : "对话"} · {run.runId.slice(0, 8)} · {run.status === "completed" ? "完成" : run.status === "cancelled" ? "取消" : run.status === "failed" ? "失败" : run.status === "interrupted" ? "中断" : "执行中"}</button>)}</div>}
             {selectedRun && <div className="run-card"><div className="run-card-head"><div><span className={`run-state ${selectedRun.status}`}>{selectedRun.status === "running" ? "运行中" : selectedRun.status === "cancelling" ? "正在取消" : selectedRun.status === "completed" ? "已完成" : selectedRun.status === "failed" ? "失败" : selectedRun.status === "cancelled" ? "已取消" : selectedRun.status === "interrupted" ? "已中断" : "等待中"}</span><span className="run-id">运行 {selectedRun.runId.slice(0, 8)}</span></div><div className="run-actions">{selectedIsActive && busy && <button className="quiet-button" onClick={() => void cancel()}>取消</button>}{!busy && selectedRun.status === "interrupted" && <button className="quiet-button" onClick={() => void continueRun(selectedRun.runId)}>继续</button>}{!busy && ["failed", "cancelled"].includes(selectedRun.status) && <button className="quiet-button" onClick={() => void retry(selectedRun.runId)}>重试</button>}{selectedIsActive && <button className="quiet-button" onClick={() => connectEvents(selectedRun.runId)}>重新连接</button>}</div></div>
               {selectedIsActive && <div className="event-list">{events.filter((event) => event.type !== "message.delta").slice(-10).map((event) => <div className="event-item" key={event.eventId}><span className={`event-dot ${event.type}`} /><span>{eventLabel(event)}</span></div>)}</div>}
               {!busy && result?.status === "failed" && <p className="result-error">{result.error.message}</p>}
               {!busy && result?.status === "cancelled" && <p className="result-note">运行已取消。未把部分执行结果加入 Agent 上下文。</p>}
-              {result?.status === "completed" && result.capabilityResult && <section className="report-card"><div className="report-heading"><div><span className="eyebrow">能力结果</span><h3>{result.capabilityResult.title}</h3></div></div><p>{result.capabilityResult.summary}</p><div className="claim-list">{result.capabilityResult.claims.map((claim) => <article className="claim" key={claim.id}><span className={`claim-kind ${claim.kind}`}>{claim.kind === "fact" ? "事实" : claim.kind === "inference" ? "推断" : "未知"}</span><p>{claim.text}</p>{claim.evidence.map((evidence, index) => <div className="evidence-ref" key={`${evidence.path}-${index}`}>{evidence.path}:{evidence.startLine}-{evidence.endLine}</div>)}</article>)}</div></section>}
+              {result?.status === "completed" && result.capabilityResult && <section className="report-card"><div className="report-heading"><div><span className="eyebrow">仓库分析结果</span><h3>{result.capabilityResult.title}</h3></div></div><p>{result.capabilityResult.summary}</p><div className="claim-list">{result.capabilityResult.claims.map((claim) => <article className="claim" key={claim.id}><span className={`claim-kind ${claim.kind}`}>{claim.kind === "fact" ? "事实" : claim.kind === "inference" ? "推断" : "未知"}</span><p>{claim.text}</p>{claim.evidence.map((evidence, index) => <div className="evidence-ref" key={`${evidence.path}-${index}`}>{evidence.path}:{evidence.startLine}-{evidence.endLine}</div>)}</article>)}</div></section>}
+              {result?.status === "completed" && result.extensionResult && <section className="report-card"><div className="report-heading"><div><span className="eyebrow">@{capabilities.find((entry) => entry.manifest.id === result.extensionResult?.extensionId)?.manifest.name ?? "扩展结果"}</span><h3>{result.extensionResult.title}</h3></div></div><p>{result.extensionResult.summary}</p><details className="extension-output"><summary>查看结构化结果</summary><pre>{JSON.stringify(result.extensionResult.output, null, 2)}</pre></details></section>}
               <RunArtifacts run={selectedRun} />
             </div>}
             {fileChangesets.length > 0 && <section className="file-history" aria-label="项目文件修改记录">
@@ -785,12 +902,30 @@ export default function HomePage() {
             <div ref={messagesEndRef} />
           </section>}
           <section className="composer-zone">
-            {selectedCapability && <div className="capability-fields"><div className="capability-form-head"><div><span className="capability-kicker">已选择能力</span><strong>@{selectedCapability.name}</strong></div><button className="icon-button" aria-label="移除能力" onClick={clearCapability}><Icon name="close" /></button></div><div className="field-grid">{selectedCapability.inputs.map((field) => <label className="capability-input-field" key={field.id}><span>{field.label}{field.required ? "（必填）" : "（可选）"}</span>{field.control === "textarea" ? <textarea value={capabilityValues[field.id] ?? ""} maxLength={field.maxLength} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} rows={3} /> : <input value={capabilityValues[field.id] ?? ""} maxLength={field.maxLength} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} />}</label>)}</div>{selectedCapability.id === "public_repository_analysis" && mode === "fake" && <p className="offline-capability-note">离线演示只使用合成的 Harborlight 仓库，不会分析真实仓库；其他地址会被拒绝。真实分析需切换在线模式。</p>}</div>}
+            {selectedCapability && <div className="capability-fields">
+              <div className="capability-form-head"><div><span className="capability-kicker">本次请求使用</span><strong>@{selectedCapability.manifest.name}</strong></div><button className="icon-button" aria-label="移除能力" onClick={clearCapability}><Icon name="close" /></button></div>
+              <div className="field-grid">{schemaFields(selectedCapability.manifest.inputSchema).map((field) => <label className="capability-input-field" key={field.id}>
+                <span>{field.title}{field.required ? "（必填）" : "（可选）"}</span>
+                {field.control === "json" ? <textarea value={capabilityValues[field.id] ?? ""} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description || (field.type === "array" ? "[]" : "{}")} rows={4} />
+                  : field.enum ? <select value={capabilityValues[field.id] ?? ""} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))}><option value="">选择…</option>{field.enum.map((item) => <option key={String(item)} value={String(item)}>{String(item)}</option>)}</select>
+                  : field.type === "boolean" ? <select value={capabilityValues[field.id] ?? ""} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))}><option value="">选择…</option><option value="true">是</option><option value="false">否</option></select>
+                  : field.control === "textarea" ? <textarea value={capabilityValues[field.id] ?? ""} maxLength={field.maxLength} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} rows={3} />
+                    : <input type={field.type === "number" || field.type === "integer" ? "number" : "text"} value={capabilityValues[field.id] ?? ""} maxLength={field.type === "string" ? field.maxLength : undefined} onChange={(event) => setCapabilityValues((values) => ({ ...values, [field.id]: event.target.value }))} placeholder={field.description} />}
+              </label>)}</div>
+              {schemaFields(selectedCapability.manifest.inputSchema).length === 0 && <p className="capability-no-config">此能力不需要额外字段；请在提示中说明本次目标。</p>}
+              {selectedCapability.manifest.id === "public_repository_analysis" && mode === "fake" && <p className="offline-capability-note">离线演示只使用合成的 Harborlight 仓库，不会分析真实仓库；其他地址会被拒绝。真实分析需切换在线模式。</p>}
+            </div>}
             {attachments.length > 0 && <div className="attachment-chips" aria-label="当前对话附件">{attachments.map((item) => <button key={item.attachmentId} title={`${item.relativePath} · ${item.byteSize} bytes`} onClick={() => void downloadAttachment(item)}><Icon name="paperclip" /><span>{item.fileName}</span><small>{formatBytes(item.byteSize)}</small></button>)}</div>}
             {attachmentResults.length > 0 && <div className="attachment-chips result-chips" aria-label="可下载的结果文件">{attachmentResults.map((item) => <button key={item.resultId} title={`下载结果 · ${item.byteSize} bytes`} onClick={() => void downloadAttachmentResult(item)}><Icon name="paperclip" /><span>{item.fileName}</span><small>结果 · {formatBytes(item.byteSize)}</small></button>)}</div>}
             <div className="composer-wrap">
-              {showPicker && <div className="capability-picker"><div className="picker-title">选择已注册能力</div>{filteredCapabilities.length ? filteredCapabilities.map((capability) => <button key={capability.id} className="picker-option" onMouseDown={(event) => event.preventDefault()} onClick={() => chooseCapability(capability)}><span className="picker-icon"><Icon name="spark" /></span><span><strong>@{capability.name}</strong><small>{capability.description}</small></span><kbd>↵</kbd></button>) : <div className="picker-empty">没有匹配的已注册能力</div>}</div>}
-              <textarea ref={textareaRef} value={text} onChange={(event) => onComposerChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !showPicker) { event.preventDefault(); void submit(); } if (event.key === "Escape" && showPicker) setShowPicker(false); }} placeholder={!canCompose ? "请先新建对话" : selectedCapability ? "能力参数请填写在上方；普通提示可移除能力后单独发送" : "给 PI Workbench 一个任务；输入 @ 可显式调用已注册能力"} rows={2} aria-label="输入你的任务" disabled={!canCompose || selectedCapability !== null} />
+              {showPicker && <div className="capability-picker" role="listbox" aria-label="选择已注册能力"><div className="picker-title">可用能力 · ↑↓ 选择 · Enter 确认</div>{filteredCapabilities.length ? capabilityGroups.map((group) => <div className="picker-group" role="group" aria-label={group.label} key={group.kind}><div className="picker-group-title">{group.label}</div>{group.entries.map((capability) => { const index = filteredCapabilities.indexOf(capability); return <button key={capability.manifest.id} id={`capability-option-${index}`} role="option" aria-selected={index === pickerIndex} className={`picker-option ${index === pickerIndex ? "active" : ""}`} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setPickerIndex(index)} onClick={() => chooseCapability(capability)}><span className="picker-icon"><Icon name={capability.manifest.icon === "grid" ? "grid" : "spark"} /></span><span><strong>@{capability.manifest.name}</strong><small>{capability.manifest.description}</small></span><kbd>↵</kbd></button>; })}</div>) : <div className="picker-empty">没有匹配的已启用能力</div>}</div>}
+              <textarea ref={textareaRef} value={text} onChange={(event) => onComposerChange(event.target.value)} onKeyDown={(event) => {
+                if (showPicker && filteredCapabilities.length && event.key === "ArrowDown") { event.preventDefault(); setPickerIndex((index) => (index + 1) % filteredCapabilities.length); return; }
+                if (showPicker && filteredCapabilities.length && event.key === "ArrowUp") { event.preventDefault(); setPickerIndex((index) => (index - 1 + filteredCapabilities.length) % filteredCapabilities.length); return; }
+                if (showPicker && event.key === "Enter" && !event.shiftKey) { event.preventDefault(); const choice = filteredCapabilities[pickerIndex]; if (choice) chooseCapability(choice); return; }
+                if (event.key === "Enter" && !event.shiftKey && !showPicker) { event.preventDefault(); void submit(); }
+                if (event.key === "Escape" && showPicker) setShowPicker(false);
+              }} placeholder={!canCompose ? "请先新建对话" : selectedCapability ? "输入本次能力请求的目标；Shift + Enter 换行" : "给 PI Workbench 一个任务；输入 @ 可显式调用已注册能力"} rows={2} aria-label="输入你的任务" aria-activedescendant={showPicker && filteredCapabilities[pickerIndex] ? `capability-option-${pickerIndex}` : undefined} disabled={!canCompose} />
               <div className="composer-toolbar"><div className="composer-tools"><button className="tool-button" title="导入本地文本附件" aria-label="附件" onClick={() => void openPicker("attachment")} disabled={!canCompose}><Icon name="paperclip" /></button><span className="tool-separator" /><span className="composer-hint">Enter 发送 · Shift + Enter 换行</span></div><button className={`send-button ${busy ? "cancel" : ""}`} onClick={() => busy ? void cancel() : void submit()} aria-label={busy ? "取消运行" : "发送"} disabled={!canCompose && !busy}>{busy ? <Icon name="stop" /> : <Icon name="send" />}</button></div>
               </div>
             {isWelcome && canCompose && <div className="suggestions">{SUGGESTIONS.map((suggestion, index) => <button key={suggestion} className="suggestion" onClick={() => setText(suggestion)}>{index === 0 && <Icon name="spark" />}{suggestion}</button>)}</div>}

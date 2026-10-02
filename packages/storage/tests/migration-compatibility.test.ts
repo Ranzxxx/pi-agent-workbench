@@ -40,7 +40,7 @@ for (const version of [4, 5]) {
       assert.throws(() => openStorage({ path, readOnly: true }), StorageSchemaError);
 
       const store = openStorage({ path });
-      assert.equal(store.diagnostics.schemaVersion, 5);
+      assert.equal(store.diagnostics.schemaVersion, 6);
       assert.equal(store.projects.list().length, 1);
       assert.equal(store.messages.list("conversation")[0]?.content, "Preserved message");
       const operation = store.fileOperations.list("changeset")[0]!;
@@ -53,7 +53,7 @@ for (const version of [4, 5]) {
       try {
         assert.deepEqual(verify.prepare("SELECT applied_at FROM schema_migrations WHERE version = 4").get(), appliedAt);
         assert.equal(verify.prepare("SELECT checksum FROM schema_migrations WHERE version = 4").get()?.checksum, migrationChecksum(loadCoreMigrations()[3]!.sql));
-        assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count, 5);
+        assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count, 6);
         assert.throws(() => verify.prepare("UPDATE file_operations SET result_sha256 = ? WHERE id = 'operation'").run("b".repeat(64)), /FOREIGN KEY/);
         assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
       } finally { verify.close(); }

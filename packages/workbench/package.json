@@ -9,6 +9,8 @@
     "./execution": "./src/execution.ts",
     "./model-config": "./src/model-config.ts",
     "./registry": "./src/registry.ts",
+    "./public-repository-extension": "./src/public-repository-extension.ts",
+    "./development-extension": "./src/development-extension.ts",
     "./worker-ipc": "./src/worker-ipc.ts",
     "./worker-client": "./src/worker-client.ts"
   },

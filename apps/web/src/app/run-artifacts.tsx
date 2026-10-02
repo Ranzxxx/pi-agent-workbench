@@ -1,8 +1,8 @@
 import * as React from "react";
-import type { WorkbenchRun } from "@pi-workbench/protocol";
+import type { V2Run } from "@pi-workbench/protocol";
 
 /** Show every artifact the API registered, including logs from failed runs. */
-export function RunArtifacts({ run }: { run: WorkbenchRun }) {
+export function RunArtifacts({ run }: { run: Pick<V2Run, "runId" | "result"> }) {
   const artifacts = run.result?.artifacts;
   if (!artifacts?.length) return null;
   return <div className="artifact-list" aria-label="运行产物">{artifacts.map((artifact) =>

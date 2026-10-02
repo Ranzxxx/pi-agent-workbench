@@ -1,6 +1,7 @@
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
-import { RepositoryAnalysisInputSchema, RunSubmissionSchema, WorkbenchResultSchema } from "./workbench.js";
+import { PromptSubmissionSchema, RepositoryAnalysisInputSchema, WorkbenchResultSchema } from "./workbench.js";
+import { ExtensionResultSchema } from "./extensions.js";
 
 const object = <T extends Record<string, import("typebox").TSchema>>(properties: T) =>
   Type.Object(properties, { additionalProperties: false });
@@ -12,6 +13,25 @@ const sequence = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
 const relativeFilePath = Type.String({ minLength: 1, maxLength: 1024,
   pattern: "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:]).+$",
 });
+const extensionInput = Type.Record(Type.String({ minLength: 1, maxLength: 128 }), Type.Any(), { maxProperties: 64 });
+const capabilityBase = {
+  kind: Type.Literal("capability"), capabilityId: id, input: extensionInput,
+  prompt: Type.Optional(Type.String({ maxLength: 16_000 })),
+};
+export const V2CapabilityInvocationRequestSchema = object({
+  ...capabilityBase,
+  prompt: Type.String({ minLength: 1, maxLength: 16_000, pattern: "\\S" }),
+});
+/** Server-persisted invocation adds an immutable config/API snapshot at admission. */
+export const V2CapabilityInvocationSchema = object({
+  ...capabilityBase,
+  apiVersion: Type.Optional(Type.String({ minLength: 1, maxLength: 32 })),
+  configSnapshot: Type.Optional(Type.Record(Type.String({ minLength: 1, maxLength: 128 }), Type.Any(), { maxProperties: 64 })),
+});
+export const V2CreateRunSubmissionSchema = Type.Union([PromptSubmissionSchema, V2CapabilityInvocationRequestSchema]);
+export const V2RunSubmissionSchema = Type.Union([PromptSubmissionSchema, V2CapabilityInvocationSchema]);
+export type V2RunSubmission = Static<typeof V2RunSubmissionSchema>;
+export type V2CreateRunSubmission = Static<typeof V2CreateRunSubmissionSchema>;
 
 /** API, event and persistence payloads have independent versions. This is not a report schema version. */
 export const V2RunStatusSchema = Type.Union([
@@ -33,7 +53,7 @@ export const V2RunSchema = object({
   extensionId: Type.Optional(Type.Union([id, Type.Null()])),
   status: V2RunStatusSchema,
   requestHash: sha256,
-  input: Type.Optional(RunSubmissionSchema),
+  input: Type.Optional(V2RunSubmissionSchema),
   retryOfRunId: Type.Optional(id), currentAttemptId: Type.Optional(id),
   createdAt: timestamp, updatedAt: timestamp, endedAt: Type.Optional(Type.Union([timestamp, Type.Null()])),
   result: Type.Optional(WorkbenchResultSchema),
@@ -44,7 +64,7 @@ export const V2ConversationMessageSchema = object({
   sequence: sequence, role: Type.Union([Type.Literal("user"), Type.Literal("assistant"), Type.Literal("capability")]),
   content: Type.String({ maxLength: 16_000 }), createdAt: timestamp,
   extensionId: Type.Optional(Type.Union([id, Type.Null()])),
-  capabilityInput: Type.Optional(RepositoryAnalysisInputSchema),
+  capabilityInput: Type.Optional(extensionInput),
 });
 export const V2ConversationSummarySchema = object({
   schemaVersion: Type.Literal(2), conversationId: id, title: Type.String({ minLength: 1, maxLength: 256 }),
@@ -58,7 +78,7 @@ export const V2ConversationSchema = object({
   messages: Type.Array(V2ConversationMessageSchema, { maxItems: 1000 }),
 });
 export const V2SubmitRunRequestSchema = object({
-  schemaVersion: Type.Literal(2), conversationId: id, input: RunSubmissionSchema,
+  schemaVersion: Type.Literal(2), conversationId: id, input: V2CreateRunSubmissionSchema,
 });
 
 export const V2ProjectSchema = object({
@@ -157,6 +177,9 @@ export const V2ErrorSchema = object({
     Type.Literal("db_readonly"), Type.Literal("unknown_schema"), Type.Literal("conflict"),
     Type.Literal("busy"), Type.Literal("worker_unavailable"), Type.Literal("interrupted"),
     Type.Literal("internal_error"), Type.Literal("migration_failed"),
+    Type.Literal("unknown_extension"), Type.Literal("extension_disabled"), Type.Literal("extension_unconfigured"),
+    Type.Literal("extension_incompatible"), Type.Literal("extension_permission_denied"),
+    Type.Literal("extension_invalid_input"), Type.Literal("extension_invalid_config"),
   ]),
   message: Type.String({ minLength: 1, maxLength: 512 }), retryable: Type.Boolean(),
 });

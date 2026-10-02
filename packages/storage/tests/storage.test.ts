@@ -36,12 +36,26 @@ test("stable data directory honors override, XDG, and home fallback", () => {
 
 test("new database migrates to WAL/FULL with foreign keys, and repeated open preserves schema", () => withDb((_root, path) => {
   const first = openStorage({ path });
-  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 5 });
+  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 6 });
   assert.equal(first.projects.list().length, 0);
   first.close();
   const reopened = openStorage({ path });
-  assert.equal(reopened.diagnostics.schemaVersion, 5);
+  assert.equal(reopened.diagnostics.schemaVersion, 6);
   assert.equal(reopened.projects.list().length, 0);
+  reopened.close();
+}));
+
+test("capability states persist enabled flags and non-sensitive configuration", () => withDb((_root, path) => {
+  const first = openStorage({ path });
+  const saved = first.capabilityStates.set({ capabilityId: "development_greeting_tool", apiVersion: "1.0", enabled: true, config: { greeting: "hello", retries: 2 } });
+  assert.equal(saved.enabled, true);
+  assert.deepEqual(first.capabilityStates.get("development_greeting_tool")?.config, { greeting: "hello", retries: 2 });
+  assert.throws(() => first.capabilityStates.set({ capabilityId: "bad id", apiVersion: "1.0", enabled: true, config: {} }), StorageError);
+  assert.throws(() => first.capabilityStates.set({ capabilityId: "secret_config", apiVersion: "1.0", enabled: true, config: { apiKey: "secret" } }), StorageError);
+  first.close();
+  const reopened = openStorage({ path });
+  assert.equal(reopened.capabilityStates.get("development_greeting_tool")?.enabled, true);
+  assert.deepEqual(reopened.capabilityStates.list()[0]?.config, { greeting: "hello", retries: 2 });
   reopened.close();
 }));
 
