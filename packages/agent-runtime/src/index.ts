@@ -18,6 +18,7 @@ import { resources } from "./resources.js";
 export { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 export { defineTool } from "@earendil-works/pi-coding-agent";
 export type { CredentialStore, Model, Provider, ToolDefinition };
+export { createProjectFileTools, type ProjectFileToolsAccess, type AttachmentToolsAccess } from "./project-file-tools.js";
 export {
   createConversationSession,
   type ConversationRuntimeOptions,

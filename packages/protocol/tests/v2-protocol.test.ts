@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  parse, V2AttachmentResultSchema, V2ChangesetSchema, V2CleanupPreviewSchema,
   parseV2AttemptIdentity, parseV2Error, parseV2EventCursor, parseV2IdempotencyRequest,
   parseV2Run, parseV2RunAttempt, parseV2RunEvent, parseV2RunEventPage,
 } from "../src/index.js";
@@ -77,4 +78,28 @@ test("v2 event envelope and cursor enforce identities, positive sequence, and mo
     { ...page, nextCursor: { ...page.nextCursor, lastEventId: "wrong_event" } },
     { ...page, runId: "other_run" },
   ]) assert.throws(() => parseV2RunEventPage(badPage));
+});
+
+test("project file event, diff, cleanup, and attachment result contracts reject malformed values", () => {
+  const fileEvent = {
+    schemaVersion: 2, eventId: "event_file", runId: "run_1", attemptId: "attempt_1", sequence: 2,
+    timestamp, type: "file_change_applied", data: {
+      changesetId: "changeset_1", operationId: "operation_1", path: "src/index.ts", postHash: "b".repeat(64),
+    },
+  };
+  assert.equal(parseV2RunEvent(fileEvent).type, "file_change_applied");
+  assert.throws(() => parseV2RunEvent({ ...fileEvent, data: { ...fileEvent.data, path: "../outside.ts" } }));
+  const changeset = {
+    schemaVersion: 2, changesetId: "changeset_1", conversationId: "conversation_1", projectId: "project_1",
+    status: "applied", createdAt: timestamp, updatedAt: timestamp,
+    operations: [{ schemaVersion: 2, operationId: "operation_1", changesetId: "changeset_1", sequence: 1,
+      path: "src/index.ts", kind: "replace", status: "applied", preHash: "a".repeat(64), postHash: "b".repeat(64) }],
+    diffs: [{ path: "src/index.ts", status: "applied", beforeText: "old", afterText: "new", diffText: "-old\n+new", truncated: false }],
+  };
+  assert.equal(parse(V2ChangesetSchema, changeset).operations.length, 1);
+  assert.throws(() => parse(V2ChangesetSchema, { ...changeset, operations: [{ ...changeset.operations[0], status: "success" }] }));
+  assert.equal(parse(V2CleanupPreviewSchema, { schemaVersion: 2, changesetIds: ["changeset_1"], changesetCount: 1,
+    backupObjectCount: 2, backupBytes: 10, losesUndoHistory: true, note: "Confirmed loss." }).backupBytes, 10);
+  assert.equal(parse(V2AttachmentResultSchema, { schemaVersion: 2, resultId: "result_1", conversationId: "conversation_1",
+    fileName: "edited.txt", byteSize: 3, mediaType: "text/plain; charset=utf-8", createdAt: timestamp }).fileName, "edited.txt");
 });

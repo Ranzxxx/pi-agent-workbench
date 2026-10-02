@@ -8,6 +8,7 @@ import {
   createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream,
   type CredentialStore, type Model, type Provider,
 } from "@earendil-works/pi-ai";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Budget, CancelReason, Pricing, Usage } from "@pi-workbench/protocol";
 import { BudgetLedger } from "./budget.js";
 import { resources } from "./resources.js";
@@ -18,6 +19,7 @@ export interface ConversationRuntimeOptions {
   provider: Provider;
   model: Model<string>;
   systemPrompt: string;
+  tools?: ToolDefinition[];
   budget: Budget;
   pricing: Pricing;
   cancellationGraceMs?: number;
@@ -39,6 +41,7 @@ export interface ConversationPromptOptions {
   signal?: AbortSignal;
   onTextDelta?: (text: string) => void;
   onCancellationPending?: () => void;
+  onToolEvent?: (event: { phase: "started" | "finished"; toolCallId: string; toolName: string; isError?: boolean }) => void;
 }
 
 export type ConversationTurnResult =
@@ -59,9 +62,8 @@ function blockedStream(model: Model<string>): AssistantMessageEventStream {
 }
 
 /**
- * A process-local, multi-turn PI session for ordinary conversation. This API
- * deliberately has no tools argument: only explicitly registered capability
- * handlers may receive a privileged tool set.
+ * A process-local, multi-turn PI session. Only explicitly supplied tools are
+ * installed; ordinary conversation callers continue to pass no tools.
  */
 export async function createConversationSession(options: ConversationRuntimeOptions) {
   if (!options.credentials || typeof options.credentials.read !== "function") throw new Error("Explicit credentials are required");
@@ -102,7 +104,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
     ({ session } = await createAgentSession({
       // Match the single-run adapter: no local resource discovery, built-in tools, extensions or persisted session files.
       cwd: options.cwd, agentDir: options.cwd, modelRuntime: runtime, model: options.model,
-      resourceLoader: resources(options.systemPrompt), tools: [], customTools: [],
+      resourceLoader: resources(options.systemPrompt), tools: (options.tools ?? []).map((tool) => tool.name), customTools: options.tools ?? [],
       sessionManager: SessionManager.inMemory(options.cwd, { id: sessionId }, sessionEntries),
       settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
     }));
@@ -121,6 +123,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
     eventError: boolean;
     onTextDelta?: (text: string) => void;
     onCancellationPending?: () => void;
+    onToolEvent?: ConversationPromptOptions["onToolEvent"];
   };
   let active: ActiveTurn | undefined;
   let disposed = false;
@@ -149,8 +152,16 @@ export async function createConversationSession(options: ConversationRuntimeOpti
       maxTokens: Math.min(model.maxTokens, turn.ledger.budget.maxOutputTokens, turn.ledger.budget.maxTokens - turn.ledger.snapshot().totalTokens),
     });
   };
-  // Defense in depth: even a future SDK default or extension change cannot expose a tool in ordinary chat.
-  session.agent.beforeToolCall = async () => ({ block: true, reason: "No tools are enabled for ordinary conversation", terminate: true });
+  const admittedTools = new Set<string>();
+  const toolIds = new Map<string, string>();
+  const originalBeforeToolCall = session.agent.beforeToolCall;
+  session.agent.beforeToolCall = async (context, signal) => {
+    const turn = active;
+    if (!turn || turn.cancelReason || !admittedTools.has(context.toolCall.id)) {
+      return { block: true, reason: "Tool call was not admitted by the workbench runtime", terminate: true };
+    }
+    return originalBeforeToolCall?.(context, signal);
+  };
   session.agent.toolExecution = "sequential";
 
   function record(event: AgentSessionEvent): void {
@@ -171,6 +182,19 @@ export async function createConversationSession(options: ConversationRuntimeOpti
         turn.eventError = true;
         session.agent.abort();
       }
+    } else if (event.type === "tool_execution_start") {
+      const reason = turn.ledger.toolCall();
+      if (reason) abort(reason);
+      else admittedTools.add(event.toolCallId);
+      const toolCallId = randomUUID();
+      toolIds.set(event.toolCallId, toolCallId);
+      try { turn.onToolEvent?.({ phase: "started", toolCallId, toolName: event.toolName.slice(0, 128) }); } catch { /* UI observers do not control tool execution. */ }
+    } else if (event.type === "tool_execution_end") {
+      const toolCallId = toolIds.get(event.toolCallId);
+      if (!toolCallId) { turn.eventError = true; session.agent.abort(); return; }
+      toolIds.delete(event.toolCallId);
+      admittedTools.delete(event.toolCallId);
+      try { turn.onToolEvent?.({ phase: "finished", toolCallId, toolName: event.toolName.slice(0, 128), isError: event.isError }); } catch { /* UI observers do not control tool execution. */ }
     }
   }
 
@@ -207,6 +231,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
       eventError: false,
       onTextDelta: promptOptions.onTextDelta,
       onCancellationPending: promptOptions.onCancellationPending,
+      onToolEvent: promptOptions.onToolEvent,
     };
     active = turn;
     const abortFromSignal = () => abort("user");

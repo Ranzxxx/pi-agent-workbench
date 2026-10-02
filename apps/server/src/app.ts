@@ -4,6 +4,7 @@ import {
   parse, V2ErrorSchema, V2EventCursorSchema, V2SubmitRunRequestSchema,
   V2AttachmentImportRequestSchema, V2PickerBrowseRequestSchema, V2PickerOpenProjectRequestSchema,
   V2PickerSelectProjectRequestSchema, V2ProjectRulesAcceptRequestSchema,
+  V2ChangesetUndoRequestSchema, V2CleanupRequestSchema,
   WorkbenchApiErrorSchema, type V2Error, type V2SubmitRunRequest,
 } from "@pi-workbench/protocol";
 import { createWorkbenchService, type WorkbenchServiceOptions, type ServiceError } from "./service.js";
@@ -174,8 +175,42 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
   app.post("/api/v2/conversations", async (_request, reply) => reply.code(201).send(service.createConversationV2()));
   app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId", async (request) => service.getConversationV2(request.params.conversationId));
   app.delete<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId", async (request) => {
+    requirePickerSession(request, true);
     service.deleteConversationV2(request.params.conversationId);
     return { schemaVersion: 2, deleted: true, conversationId: request.params.conversationId };
+  });
+  app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/changesets", async (request) => {
+    requirePickerSession(request);
+    return { schemaVersion: 2, changesets: service.listConversationChangesets(request.params.conversationId) };
+  });
+  app.get<{ Params: { conversationId: string; changesetId: string } }>("/api/v2/conversations/:conversationId/changesets/:changesetId", async (request) => {
+    requirePickerSession(request);
+    return service.getConversationChangeset(request.params.conversationId, request.params.changesetId);
+  });
+  app.post<{ Params: { conversationId: string; changesetId: string } }>("/api/v2/conversations/:conversationId/changesets/:changesetId/undo", async (request) => {
+    requirePickerSession(request, true);
+    parsePickerBody(V2ChangesetUndoRequestSchema, request.body);
+    return service.undoFileChangeset(request.params.conversationId, request.params.changesetId);
+  });
+  app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/attachment-results", async (request) => {
+    requirePickerSession(request);
+    return { schemaVersion: 2, results: await service.listConversationAttachmentResults(request.params.conversationId) };
+  });
+  app.get<{ Params: { conversationId: string; resultId: string } }>("/api/v2/conversations/:conversationId/attachment-results/:resultId", async (request, reply) => {
+    requirePickerSession(request);
+    const item = await service.readConversationAttachmentResult(request.params.conversationId, request.params.resultId);
+    const fileName = encodeURIComponent(item.result.fileName).replaceAll("'", "%27");
+    return reply.type(item.result.mediaType).header("content-disposition", `attachment; filename*=UTF-8''${fileName}`)
+      .header("x-content-type-options", "nosniff").header("cache-control", "no-store").send(item.bytes);
+  });
+  app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/file-cleanup-preview", async (request) => {
+    requirePickerSession(request);
+    return service.previewFileCleanup(request.params.conversationId);
+  });
+  app.post<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/file-cleanup", async (request) => {
+    requirePickerSession(request, true);
+    const body = parsePickerBody<{ schemaVersion: 2; confirm: true; changesetIds: string[] }>(V2CleanupRequestSchema, request.body);
+    return service.cleanupFileChangesets(request.params.conversationId, body.changesetIds);
   });
   app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/runs", async (request) => ({ schemaVersion: 2, runs: service.listRunsV2(request.params.conversationId) }));
   app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/attachments", async (request) => {

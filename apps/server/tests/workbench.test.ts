@@ -20,6 +20,15 @@ async function createConversation(baseUrl: string): Promise<V2Conversation> {
   assert.equal(response.status, 201);
   return await response.json() as V2Conversation;
 }
+async function pickerHeaders(baseUrl: string): Promise<Record<string, string>> {
+  const origin = new URL(baseUrl).origin;
+  const response = await fetch(`${baseUrl}/api/v2/picker/session`, { method: "POST", headers: { origin } });
+  assert.equal(response.status, 200);
+  const session = await response.json() as { csrfToken: string };
+  const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
+  assert.ok(cookie);
+  return { origin, cookie, "x-csrf-token": session.csrfToken };
+}
 async function submit(baseUrl: string, conversationId: string, text: string, idempotencyKey = crypto.randomUUID()): Promise<Response> {
   return fetch(`${baseUrl}/api/v2/runs`, {
     method: "POST", headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
@@ -129,6 +138,7 @@ await test("global Worker slot serializes runs; cancellation waits for stop and 
   t.after(async () => { await app.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); });
   const first = await createConversation(baseUrl);
   const second = await createConversation(baseUrl);
+  const picker = await pickerHeaders(baseUrl);
   const activeKey = crypto.randomUUID();
   const running = await submit(baseUrl, first.conversationId, "[[fake:slow]] keep waiting", activeKey);
   assert.equal(running.status, 202);
@@ -140,7 +150,7 @@ await test("global Worker slot serializes runs; cancellation waits for stop and 
   const competingKey = crypto.randomUUID();
   const competing = await submit(baseUrl, second.conversationId, "must wait", competingKey);
   assert.equal(competing.status, 409);
-  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${first.conversationId}`, { method: "DELETE" })).status, 409);
+  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${first.conversationId}`, { method: "DELETE", headers: picker })).status, 409);
 
   const cancel = await fetch(`${baseUrl}/api/v2/runs/${run.runId}/cancel`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
   assert.equal(cancel.status, 200);
@@ -155,7 +165,7 @@ await test("global Worker slot serializes runs; cancellation waits for stop and 
   const beforeDeleteDb = openStorage({ dataDirectory: { dataDirectory: root } });
   const deletedAttemptIds = beforeDeleteDb.attempts.list(run.runId).map((attempt) => attempt.attemptId);
   beforeDeleteDb.close();
-  const deletion = await fetch(`${baseUrl}/api/v2/conversations/${first.conversationId}`, { method: "DELETE" });
+  const deletion = await fetch(`${baseUrl}/api/v2/conversations/${first.conversationId}`, { method: "DELETE", headers: picker });
   assert.equal(deletion.status, 200);
   assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${first.conversationId}`)).status, 404);
   assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${second.conversationId}`)).status, 200);

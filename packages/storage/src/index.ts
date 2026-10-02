@@ -57,7 +57,23 @@ export interface ProjectRulesRecord {
   projectId: string; sourcePath: string; sourceSha256: string; sourceVersion: string; content: string;
   acceptedAt: string; revokedAt: string | null;
 }
-export interface GarbageRecord { kind: "attachment_object" | "run_artifacts"; objectRef: string; attempts: number; }
+export interface GarbageRecord { kind: "attachment_object" | "run_artifacts" | "file_backup_object"; objectRef: string; attempts: number; }
+export interface ContentObjectRecord { sha256: string; byteSize: number; createdAt: string; }
+export interface FileChangesetRecord {
+  id: string; conversationId: string; projectId: string; runId: string | null; undoOfChangesetId: string | null;
+  status: "open" | "applied" | "partial" | "conflict" | "undone"; createdAt: string; updatedAt: string;
+}
+export type FileOperationKind = "create" | "replace" | "restore" | "remove_created";
+export type FileOperationStatus = "prepared" | "applied" | "not_applied" | "conflict" | "uncertain" | "undone";
+export interface FileOperationRecord {
+  id: string; changesetId: string; sequence: number; relativePath: string; kind: FileOperationKind; status: FileOperationStatus;
+  preVersion: string | null; preHash: string | null; expectedPostHash: string | null; expectedPostIdentity: string | null; postVersion: string | null; postHash: string | null;
+  backupSha256: string | null; resultSha256: string | null; errorCode: string | null; createdAt: string; updatedAt: string;
+}
+export interface AttachmentResultRecord {
+  id: string; conversationId: string; runId: string | null; sourceAttachmentId: string | null; objectSha256: string;
+  fileName: string; byteSize: number; mediaType: "text/plain; charset=utf-8"; createdAt: string;
+}
 export interface ConversationRecord {
   id: string; projectId: string | null; piSessionId: string | null; title: string;
   status: "active" | "archived" | "recovery_required"; createdAt: string; updatedAt: string;
@@ -109,6 +125,10 @@ interface Context {
 export class Storage {
   readonly projects: ProjectRepository;
   readonly attachments: AttachmentRepository;
+  readonly attachmentResults: AttachmentResultRepository;
+  readonly contentObjects: ContentObjectRepository;
+  readonly fileChangesets: FileChangesetRepository;
+  readonly fileOperations: FileOperationRepository;
   readonly projectRules: ProjectRulesRepository;
   readonly garbage: GarbageRepository;
   readonly conversations: ConversationRepository;
@@ -131,6 +151,10 @@ export class Storage {
     this.readOnly = readOnly;
     this.projects = new ProjectRepository(context);
     this.attachments = new AttachmentRepository(context);
+    this.attachmentResults = new AttachmentResultRepository(context);
+    this.contentObjects = new ContentObjectRepository(context);
+    this.fileChangesets = new FileChangesetRepository(context);
+    this.fileOperations = new FileOperationRepository(context);
     this.projectRules = new ProjectRulesRepository(context);
     this.garbage = new GarbageRepository(context);
     this.conversations = new ConversationRepository(context);
@@ -315,7 +339,254 @@ export class AttachmentRepository {
     return (this.context.db.prepare("SELECT * FROM attachments WHERE conversation_id = ? ORDER BY created_at, id").all(conversationId) as AttachmentRow[]).map(mapAttachment);
   }
   referenceCount(sha256: string): number {
-    return numberFrom(this.context.db.prepare("SELECT COUNT(*) AS count FROM attachments WHERE object_sha256 = ?").get(sha256), "count");
+    return numberFrom(this.context.db.prepare("SELECT (SELECT COUNT(*) FROM attachments WHERE object_sha256 = ?) + (SELECT COUNT(*) FROM attachment_results WHERE object_sha256 = ?) AS count").get(sha256, sha256), "count");
+  }
+  totalBytes(): number {
+    return numberFrom(this.context.db.prepare("SELECT COALESCE(SUM(byte_size), 0) AS count FROM attachment_objects").get(), "count");
+  }
+}
+
+export class AttachmentResultRepository {
+  constructor(private readonly context: Context) {}
+  create(input: Omit<AttachmentResultRecord, "createdAt" | "mediaType"> & { createdAt?: string }): AttachmentResultRecord {
+    assertId(input.id, "Attachment result id"); assertId(input.conversationId, "Conversation id");
+    if (input.runId) assertId(input.runId, "Run id");
+    if (input.sourceAttachmentId) assertId(input.sourceAttachmentId, "Source attachment id");
+    if (!/^[a-f0-9]{64}$/u.test(input.objectSha256) || !input.fileName.trim() || input.fileName.length > 512 ||
+        !Number.isSafeInteger(input.byteSize) || input.byteSize < 0 || input.byteSize > 65_536) throw new StorageError("invalid_input", "Attachment result fields are invalid");
+    const createdAt = input.createdAt ?? new Date().toISOString(); assertTimestamp(createdAt);
+    this.context.atomic((db) => {
+      if (input.sourceAttachmentId && !db.prepare("SELECT 1 FROM attachments WHERE id = ? AND conversation_id = ?").get(input.sourceAttachmentId, input.conversationId)) throw new StorageError("not_found", "Source attachment was not found in this conversation");
+      const garbage = db.prepare("SELECT status FROM garbage_queue WHERE kind = 'attachment_object' AND object_ref = ?").get(input.objectSha256) as { status: string } | undefined;
+      if (garbage?.status === "deleting") throw new StorageError("conflict", "Attachment result object is being reclaimed");
+      if (garbage) db.prepare("DELETE FROM garbage_queue WHERE kind = 'attachment_object' AND object_ref = ?").run(input.objectSha256);
+      db.prepare("INSERT INTO attachment_objects(sha256, byte_size, created_at) VALUES (?, ?, ?) ON CONFLICT(sha256) DO NOTHING").run(input.objectSha256, input.byteSize, createdAt);
+      const object = db.prepare("SELECT byte_size FROM attachment_objects WHERE sha256 = ?").get(input.objectSha256) as { byte_size: number } | undefined;
+      if (!object || object.byte_size !== input.byteSize) throw new StorageError("conflict", "Attachment result object metadata does not match");
+      db.prepare("INSERT INTO attachment_results(id, conversation_id, run_id, source_attachment_id, object_sha256, file_name, byte_size, media_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'text/plain; charset=utf-8', ?)")
+        .run(input.id, input.conversationId, input.runId, input.sourceAttachmentId, input.objectSha256, input.fileName, input.byteSize, createdAt);
+    });
+    return this.get(input.id)!;
+  }
+  get(id: string): AttachmentResultRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM attachment_results WHERE id = ?").get(id) as AttachmentResultRow | undefined;
+    return row && mapAttachmentResult(row);
+  }
+  getForConversation(id: string, conversationId: string): AttachmentResultRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM attachment_results WHERE id = ? AND conversation_id = ?").get(id, conversationId) as AttachmentResultRow | undefined;
+    return row && mapAttachmentResult(row);
+  }
+  list(conversationId: string): AttachmentResultRecord[] {
+    return (this.context.db.prepare("SELECT * FROM attachment_results WHERE conversation_id = ? ORDER BY created_at, id").all(conversationId) as AttachmentResultRow[]).map(mapAttachmentResult);
+  }
+}
+
+export class ContentObjectRepository {
+  constructor(private readonly context: Context) {}
+  register(input: ContentObjectRecord): ContentObjectRecord {
+    if (!/^[a-f0-9]{64}$/u.test(input.sha256) || !Number.isSafeInteger(input.byteSize) || input.byteSize < 0 || input.byteSize > 65_536) throw new StorageError("invalid_input", "File backup object metadata is invalid");
+    assertTimestamp(input.createdAt);
+    this.context.atomic((db) => {
+      const garbage = db.prepare("SELECT status FROM file_object_garbage WHERE sha256 = ?").get(input.sha256) as { status: string } | undefined;
+      if (garbage?.status === "deleting") throw new StorageError("conflict", "File backup object is being reclaimed");
+      if (garbage) db.prepare("DELETE FROM file_object_garbage WHERE sha256 = ?").run(input.sha256);
+      db.prepare("INSERT INTO content_objects(sha256, byte_size, created_at) VALUES (?, ?, ?) ON CONFLICT(sha256) DO NOTHING").run(input.sha256, input.byteSize, input.createdAt);
+      const row = db.prepare("SELECT byte_size FROM content_objects WHERE sha256 = ?").get(input.sha256) as { byte_size: number } | undefined;
+      if (!row || row.byte_size !== input.byteSize) throw new StorageError("conflict", "File backup object metadata does not match");
+    });
+    return this.get(input.sha256)!;
+  }
+  get(sha256: string): ContentObjectRecord | undefined {
+    const row = this.context.db.prepare("SELECT sha256, byte_size, created_at FROM content_objects WHERE sha256 = ?").get(sha256) as ContentObjectRow | undefined;
+    return row && { sha256: row.sha256, byteSize: row.byte_size, createdAt: row.created_at };
+  }
+  totalBytes(): number {
+    return numberFrom(this.context.db.prepare("SELECT COALESCE(SUM(byte_size), 0) AS count FROM content_objects").get(), "count");
+  }
+  usedBytes(): number {
+    return this.totalBytes() + new AttachmentRepository(this.context).totalBytes();
+  }
+}
+
+export class FileChangesetRepository {
+  constructor(private readonly context: Context) {}
+  ensureForRun(input: { id: string; conversationId: string; projectId: string; runId: string; createdAt?: string }): FileChangesetRecord {
+    assertId(input.id, "Changeset id"); assertId(input.conversationId, "Conversation id"); assertId(input.projectId, "Project id"); assertId(input.runId, "Run id");
+    const createdAt = input.createdAt ?? new Date().toISOString(); assertTimestamp(createdAt);
+    this.context.atomic((db) => {
+      const existing = db.prepare("SELECT id, status FROM file_changesets WHERE run_id = ?").get(input.runId) as { id: string; status: string } | undefined;
+      if (existing) {
+        if (existing.status !== "open") db.prepare("UPDATE file_changesets SET status = 'open', updated_at = ? WHERE id = ?").run(createdAt, existing.id);
+        return;
+      }
+      db.prepare("INSERT INTO file_changesets(id, conversation_id, project_id, run_id, undo_of_changeset_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, 'open', ?, ?)")
+        .run(input.id, input.conversationId, input.projectId, input.runId, createdAt, createdAt);
+    });
+    const row = this.context.db.prepare("SELECT * FROM file_changesets WHERE run_id = ?").get(input.runId) as FileChangesetRow | undefined;
+    if (!row) throw new StorageError("conflict", "File changeset could not be created");
+    return mapFileChangeset(row);
+  }
+  createUndo(input: { id: string; originalChangesetId: string; createdAt?: string }): FileChangesetRecord {
+    assertId(input.id, "Changeset id"); assertId(input.originalChangesetId, "Changeset id");
+    const timestamp = input.createdAt ?? new Date().toISOString(); assertTimestamp(timestamp);
+    this.context.atomic((db) => {
+      const original = db.prepare("SELECT conversation_id, project_id FROM file_changesets WHERE id = ?").get(input.originalChangesetId) as { conversation_id: string; project_id: string } | undefined;
+      if (!original) throw new StorageError("not_found", "File changeset was not found");
+      db.prepare("INSERT INTO file_changesets(id, conversation_id, project_id, run_id, undo_of_changeset_id, status, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, 'open', ?, ?)")
+        .run(input.id, original.conversation_id, original.project_id, input.originalChangesetId, timestamp, timestamp);
+    });
+    return this.get(input.id)!;
+  }
+  get(id: string): FileChangesetRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM file_changesets WHERE id = ?").get(id) as FileChangesetRow | undefined;
+    return row && mapFileChangeset(row);
+  }
+  getForConversation(id: string, conversationId: string): FileChangesetRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM file_changesets WHERE id = ? AND conversation_id = ?").get(id, conversationId) as FileChangesetRow | undefined;
+    return row && mapFileChangeset(row);
+  }
+  forRun(runId: string): FileChangesetRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM file_changesets WHERE run_id = ?").get(runId) as FileChangesetRow | undefined;
+    return row && mapFileChangeset(row);
+  }
+  list(conversationId: string): FileChangesetRecord[] {
+    return (this.context.db.prepare("SELECT * FROM file_changesets WHERE conversation_id = ? ORDER BY created_at, id").all(conversationId) as FileChangesetRow[]).map(mapFileChangeset);
+  }
+  listOpen(limit = 1000): FileChangesetRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10_000) throw new TypeError("Open changeset limit is invalid");
+    return (this.context.db.prepare("SELECT * FROM file_changesets WHERE status = 'open' ORDER BY created_at, id LIMIT ?").all(limit) as FileChangesetRow[]).map(mapFileChangeset);
+  }
+  cleanupImpact(conversationId: string, ids: string[]): { changesetCount: number; operationCount: number; objectCount: number; objectBytes: number } {
+    assertId(conversationId, "Conversation id");
+    if (!ids.length || ids.length > 100) throw new StorageError("invalid_input", "Cleanup requires 1 to 100 changesets");
+    for (const id of ids) assertId(id, "Changeset id");
+    const unique = [...new Set(ids)];
+    const placeholders = unique.map(() => "?").join(", ");
+    const changesetCount = numberFrom(this.context.db.prepare(`SELECT COUNT(*) AS count FROM file_changesets WHERE conversation_id = ? AND id IN (${placeholders})`).get(conversationId, ...unique), "count");
+    if (changesetCount !== unique.length) throw new StorageError("not_found", "One or more file changesets were not found in this conversation");
+    const operationCount = numberFrom(this.context.db.prepare(`SELECT COUNT(*) AS count FROM file_operations WHERE changeset_id IN (${placeholders})`).get(...unique), "count");
+    const objectRows = this.context.db.prepare(`SELECT DISTINCT co.sha256, co.byte_size FROM content_objects co JOIN file_operations op ON op.backup_sha256 = co.sha256 OR op.result_sha256 = co.sha256 WHERE op.changeset_id IN (${placeholders}) ORDER BY co.sha256`).all(...unique) as Array<{ sha256: string; byte_size: number }>;
+    return { changesetCount, operationCount, objectCount: objectRows.length, objectBytes: objectRows.reduce((sum, row) => sum + row.byte_size, 0) };
+  }
+  deleteForCleanup(conversationId: string, ids: string[], queuedAt = new Date().toISOString()): { deletedChangesetCount: number; queuedBackupObjects: number } {
+    assertId(conversationId, "Conversation id"); assertTimestamp(queuedAt);
+    const impact = this.cleanupImpact(conversationId, ids);
+    const unique = [...new Set(ids)];
+    const placeholders = unique.map(() => "?").join(", ");
+    const queuedBackupObjects = this.context.atomic((db) => {
+      const unsafe = db.prepare(`SELECT 1 FROM file_changesets c JOIN file_operations o ON o.changeset_id = c.id WHERE c.id IN (${placeholders}) AND (c.status = 'open' OR o.status IN ('prepared', 'uncertain')) LIMIT 1`).get(...unique);
+      if (unsafe) throw new StorageError("active_task", "Open or unresolved file changesets cannot be cleaned up");
+      const hashes = db.prepare(`SELECT backup_sha256 AS sha256 FROM file_operations WHERE changeset_id IN (${placeholders}) AND backup_sha256 IS NOT NULL UNION SELECT result_sha256 AS sha256 FROM file_operations WHERE changeset_id IN (${placeholders}) AND result_sha256 IS NOT NULL`).all(...unique, ...unique) as Array<{ sha256: string }>;
+      db.prepare(`DELETE FROM file_changesets WHERE conversation_id = ? AND id IN (${placeholders})`).run(conversationId, ...unique);
+      let queued = 0;
+      for (const { sha256 } of hashes) {
+        const refs = numberFrom(db.prepare("SELECT COUNT(*) AS count FROM file_operations WHERE backup_sha256 = ? OR result_sha256 = ?").get(sha256, sha256), "count");
+        if (refs === 0) {
+          const result = db.prepare("INSERT INTO file_object_garbage(sha256, queued_at) VALUES (?, ?) ON CONFLICT(sha256) DO NOTHING").run(sha256, queuedAt);
+          if (result.changes === 1) queued += 1;
+        }
+      }
+      return queued;
+    });
+    return { deletedChangesetCount: impact.changesetCount, queuedBackupObjects };
+  }
+  updateStatus(id: string, status: FileChangesetRecord["status"], updatedAt = new Date().toISOString()): FileChangesetRecord {
+    assertTimestamp(updatedAt);
+    const result = this.context.atomic((db) => db.prepare("UPDATE file_changesets SET status = ?, updated_at = ? WHERE id = ?").run(status, updatedAt, id));
+    if (result.changes !== 1) throw new StorageError("not_found", "File changeset was not found");
+    return this.get(id)!;
+  }
+  finalizeRun(runId: string, updatedAt = new Date().toISOString()): FileChangesetRecord | undefined {
+    assertId(runId, "Run id"); assertTimestamp(updatedAt);
+    const changeset = this.forRun(runId);
+    if (!changeset) return undefined;
+    return this.finalize(changeset.id, updatedAt);
+  }
+  finalize(id: string, updatedAt = new Date().toISOString()): FileChangesetRecord {
+    assertId(id, "Changeset id"); assertTimestamp(updatedAt);
+    const changeset = this.get(id);
+    if (!changeset) throw new StorageError("not_found", "File changeset was not found");
+    const operations = (this.context.db.prepare("SELECT status FROM file_operations WHERE changeset_id = ?").all(changeset.id) as Array<{ status: FileOperationStatus }>);
+    const applied = operations.some((operation) => operation.status === "applied");
+    const unresolved = operations.some((operation) => operation.status === "prepared" || operation.status === "uncertain");
+    const conflict = operations.some((operation) => operation.status === "conflict");
+    const failed = operations.some((operation) => operation.status === "not_applied");
+    const status: FileChangesetRecord["status"] = unresolved || (applied && (conflict || failed)) ? "partial"
+      : conflict ? "conflict" : applied ? "applied" : "partial";
+    return this.updateStatus(changeset.id, status, updatedAt);
+  }
+}
+
+export class FileOperationRepository {
+  constructor(private readonly context: Context) {}
+  prepare(input: {
+    id: string; changesetId: string; relativePath: string; kind: FileOperationKind; preVersion: string | null;
+    preHash: string | null; expectedPostHash: string | null; backupSha256: string | null; resultSha256: string | null; createdAt?: string;
+  }): FileOperationRecord {
+    assertId(input.id, "File operation id"); assertId(input.changesetId, "Changeset id");
+    if (!input.relativePath || input.relativePath.length > 1024 || input.relativePath.startsWith("/") || input.relativePath.includes("\\") ||
+        input.relativePath.split("/").some((part) => !part || part === "." || part === "..")) throw new StorageError("invalid_input", "File operation path is invalid");
+    for (const digest of [input.preHash, input.expectedPostHash, input.backupSha256, input.resultSha256]) if (digest !== null && !/^[a-f0-9]{64}$/u.test(digest)) throw new StorageError("invalid_input", "File operation digest is invalid");
+    const createdAt = input.createdAt ?? new Date().toISOString(); assertTimestamp(createdAt);
+    this.context.atomic((db) => {
+      const changeset = db.prepare("SELECT status FROM file_changesets WHERE id = ?").get(input.changesetId) as { status: string } | undefined;
+      if (!changeset) throw new StorageError("not_found", "File changeset was not found");
+      if (changeset.status !== "open") throw new StorageError("conflict", "File changeset is no longer open");
+      const sequence = numberFrom(db.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM file_operations WHERE changeset_id = ?").get(input.changesetId), "next");
+      db.prepare("INSERT INTO file_operations(id, changeset_id, sequence, relative_path, operation_kind, status, pre_version, pre_hash, expected_post_hash, expected_post_identity, post_version, post_hash, backup_sha256, result_sha256, error_code, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'prepared', ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, ?, ?)")
+        .run(input.id, input.changesetId, sequence, input.relativePath, input.kind, input.preVersion, input.preHash, input.expectedPostHash, input.backupSha256, input.resultSha256, createdAt, createdAt);
+    });
+    return this.get(input.id)!;
+  }
+  get(id: string): FileOperationRecord | undefined {
+    const row = this.context.db.prepare("SELECT * FROM file_operations WHERE id = ?").get(id) as FileOperationRow | undefined;
+    return row && mapFileOperation(row);
+  }
+  list(changesetId: string): FileOperationRecord[] {
+    assertId(changesetId, "Changeset id");
+    return (this.context.db.prepare("SELECT * FROM file_operations WHERE changeset_id = ? ORDER BY sequence").all(changesetId) as FileOperationRow[]).map(mapFileOperation);
+  }
+  listPrepared(limit = 1000): FileOperationRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10_000) throw new TypeError("Prepared file operation limit is invalid");
+    return (this.context.db.prepare("SELECT * FROM file_operations WHERE status IN ('prepared', 'uncertain') ORDER BY created_at, id LIMIT ?").all(limit) as FileOperationRow[]).map(mapFileOperation);
+  }
+  expectPostIdentity(id: string, identity: string, updatedAt = new Date().toISOString()): FileOperationRecord {
+    assertTimestamp(updatedAt);
+    if (!/^\d{1,64}:\d{1,64}$/u.test(identity)) throw new StorageError("invalid_input", "Expected file identity is invalid");
+    const result = this.context.atomic((db) => db.prepare("UPDATE file_operations SET expected_post_identity = ?, updated_at = ? WHERE id = ? AND status = 'prepared' AND expected_post_identity IS NULL")
+      .run(identity, updatedAt, id));
+    if (result.changes !== 1) throw new StorageError("conflict", "File operation is not awaiting an expected file identity");
+    return this.get(id)!;
+  }
+  applied(id: string, postVersion: string | null, postHash: string | null, updatedAt = new Date().toISOString()): FileOperationRecord {
+    assertTimestamp(updatedAt);
+    if ((postVersion === null) !== (postHash === null) || (postHash && !/^[a-f0-9]{64}$/u.test(postHash))) throw new StorageError("invalid_input", "Applied file version is invalid");
+    this.context.atomic((db) => {
+      const operation = db.prepare("SELECT status FROM file_operations WHERE id = ?").get(id) as { status: FileOperationStatus } | undefined;
+      if (!operation) throw new StorageError("not_found", "File operation was not found");
+      if (operation.status !== "prepared" && operation.status !== "uncertain") throw new StorageError("conflict", "File operation is not awaiting completion");
+      db.prepare("UPDATE file_operations SET status = 'applied', post_version = ?, post_hash = ?, error_code = NULL, updated_at = ? WHERE id = ?").run(postVersion, postHash, updatedAt, id);
+    });
+    return this.get(id)!;
+  }
+  fail(id: string, status: "not_applied" | "conflict" | "uncertain", errorCode: string, updatedAt = new Date().toISOString()): FileOperationRecord {
+    assertTimestamp(updatedAt);
+    if (!errorCode || errorCode.length > 128) throw new StorageError("invalid_input", "File operation error code is invalid");
+    this.context.atomic((db) => {
+      const operation = db.prepare("SELECT status FROM file_operations WHERE id = ?").get(id) as { status: FileOperationStatus } | undefined;
+      if (!operation) throw new StorageError("not_found", "File operation was not found");
+      if (operation.status !== "prepared" && operation.status !== "uncertain") throw new StorageError("conflict", "File operation is not awaiting failure resolution");
+      db.prepare("UPDATE file_operations SET status = ?, error_code = ?, updated_at = ? WHERE id = ?").run(status, errorCode, updatedAt, id);
+    });
+    return this.get(id)!;
+  }
+  markUndone(ids: string[], updatedAt = new Date().toISOString()): void {
+    assertTimestamp(updatedAt);
+    if (!ids.length) return;
+    for (const id of ids) assertId(id, "File operation id");
+    const unique = [...new Set(ids)];
+    const placeholders = unique.map(() => "?").join(", ");
+    this.context.atomic((db) => db.prepare("UPDATE file_operations SET status = 'undone', updated_at = ? WHERE id IN (" + placeholders + ") AND status = 'applied'").run(updatedAt, ...unique));
   }
 }
 
@@ -349,41 +620,65 @@ export class GarbageRepository {
   constructor(private readonly context: Context) {}
   list(limit = 100): GarbageRecord[] {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new TypeError("Garbage queue limit is invalid");
-    const rows = this.context.db.prepare("SELECT kind, object_ref, attempts FROM garbage_queue ORDER BY queued_at, kind, object_ref LIMIT ?").all(limit) as GarbageRow[];
+    const rows = this.context.db.prepare("SELECT kind, object_ref, attempts FROM garbage_queue UNION ALL SELECT 'file_backup_object' AS kind, sha256 AS object_ref, attempts FROM file_object_garbage ORDER BY kind, object_ref LIMIT ?").all(limit) as GarbageRow[];
     return rows.map((row) => ({ kind: row.kind, objectRef: row.object_ref, attempts: row.attempts }));
   }
   enqueue(item: Pick<GarbageRecord, "kind" | "objectRef">): void {
     if (item.kind === "attachment_object" && !/^[a-f0-9]{64}$/u.test(item.objectRef)) throw new StorageError("invalid_input", "Attachment object reference is invalid");
+    if (item.kind === "file_backup_object" && !/^[a-f0-9]{64}$/u.test(item.objectRef)) throw new StorageError("invalid_input", "File backup reference is invalid");
     if (item.kind === "run_artifacts") assertId(item.objectRef, "Run id");
-    this.context.atomic((db) => db.prepare("INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES (?, ?, ?) ON CONFLICT(kind, object_ref) DO NOTHING")
-      .run(item.kind, item.objectRef, new Date().toISOString()));
+    this.context.atomic((db) => {
+      if (item.kind === "file_backup_object") db.prepare("INSERT INTO file_object_garbage(sha256, queued_at) VALUES (?, ?) ON CONFLICT(sha256) DO NOTHING").run(item.objectRef, new Date().toISOString());
+      else db.prepare("INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES (?, ?, ?) ON CONFLICT(kind, object_ref) DO NOTHING")
+        .run(item.kind, item.objectRef, new Date().toISOString());
+    });
   }
   claim(item: Pick<GarbageRecord, "kind" | "objectRef">): boolean {
     return this.context.atomic((db) => {
-      const row = db.prepare("SELECT status FROM garbage_queue WHERE kind = ? AND object_ref = ?").get(item.kind, item.objectRef) as { status: string } | undefined;
+      const row = item.kind === "file_backup_object"
+        ? db.prepare("SELECT status FROM file_object_garbage WHERE sha256 = ?").get(item.objectRef) as { status: string } | undefined
+        : db.prepare("SELECT status FROM garbage_queue WHERE kind = ? AND object_ref = ?").get(item.kind, item.objectRef) as { status: string } | undefined;
       if (!row) return false;
       if (item.kind === "attachment_object") {
-        const refs = numberFrom(db.prepare("SELECT COUNT(*) AS count FROM attachments WHERE object_sha256 = ?").get(item.objectRef), "count");
+        const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM attachments WHERE object_sha256 = ?) + (SELECT COUNT(*) FROM attachment_results WHERE object_sha256 = ?) AS count").get(item.objectRef, item.objectRef), "count");
         if (refs > 0) { db.prepare("DELETE FROM garbage_queue WHERE kind = ? AND object_ref = ?").run(item.kind, item.objectRef); return false; }
+      }
+      if (item.kind === "file_backup_object") {
+        const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM file_operations WHERE backup_sha256 = ?) + (SELECT COUNT(*) FROM file_operations WHERE result_sha256 = ?) AS count").get(item.objectRef, item.objectRef), "count");
+        if (refs > 0) { db.prepare("DELETE FROM file_object_garbage WHERE sha256 = ?").run(item.objectRef); return false; }
+        if (row.status !== "pending") return false;
+        return db.prepare("UPDATE file_object_garbage SET status = 'deleting' WHERE sha256 = ? AND status = 'pending'").run(item.objectRef).changes === 1;
       }
       if (row.status !== "pending") return false;
       return db.prepare("UPDATE garbage_queue SET status = 'deleting' WHERE kind = ? AND object_ref = ? AND status = 'pending'").run(item.kind, item.objectRef).changes === 1;
     });
   }
-  resetClaims(): void { this.context.atomic((db) => db.prepare("UPDATE garbage_queue SET status = 'pending' WHERE status = 'deleting'").run()); }
+  resetClaims(): void {
+    this.context.atomic((db) => {
+      db.prepare("UPDATE garbage_queue SET status = 'pending' WHERE status = 'deleting'").run();
+      db.prepare("UPDATE file_object_garbage SET status = 'pending' WHERE status = 'deleting'").run();
+    });
+  }
   complete(item: Pick<GarbageRecord, "kind" | "objectRef">): void {
     this.context.atomic((db) => {
       if (item.kind === "attachment_object") {
-        const refs = numberFrom(db.prepare("SELECT COUNT(*) AS count FROM attachments WHERE object_sha256 = ?").get(item.objectRef), "count");
+        const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM attachments WHERE object_sha256 = ?) + (SELECT COUNT(*) FROM attachment_results WHERE object_sha256 = ?) AS count").get(item.objectRef, item.objectRef), "count");
         if (refs > 0) { db.prepare("DELETE FROM garbage_queue WHERE kind = ? AND object_ref = ?").run(item.kind, item.objectRef); return; }
         db.prepare("DELETE FROM attachment_objects WHERE sha256 = ?").run(item.objectRef);
+      } else if (item.kind === "file_backup_object") {
+        const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM file_operations WHERE backup_sha256 = ?) + (SELECT COUNT(*) FROM file_operations WHERE result_sha256 = ?) AS count").get(item.objectRef, item.objectRef), "count");
+        if (refs > 0) { db.prepare("DELETE FROM file_object_garbage WHERE sha256 = ?").run(item.objectRef); return; }
+        db.prepare("DELETE FROM content_objects WHERE sha256 = ?").run(item.objectRef);
+        return;
       }
       db.prepare("DELETE FROM garbage_queue WHERE kind = ? AND object_ref = ?").run(item.kind, item.objectRef);
     });
   }
   fail(item: Pick<GarbageRecord, "kind" | "objectRef">, error: string): void {
-    this.context.atomic((db) => db.prepare("UPDATE garbage_queue SET status = 'pending', attempts = attempts + 1, last_error = ? WHERE kind = ? AND object_ref = ?")
-      .run(error.slice(0, 512), item.kind, item.objectRef));
+    this.context.atomic((db) => {
+      if (item.kind === "file_backup_object") db.prepare("UPDATE file_object_garbage SET status = 'pending', attempts = attempts + 1, last_error = ? WHERE sha256 = ?").run(error.slice(0, 512), item.objectRef);
+      else db.prepare("UPDATE garbage_queue SET status = 'pending', attempts = attempts + 1, last_error = ? WHERE kind = ? AND object_ref = ?").run(error.slice(0, 512), item.kind, item.objectRef);
+    });
   }
 }
 
@@ -444,14 +739,21 @@ export class ConversationRepository {
       const worker = db.prepare("SELECT status FROM worker_identity WHERE singleton = 1").get() as { status: string } | undefined;
       if (worker && (worker.status === "stopping" || worker.status === "uncertain")) throw new StorageError("active_task", "Worker exit has not been confirmed");
 
-      const objectHashes = db.prepare("SELECT DISTINCT object_sha256 FROM attachments WHERE conversation_id = ?").all(id) as Array<{ object_sha256: string }>;
+      const objectHashes = db.prepare("SELECT object_sha256 FROM attachments WHERE conversation_id = ? UNION SELECT object_sha256 FROM attachment_results WHERE conversation_id = ?").all(id, id) as Array<{ object_sha256: string }>;
+      const backupHashes = db.prepare("SELECT backup_sha256 AS sha256 FROM file_operations o JOIN file_changesets c ON c.id = o.changeset_id WHERE c.conversation_id = ? AND backup_sha256 IS NOT NULL UNION SELECT result_sha256 AS sha256 FROM file_operations o JOIN file_changesets c ON c.id = o.changeset_id WHERE c.conversation_id = ? AND result_sha256 IS NOT NULL").all(id, id) as Array<{ sha256: string }>;
       const runIds = db.prepare("SELECT id FROM runs WHERE conversation_id = ?").all(id) as Array<{ id: string }>;
       const queuedAt = new Date().toISOString();
+      db.prepare("DELETE FROM attachment_results WHERE conversation_id = ?").run(id);
       db.prepare("DELETE FROM attachments WHERE conversation_id = ?").run(id);
       for (const { object_sha256 } of objectHashes) {
-        const refs = numberFrom(db.prepare("SELECT COUNT(*) AS count FROM attachments WHERE object_sha256 = ?").get(object_sha256), "count");
+        const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM attachments WHERE object_sha256 = ?) + (SELECT COUNT(*) FROM attachment_results WHERE object_sha256 = ?) AS count").get(object_sha256, object_sha256), "count");
         if (refs === 0) db.prepare(`INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES ('attachment_object', ?, ?)
           ON CONFLICT(kind, object_ref) DO NOTHING`).run(object_sha256, queuedAt);
+      }
+      db.prepare("DELETE FROM file_changesets WHERE conversation_id = ?").run(id);
+      for (const { sha256 } of backupHashes) {
+        const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM file_operations WHERE backup_sha256 = ?) + (SELECT COUNT(*) FROM file_operations WHERE result_sha256 = ?) AS count").get(sha256, sha256), "count");
+        if (refs === 0) db.prepare("INSERT INTO file_object_garbage(sha256, queued_at) VALUES (?, ?) ON CONFLICT(sha256) DO NOTHING").run(sha256, queuedAt);
       }
       for (const { id: runId } of runIds) db.prepare(`INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES ('run_artifacts', ?, ?)
         ON CONFLICT(kind, object_ref) DO NOTHING`).run(runId, queuedAt);
@@ -1027,6 +1329,11 @@ function isTerminalRunStatus(status: V2RunStatus): boolean {
 
 type ProjectRow = { id: string; display_name: string; canonical_root: string; directory_identity: string | null; validation_state: ProjectRecord["validationState"]; created_at: string; last_accessed_at: string };
 type AttachmentRow = { id: string; conversation_id: string; object_sha256: string; file_name: string; relative_path: string; byte_size: number; media_type: AttachmentRecord["mediaType"]; created_at: string };
+type AttachmentResultRow = { id: string; conversation_id: string; run_id: string | null; source_attachment_id: string | null; object_sha256: string; file_name: string; byte_size: number; media_type: AttachmentResultRecord["mediaType"]; created_at: string };
+type ContentObjectRow = { sha256: string; byte_size: number; created_at: string };
+type FileObjectGarbageRow = { sha256: string; byte_size: number; attempts: number };
+type FileChangesetRow = { id: string; conversation_id: string; project_id: string; run_id: string | null; undo_of_changeset_id: string | null; status: FileChangesetRecord["status"]; created_at: string; updated_at: string };
+type FileOperationRow = { id: string; changeset_id: string; sequence: number; relative_path: string; operation_kind: FileOperationKind; status: FileOperationStatus; pre_version: string | null; pre_hash: string | null; expected_post_hash: string | null; expected_post_identity: string | null; post_version: string | null; post_hash: string | null; backup_sha256: string | null; result_sha256: string | null; error_code: string | null; created_at: string; updated_at: string };
 type ProjectRulesRow = { project_id: string; source_path: string; source_sha256: string; source_version: string; content: string; accepted_at: string; revoked_at: string | null };
 type GarbageRow = { kind: GarbageRecord["kind"]; object_ref: string; attempts: number };
 type ConversationRow = { id: string; project_id: string | null; pi_session_id: string | null; title: string; status: ConversationRecord["status"]; created_at: string; updated_at: string };
@@ -1047,6 +1354,20 @@ function mapProject(row: ProjectRow): ProjectRecord {
 function mapAttachment(row: AttachmentRow): AttachmentRecord {
   return { id: row.id, conversationId: row.conversation_id, objectSha256: row.object_sha256, fileName: row.file_name,
     relativePath: row.relative_path, byteSize: row.byte_size, mediaType: row.media_type, createdAt: row.created_at };
+}
+function mapAttachmentResult(row: AttachmentResultRow): AttachmentResultRecord {
+  return { id: row.id, conversationId: row.conversation_id, runId: row.run_id, sourceAttachmentId: row.source_attachment_id,
+    objectSha256: row.object_sha256, fileName: row.file_name, byteSize: row.byte_size, mediaType: row.media_type, createdAt: row.created_at };
+}
+function mapFileChangeset(row: FileChangesetRow): FileChangesetRecord {
+  return { id: row.id, conversationId: row.conversation_id, projectId: row.project_id, runId: row.run_id,
+    undoOfChangesetId: row.undo_of_changeset_id, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at };
+}
+function mapFileOperation(row: FileOperationRow): FileOperationRecord {
+  return { id: row.id, changesetId: row.changeset_id, sequence: row.sequence, relativePath: row.relative_path, kind: row.operation_kind,
+    status: row.status, preVersion: row.pre_version, preHash: row.pre_hash, expectedPostHash: row.expected_post_hash, expectedPostIdentity: row.expected_post_identity,
+    postVersion: row.post_version, postHash: row.post_hash, backupSha256: row.backup_sha256, resultSha256: row.result_sha256,
+    errorCode: row.error_code, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 function mapProjectRules(row: ProjectRulesRow): ProjectRulesRecord {
   return { projectId: row.project_id, sourcePath: row.source_path, sourceSha256: row.source_sha256,

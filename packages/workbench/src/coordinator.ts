@@ -4,9 +4,12 @@ import path from "node:path";
 import { StorageError, openStorage, resolveDataDirectory, type JsonValue, type Storage, type WorkerIdentityRecord } from "@pi-workbench/storage";
 import {
   parse, parseV2Error, parseV2Run, parseV2RunEvent, parseV2EventCursor, parseWorkbenchEvent, parseWorkbenchResult,
-  RunSubmissionSchema, V2ImportResultSchema, V2ProjectSchema, V2ProjectRulesSchema, WorkbenchRunSchema, WorkbenchStreamResetSchema,
+  RunSubmissionSchema, V2ImportResultSchema, V2ProjectSchema, V2ProjectRulesSchema, V2ChangesetSchema, V2ChangesetSummarySchema,
+  V2FileOperationSchema, V2FileDiffSchema, V2AttachmentResultSchema, V2CleanupPreviewSchema, V2CleanupResultSchema, V2ChangesetUndoResultSchema,
+  WorkbenchRunSchema, WorkbenchStreamResetSchema,
   type Conversation, type ConversationMessage, type ConversationSummary, type RunSubmission, type V2Conversation,
   type V2ConversationSummary, type V2Error, type V2EventCursor, type V2ImportResult, type V2Project, type V2ProjectRules, type V2Run, type V2RunEvent, type V2RunStatus,
+  type V2Changeset, type V2ChangesetSummary, type V2AttachmentResult, type V2CleanupPreview, type V2CleanupResult, type V2ChangesetUndoResult,
   type WorkbenchArtifact, type WorkbenchEvent, type WorkbenchResult, type WorkbenchRun, type WorkbenchRunStatus, type WorkbenchStreamReset,
 } from "@pi-workbench/protocol";
 import type { ConversationSessionSnapshot } from "@pi-workbench/agent-runtime";
@@ -15,6 +18,10 @@ import type { WorkerEventPayload } from "./worker-ipc.js";
 import { publicRepositoryCapability } from "./registry.js";
 import type { WorkbenchMode } from "./model-config.js";
 import { ProjectPickerService, type PickerSessionStart } from "./project-picker.js";
+import { recoverPreparedFileOperations } from "./file-journal.js";
+import { createPersistedFileJournal } from "./file-journal.js";
+import { createProjectFileAccess } from "@pi-workbench/tools";
+import { readFileBackup, readManagedObject } from "./managed-object-store.js";
 
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
 const EVENT_LIMIT = 1000;
@@ -108,6 +115,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   let worker: WorkerClient | undefined;
   let activeExecution: Promise<void> | undefined;
   let workerUnavailable = false;
+  let fileMutationActive = false;
   let closing = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
 
@@ -210,6 +218,9 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     else if (event.type === "capability.started") appendV2(runId, { type: "run.progress", data: { phase: "capability", message: event.data.label } });
     else if (event.type === "tool.started") appendV2(runId, { type: "tool.started", data: { toolCallId: event.data.toolCallId, toolName: event.data.toolName, argumentsSummary: "omitted" } });
     else if (event.type === "tool.finished") appendV2(runId, { type: "tool.finished", data: { toolCallId: event.data.toolCallId, toolName: event.data.toolName, isError: event.data.isError } });
+    else if (event.type === "file_change_prepared") appendV2(runId, { type: "file_change_prepared", data: event.data });
+    else if (event.type === "file_change_applied") appendV2(runId, { type: "file_change_applied", data: event.data });
+    else if (event.type === "file_change_conflict") appendV2(runId, { type: "file_change_conflict", data: event.data });
     else if (event.type === "run.cancelling") {
       if (run.status !== "cancelling") storage.runs.updateStatus(runId, "cancelling");
       appendV2(runId, { type: "run.cancelling", data: { reason: event.data.reason === "timeout" ? "timeout" : "user" } });
@@ -295,6 +306,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
         storage.workerIdentity.clear(worker.bootId);
         worker = undefined;
       }
+      await recoverPreparedFileOperations(storage);
       if (!closing) await startWorker();
     }).catch(() => {
       workerUnavailable = true;
@@ -303,6 +315,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   }
 
   await recoverPreviousWorker();
+  if (!workerUnavailable) await recoverPreparedFileOperations(storage);
   await startWorker();
   heartbeat = setInterval(() => {
     const slot = storage.activeSlot.get();
@@ -324,8 +337,15 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     const run = getRunRecord(runId);
     const snapshotRecord = storage.snapshots.latest(run.conversationId);
     const snapshot = snapshotRecord?.snapshot as unknown as ConversationSessionSnapshot | undefined;
+    const conversation = getConversationRecord(run.conversationId);
+    const projectRecord = conversation.projectId ? storage.projects.get(conversation.projectId) : undefined;
+    const rulesRecord = conversation.projectId ? storage.projectRules.get(conversation.projectId) : undefined;
+    const project = projectRecord ? {
+      projectId: projectRecord.id, canonicalRoot: projectRecord.canonicalRoot, directoryIdentity: projectRecord.directoryIdentity,
+      ...(rulesRecord && !rulesRecord.revokedAt ? { acceptedRules: { sourcePath: rulesRecord.sourcePath, sourceSha256: rulesRecord.sourceSha256, content: rulesRecord.content } } : {}),
+    } : undefined;
     try {
-      const result = await client.execute({ runId, conversationId: run.conversationId, input: parse(RunSubmissionSchema, run.request), ...(snapshot ? { snapshot } : {}) }, {
+      const result = await client.execute({ runId, conversationId: run.conversationId, input: parse(RunSubmissionSchema, run.request), ...(snapshot ? { snapshot } : {}), ...(project ? { project } : {}) }, {
         onEvent: (event) => { persistWorkerEvent(runId, event); },
       });
       await finalizeRun(runId, result);
@@ -389,6 +409,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
         const usageEvent = usageUpdated(runId, task.usage);
         if (usageEvent) published.push(usageEvent);
       }
+      storage.fileChangesets.finalizeRun(runId, terminalAt);
       storage.results.save(runId, { result, artifacts: locations.map((entry) => ({ kind: entry.kind, path: entry.path, sha256: entry.sha256 })) }, terminalAt);
       if (attempt.status === "running") {
         const error = result.status === "failed" ? parseV2Error({ schemaVersion: 2, code: "internal_error", message: result.error.message.slice(0, 512) || "Run failed.", retryable: false }) : undefined;
@@ -406,6 +427,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
 
   function admit(conversationId: string, rawInput: unknown, key: string, retryOfRunId?: string): { runId: string; replayed: boolean } {
     if (closing) throw makeError("conflict", "Service is shutting down.", 503, true);
+    if (fileMutationActive) throw makeError("active_task", "当前正在撤销文件修改，暂不能启动新任务。", 409);
     getConversationRecord(conversationId);
     if (typeof key !== "string" || !KEY_PATTERN.test(key)) throw makeError("invalid_request", "A valid Idempotency-Key header is required.", 400);
     const input = parse(RunSubmissionSchema, rawInput);
@@ -523,6 +545,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     return storage.conversations.list().map((item) => v2Summary(item.id));
   }
   function deleteConversation(conversationId: string): void {
+    if (fileMutationActive) throw makeError("active_task", "当前正在撤销文件修改，暂不能删除对话。", 409);
     try { storage.conversations.deletePermanently(conversationId); void picker.flushGarbage().catch(() => undefined); }
     catch (error) { translateError(error); }
   }
@@ -544,6 +567,7 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   }
   function continueV2(runId: string, key: string): { run: V2Run; replayed: boolean } {
     if (typeof key !== "string" || !KEY_PATTERN.test(key)) throw makeError("invalid_request", "A valid Idempotency-Key header is required.", 400);
+    if (fileMutationActive) throw makeError("active_task", "当前正在撤销文件修改，暂不能继续任务。", 409);
     if (workerUnavailable || !worker?.isAlive) throw makeError("worker_unavailable", "The Worker is not confirmed ready.", 503, true);
     const workerClient = worker;
     const heartbeatAt = now();
@@ -631,6 +655,141 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     if (!attachment) throw makeError("not_found", "Attachment not found.", 404);
     return { attachment, bytes: await picker.readAttachment(attachment) };
   }
+  function listConversationChangesets(conversationId: string): V2ChangesetSummary[] {
+    getConversationRecord(conversationId);
+    return storage.fileChangesets.list(conversationId).flatMap((item) => {
+      const operationCount = storage.fileOperations.list(item.id).length;
+      if (!operationCount) return [];
+      return [parse(V2ChangesetSummarySchema, { schemaVersion: 2, changesetId: item.id, conversationId: item.conversationId,
+        projectId: item.projectId, runId: item.runId, undoOfChangesetId: item.undoOfChangesetId, status: item.status,
+        operationCount, createdAt: item.createdAt, updatedAt: item.updatedAt })];
+    });
+  }
+  async function getConversationChangeset(conversationId: string, changesetId: string): Promise<V2Changeset> {
+    getConversationRecord(conversationId);
+    const changeset = storage.fileChangesets.getForConversation(changesetId, conversationId);
+    if (!changeset) throw makeError("not_found", "File changeset not found.", 404);
+    const operations = storage.fileOperations.list(changesetId);
+    if (operations.length > 1000) throw makeError("conflict", "File changeset exceeds the display limit.", 409);
+    const views = operations.map((operation) => parse(V2FileOperationSchema, {
+      schemaVersion: 2, operationId: operation.id, changesetId, sequence: operation.sequence, path: operation.relativePath,
+      kind: operation.kind, status: operation.status, preHash: operation.preHash, postHash: operation.postHash,
+      errorCode: operation.errorCode,
+    }));
+    const byPath = new Map<string, typeof operations>();
+    for (const operation of operations) byPath.set(operation.relativePath, [...(byPath.get(operation.relativePath) ?? []), operation]);
+    const diffs = [];
+    for (const [filePath, group] of byPath) {
+      if (diffs.length >= 200) break;
+      const firstApplied = group.find((operation) => operation.status === "applied" || operation.status === "undone");
+      const lastApplied = [...group].reverse().find((operation) => operation.status === "applied" || operation.status === "undone");
+      const first = firstApplied ?? group[0]!;
+      const last = lastApplied ?? group.at(-1)!;
+      const beforeBytes = first.preHash === null ? null : first.backupSha256 ? await readFileBackup(storage, dataDirectory, first.backupSha256) : null;
+      const afterBytes = last.expectedPostHash === null ? null : last.resultSha256 ? await readFileBackup(storage, dataDirectory, last.resultSha256) : null;
+      if ((first.preHash !== null && !beforeBytes) || (last.expectedPostHash !== null && !afterBytes)) throw makeError("conflict", "A file diff object is missing or failed integrity checks.", 409);
+      const beforeText = beforeBytes ? new TextDecoder("utf-8", { fatal: true }).decode(beforeBytes) : null;
+      const afterText = afterBytes ? new TextDecoder("utf-8", { fatal: true }).decode(afterBytes) : null;
+      const status = group.some((item) => item.status === "uncertain" || item.status === "prepared") ? "uncertain"
+        : group.some((item) => item.status === "conflict") ? "conflict"
+          : group.some((item) => item.status === "applied") ? "applied"
+            : group.every((item) => item.status === "undone") ? "undone" : "not_applied";
+      const lines = [`--- a/${filePath}`, `+++ b/${filePath}`];
+      if (beforeText !== null) lines.push(...beforeText.split(/\r?\n/u).map((line) => `-${line}`));
+      if (afterText !== null) lines.push(...afterText.split(/\r?\n/u).map((line) => `+${line}`));
+      let diffText = lines.join("\n");
+      const truncated = Buffer.byteLength(diffText, "utf8") > 131_072;
+      if (truncated) diffText = Buffer.from(diffText, "utf8").subarray(0, 130_000).toString("utf8");
+      diffs.push(parse(V2FileDiffSchema, { path: filePath, status, beforeText, afterText, diffText, truncated }));
+    }
+    return parse(V2ChangesetSchema, { schemaVersion: 2, changesetId, conversationId, projectId: changeset.projectId,
+      runId: changeset.runId, undoOfChangesetId: changeset.undoOfChangesetId, status: changeset.status,
+      createdAt: changeset.createdAt, updatedAt: changeset.updatedAt, operations: views, diffs });
+  }
+  async function listConversationAttachmentResults(conversationId: string): Promise<V2AttachmentResult[]> {
+    getConversationRecord(conversationId);
+    return storage.attachmentResults.list(conversationId).map((record) => parse(V2AttachmentResultSchema, {
+      schemaVersion: 2, resultId: record.id, conversationId: record.conversationId, sourceAttachmentId: record.sourceAttachmentId,
+      fileName: record.fileName, byteSize: record.byteSize, mediaType: record.mediaType, createdAt: record.createdAt,
+    }));
+  }
+  async function readConversationAttachmentResult(conversationId: string, resultId: string) {
+    getConversationRecord(conversationId);
+    const record = storage.attachmentResults.getForConversation(resultId, conversationId);
+    if (!record) throw makeError("not_found", "Attachment result not found.", 404);
+    const object = await readManagedObject(dataDirectory, "objects", record.objectSha256);
+    if (!object || object.byteLength !== record.byteSize) throw makeError("not_found", "Attachment result is missing or failed integrity checks.", 404);
+    return { result: record, bytes: object };
+  }
+  function previewFileCleanup(conversationId: string): V2CleanupPreview {
+    getConversationRecord(conversationId);
+    const changesets = storage.fileChangesets.list(conversationId).filter((item) => storage.fileOperations.list(item.id).length > 0).slice(0, 100);
+    const changesetIds = changesets.map((item) => item.id);
+    const impact = changesetIds.length ? storage.fileChangesets.cleanupImpact(conversationId, changesetIds)
+      : { changesetCount: 0, operationCount: 0, objectCount: 0, objectBytes: 0 };
+    return parse(V2CleanupPreviewSchema, { schemaVersion: 2, changesetIds, changesetCount: impact.changesetCount,
+      backupObjectCount: impact.objectCount, backupBytes: impact.objectBytes, losesUndoHistory: impact.changesetCount > 0,
+      note: "删除所选变更记录会清除应用内差异和撤销能力；项目目录中的当前文件不会回滚或删除。共享备份对象可能保留。" });
+  }
+  function cleanupFileChangesets(conversationId: string, changesetIds: string[]): V2CleanupResult {
+    getConversationRecord(conversationId);
+    if (storage.activeSlot.get().runId || fileMutationActive) throw makeError("active_task", "当前有运行中的任务或文件撤销，暂不能清理文件记录。", 409);
+    let result: ReturnType<typeof storage.fileChangesets.deleteForCleanup>;
+    try { result = storage.fileChangesets.deleteForCleanup(conversationId, changesetIds); }
+    catch (error) { translateError(error); }
+    void picker.flushGarbage().catch(() => undefined);
+    return parse(V2CleanupResultSchema, { schemaVersion: 2, ...result });
+  }
+  async function undoFileChangeset(conversationId: string, changesetId: string): Promise<V2ChangesetUndoResult> {
+    getConversationRecord(conversationId);
+    if (storage.activeSlot.get().runId || fileMutationActive) throw makeError("active_task", "当前有运行中的任务或文件撤销；停止后才能撤销文件修改。", 409);
+    fileMutationActive = true;
+    try {
+    const original = storage.fileChangesets.getForConversation(changesetId, conversationId);
+    if (!original) throw makeError("not_found", "File changeset not found.", 404);
+    const operations = storage.fileOperations.list(changesetId);
+    const applied = operations.filter((operation) => operation.status === "applied");
+    if (!applied.length) return parse(V2ChangesetUndoResultSchema, { schemaVersion: 2, changesetId, status: "conflict", undonePaths: [], conflictPaths: [] });
+    const project = await picker.reopenProject(original.projectId);
+    const undo = storage.fileChangesets.createUndo({ id: randomUUID(), originalChangesetId: changesetId });
+    const journal = createPersistedFileJournal({ storage, dataDirectory, changesetId: undo.id });
+    const access = createProjectFileAccess(project.canonicalRoot, project.directoryIdentity, journal);
+    await access.initialize();
+    const byPath = new Map<string, typeof applied>();
+    for (const operation of applied) byPath.set(operation.relativePath, [...(byPath.get(operation.relativePath) ?? []), operation]);
+    const undonePaths: string[] = [];
+    const conflictPaths: string[] = [];
+    for (const [filePath, group] of byPath) {
+      const first = group[0]!;
+      const last = group.at(-1)!;
+      try {
+        const current = await access.versionOf(filePath);
+        if ((last.postVersion === null && current !== null) || (last.postVersion !== null && current?.token !== last.postVersion)) {
+          conflictPaths.push(filePath); continue;
+        }
+        if (first.preHash === null) {
+          if (current) await access.removeCreatedFile(filePath, current.token);
+        } else {
+          if (!first.backupSha256) throw new Error("Missing file backup");
+          const before = await readFileBackup(storage, dataDirectory, first.backupSha256);
+          if (!before) throw new Error("Missing file backup");
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(before);
+          if (current) await access.restoreFile(filePath, current.token, text);
+          else await access.createFile(filePath, text);
+        }
+        storage.fileOperations.markUndone(group.map((operation) => operation.id));
+        undonePaths.push(filePath);
+      } catch {
+        conflictPaths.push(filePath);
+      }
+    }
+    const status = conflictPaths.length ? (undonePaths.length ? "partial" : "conflict") : "undone";
+    storage.fileChangesets.updateStatus(undo.id, undonePaths.length ? "applied" : status);
+    const remainingApplied = storage.fileOperations.list(changesetId).some((operation) => operation.status === "applied");
+    storage.fileChangesets.updateStatus(changesetId, remainingApplied ? (conflictPaths.length ? "partial" : "applied") : status);
+    return parse(V2ChangesetUndoResultSchema, { schemaVersion: 2, changesetId, status, undonePaths, conflictPaths });
+    } finally { fileMutationActive = false; }
+  }
   function translateError(error: unknown): never {
     if (error instanceof StorageError) {
       const status = error.code === "not_found" ? 404 : error.code === "active_task" ? 409 : error.code === "db_busy" ? 503 : error.code === "db_readonly" ? 503 : 409;
@@ -674,6 +833,13 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     },
     importAttachments,
     readConversationAttachment,
+    listConversationAttachmentResults,
+    readConversationAttachmentResult,
+    listConversationChangesets,
+    getConversationChangeset,
+    undoFileChangeset,
+    previewFileCleanup,
+    cleanupFileChangesets,
     projectRules: (projectId: string) => v2ProjectRules(storage.projectRules.get(projectId)),
     previewProjectRules: picker.previewRules.bind(picker),
     acceptProjectRules: picker.acceptRules.bind(picker),
