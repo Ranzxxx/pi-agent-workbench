@@ -127,6 +127,9 @@ test("ordinary conversation cancellation propagates and preserves the context se
 test("PI compaction usage is budgeted and its summary is restored from the public session snapshot", { timeout: 10000 }, async () => {
   const contexts: string[] = [];
   const statuses: string[] = [];
+  let providerCallInFlight = false;
+  let providerCallsStarted = 0;
+  let usageSettlements = 0;
   const faux = fauxProvider({ api: "conversation-compaction-test", provider: "conversation-compaction-test",
     models: [{ id: "test", contextWindow: 256, maxTokens: 64 }], tokenSize: { min: 8, max: 8 } });
   faux.setResponses([
@@ -136,6 +139,7 @@ test("PI compaction usage is budgeted and its summary is restored from the publi
   ]);
   const original = faux.provider.streamSimple.bind(faux.provider);
   const provider: Provider = { ...faux.provider, streamSimple(model, context, options) {
+    assert.equal(providerCallInFlight, true, "the durable call-start hook must run before the provider stream");
     contexts.push(JSON.stringify(context.messages));
     return original(model, context, options);
   } };
@@ -144,6 +148,17 @@ test("PI compaction usage is budgeted and its summary is restored from the publi
     systemPrompt: "Answer concisely.", budget: { ...budget, maxModelCalls: 8, maxTokens: 10000 },
     pricing: { version: "compaction-test", input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
     compactionSettings: { reserveTokens: 240, keepRecentTokens: 16 },
+    onModelCallStarted() {
+      assert.equal(providerCallInFlight, false, "each call must follow settlement of the preceding call");
+      providerCallInFlight = true;
+      providerCallsStarted++;
+    },
+    onUsageCheckpoint(_usage, complete) {
+      assert.equal(providerCallInFlight, true, "including the compaction summarizer, each call must be settled");
+      assert.equal(complete, true);
+      providerCallInFlight = false;
+      usageSettlements++;
+    },
   } satisfies ConversationRuntimeOptions;
   const conversation = await createConversationSession(base);
   let saved: ConversationSessionSnapshot | undefined;
@@ -158,6 +173,9 @@ test("PI compaction usage is budgeted and its summary is restored from the publi
     }
     assert.ok(statuses.includes("started"));
     assert.ok(statuses.includes("completed"));
+    assert.equal(providerCallsStarted, 3, "two turn responses and the SDK compaction summary use the wrapped stream");
+    assert.equal(usageSettlements, providerCallsStarted);
+    assert.equal(providerCallInFlight, false);
     saved = conversation.snapshot();
   } finally { await conversation.dispose(); }
 

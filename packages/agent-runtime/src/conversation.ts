@@ -30,6 +30,9 @@ export interface ConversationRuntimeOptions {
   sessionId?: string;
   restoredSnapshot?: ConversationSessionSnapshot;
   persistSnapshot?: (snapshot: ConversationSessionSnapshot) => void | Promise<void>;
+  onModelCallStarted?: (usage: Usage) => void;
+  onUsageCheckpoint?: (usage: Usage, usageComplete: boolean) => void;
+  onSafeCheckpoint?: (snapshot: ConversationSessionSnapshot, usage: Usage, usageComplete: boolean) => void | Promise<void>;
 }
 
 export interface ConversationSessionSnapshot {
@@ -159,6 +162,8 @@ export async function createConversationSession(options: ConversationRuntimeOpti
     if (!turn || turn.cancelReason) return blockedStream(model);
     const reason = turn.ledger.modelCall();
     if (reason) { abort(reason); return blockedStream(model); }
+    try { options.onModelCallStarted?.(turn.ledger.snapshot()); }
+    catch { turn.ledger.markIncomplete(); abort("cost_limit"); return blockedStream(model); }
     return originalStream(model, context, {
       ...streamOptions,
       maxTokens: Math.min(model.maxTokens, turn.ledger.budget.maxOutputTokens, turn.ledger.remainingTokens()),
@@ -191,9 +196,10 @@ export async function createConversationSession(options: ConversationRuntimeOpti
         if ((event.message.stopReason === "error" || event.message.stopReason === "aborted") && event.message.usage.totalTokens === 0 && turn.ledger.snapshot().modelCalls > 0) {
           turn.ledger.markIncomplete();
         }
+        options.onUsageCheckpoint?.(turn.ledger.snapshot(), turn.ledger.usageComplete);
         const reason = turn.ledger.exhausted();
         if (reason) abort(reason);
-      } catch {
+      } catch (error) {
         turn.eventError = true;
         session.agent.abort();
       }
@@ -206,6 +212,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
         const reason = turn.ledger.exhausted();
         if (reason && !turn.cancelReason) abort(reason);
       } else turn.ledger.markIncomplete();
+      options.onUsageCheckpoint?.(turn.ledger.snapshot(), turn.ledger.usageComplete);
       try { turn.onCompactionStatus?.({ state: event.aborted ? "aborted" : event.errorMessage ? "failed" : "completed", reason: event.reason }); } catch { /* UI observers do not control runtime. */ }
     } else if (event.type === "tool_execution_start") {
       const reason = turn.ledger.toolCall();
@@ -279,6 +286,7 @@ export async function createConversationSession(options: ConversationRuntimeOpti
           return { status: "failed", error: { code: "model_error", message: "Model did not complete the conversation turn" }, usage: turn.ledger.snapshot(), usageComplete: turn.ledger.usageComplete };
         }
         const response = turn.lastAssistant.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+        if (turn.ledger.usageComplete) await options.onSafeCheckpoint?.(snapshot(), turn.ledger.snapshot(), true);
         return { status: "completed", text: response.slice(0, 16_000), usage: turn.ledger.snapshot(), usageComplete: turn.ledger.usageComplete };
       } catch {
         try { await persistSnapshot(); } catch {

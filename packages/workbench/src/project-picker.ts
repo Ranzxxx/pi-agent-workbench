@@ -2,8 +2,8 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { constants } from "node:fs";
 import { mkdir, open, lstat, realpath, readdir, link, unlink, rm } from "node:fs/promises";
 import path from "node:path";
-import { StorageError, type AttachmentRecord, type ProjectRecord, type ProjectRulesRecord, type Storage } from "@pi-workbench/storage";
-import { readManagedObject } from "./managed-object-store.js";
+import { ManagedObjectQuotaExceededError, StorageError, type AttachmentRecord, type ProjectRecord, type ProjectRulesRecord, type Storage } from "@pi-workbench/storage";
+import { MAX_MANAGED_OBJECT_BYTES, readManagedObject, reserveManagedObjects } from "./managed-object-store.js";
 
 const SESSION_MS = 4 * 60 * 60 * 1000;
 const TOKEN_MS = 10 * 60 * 1000;
@@ -36,6 +36,45 @@ function fail(code: PickerError["code"], message: string, statusCode = code === 
 function identity(info: { dev: number | bigint; ino: number | bigint }): string { return `${info.dev}:${info.ino}`; }
 function digest(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
 function inside(root: string, target: string): boolean { const rel = path.relative(root, target); return rel === "" || (!rel.startsWith(`..${path.sep}`) && rel !== ".." && !path.isAbsolute(rel)); }
+function pathIdentity(info: { dev: number | bigint; ino: number | bigint }): string { return `${info.dev}:${info.ino}`; }
+interface RunArtifactRemoval { directoryName: "runs" | "workflows"; root: string; target: string; rootIdentity: string; targetIdentity: string; }
+async function inspectRunArtifactTree(dataRoot: string, directoryName: "runs" | "workflows", runId: string): Promise<RunArtifactRemoval | null> {
+  const root = path.join(dataRoot, directoryName);
+  if (!inside(dataRoot, root) || path.dirname(root) !== dataRoot) throw new Error("run artifact root is outside the data directory");
+  const rootInfo = await lstat(root).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+  if (!rootInfo) return null;
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || await realpath(root).catch(() => "") !== root) throw new Error("run artifact root is unsafe");
+  const target = path.join(root, runId);
+  if (!inside(root, target) || path.dirname(target) !== root) throw new Error("run artifact target is outside its root");
+  const targetInfo = await lstat(target).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+  if (!targetInfo) return null;
+  if (!targetInfo.isDirectory() || targetInfo.isSymbolicLink() || await realpath(target).catch(() => "") !== target || !inside(root, target)) {
+    throw new Error("run artifact target is unsafe");
+  }
+  return { directoryName, root, target, rootIdentity: pathIdentity(rootInfo), targetIdentity: pathIdentity(targetInfo) };
+}
+async function removeRunArtifacts(dataDirectory: string, runId: string): Promise<void> {
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(runId)) throw new Error("invalid run artifact ref");
+  const dataRoot = path.resolve(dataDirectory);
+  if (dataRoot !== dataDirectory) throw new Error("run artifact data root is not canonical");
+  const dataInfo = await lstat(dataRoot);
+  if (!dataInfo.isDirectory() || dataInfo.isSymbolicLink() || await realpath(dataRoot).catch(() => "") !== dataRoot) {
+    throw new Error("run artifact data root is unsafe");
+  }
+  const removals = (await Promise.all([
+    inspectRunArtifactTree(dataRoot, "runs", runId),
+    inspectRunArtifactTree(dataRoot, "workflows", runId),
+  ])).filter((item): item is RunArtifactRemoval => item !== null);
+  // Validate both trees before deleting either one; if a path is unsafe, the queued
+  // cleanup remains retryable without having partially removed this run's outputs.
+  for (const removal of removals) {
+    const current = await inspectRunArtifactTree(dataRoot, removal.directoryName, runId);
+    if (!current || current.rootIdentity !== removal.rootIdentity || current.targetIdentity !== removal.targetIdentity) {
+      throw new Error("run artifact path changed during cleanup");
+    }
+  }
+  for (const removal of removals) await rm(removal.target, { recursive: true, force: true });
+}
 function assertPlainName(name: string): void {
   if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\") || /[\u0000-\u001f]/u.test(name)) throw fail("invalid_request", "文件或目录名称无效。");
 }
@@ -58,7 +97,7 @@ export class ProjectPickerService {
   private roots: AllowedRoot[] = [];
   private readonly objectRoot: string;
 
-  constructor(private readonly storage: Storage, private readonly dataDirectory: string, private readonly configuredRoots: string[]) {
+  constructor(private readonly storage: Storage, private readonly dataDirectory: string, private readonly configuredRoots: string[], private readonly maxManagedObjectBytes = MAX_MANAGED_OBJECT_BYTES) {
     this.objectRoot = path.join(dataDirectory, "objects");
   }
 
@@ -275,19 +314,46 @@ export class ProjectPickerService {
     if (!candidates.length) return { attachments: [], skipped: skipped.slice(0, 500), totalBytes: 0 };
 
     const written: string[] = [];
+    let reservations: Array<{ reservationId: string; area: "objects" | "file-objects"; sha256: string; byteSize: number }> = [];
+    let imported: PickerImportResult | undefined;
+    let failure: unknown;
+    let failed = false;
     try {
-      for (const candidate of candidates) { await this.writeObject(candidate.sha256, candidate.bytes); written.push(candidate.sha256); }
-      const attachments = this.storage.attachments.addMany(candidates.map(({ file, bytes, sha256 }) => ({
+      reservations = await reserveManagedObjects(this.storage, this.dataDirectory, candidates.map(({ bytes, sha256 }) => ({ area: "objects" as const, sha256, byteSize: bytes.byteLength })), this.maxManagedObjectBytes);
+      const reservationByDigest = new Map(reservations.map((reservation) => [reservation.sha256, reservation.reservationId]));
+      for (const candidate of candidates) {
+        await this.writeObject(candidate.sha256, candidate.bytes, reservationByDigest.get(candidate.sha256)!);
+        written.push(candidate.sha256);
+      }
+      const attachments = this.storage.attachments.addManyReserved(candidates.map(({ file, bytes, sha256 }) => ({
         id: randomUUID(), conversationId, objectSha256: sha256, fileName: file.name, relativePath: file.relativePath,
         byteSize: bytes.byteLength, mediaType: "text/plain; charset=utf-8" as const,
-      })));
-      return { attachments, skipped: skipped.slice(0, 500), totalBytes };
+      })), reservations.map((reservation) => reservation.reservationId));
+      imported = { attachments, skipped: skipped.slice(0, 500), totalBytes };
     } catch (error) {
-      for (const sha256 of new Set(written)) if (this.storage.attachments.referenceCount(sha256) === 0) this.storage.garbage.enqueue({ kind: "attachment_object", objectRef: sha256 });
-      await this.flushGarbage();
-      if ((error as PickerError).statusCode) throw error;
-      throw fail("conflict", "附件未能完整保存；没有创建附件记录，请重试。");
+      failed = true;
+      failure = (error as PickerError).statusCode ? error
+        : error instanceof ManagedObjectQuotaExceededError ? fail("conflict", "本地附件空间达到安全上限，已拒绝导入。", 409)
+        : fail("conflict", "附件未能完整保存；没有创建附件记录，请重试。");
+      try {
+        for (const sha256 of new Set(written)) if (this.storage.attachments.referenceCount(sha256) === 0) this.storage.garbage.enqueue({ kind: "attachment_object", objectRef: sha256 });
+      } catch (cleanupError) {
+        if (failure instanceof Error) Object.defineProperty(failure, "garbageEnqueueError", { value: cleanupError, configurable: true });
+      }
     }
+    try { this.storage.managedObjects.releaseMany(reservations.map((reservation) => reservation.reservationId)); }
+    catch (releaseError) {
+      if (!failed) { failed = true; failure = releaseError; }
+      else if (failure instanceof Error) Object.defineProperty(failure, "reservationReleaseError", { value: releaseError, configurable: true });
+    }
+    if (failed) {
+      try { await this.flushGarbage(); }
+      catch (cleanupError) {
+        if (failure instanceof Error) Object.defineProperty(failure, "garbageCleanupError", { value: cleanupError, configurable: true });
+      }
+      throw failure;
+    }
+    return imported!;
   }
 
   async readAttachment(attachment: AttachmentRecord): Promise<Buffer> {
@@ -303,34 +369,28 @@ export class ProjectPickerService {
     for (const item of this.storage.garbage.list(250)) {
       try {
         if (!this.storage.garbage.claim(item)) continue;
-        const target = item.kind === "attachment_object" ? this.objectPath(item.objectRef)
-          : item.kind === "file_backup_object" ? this.fileObjectPath(item.objectRef) : path.join(this.dataDirectory, "runs", item.objectRef);
-        if (item.kind === "attachment_object" || item.kind === "file_backup_object") {
+        if (item.kind === "run_artifacts") {
+          await removeRunArtifacts(this.dataDirectory, item.objectRef);
+        } else {
+          const target = item.kind === "attachment_object" ? this.objectPath(item.objectRef) : this.fileObjectPath(item.objectRef);
           const parent = path.dirname(target);
           const parentInfo = await lstat(parent).catch(() => undefined);
           if (parentInfo && (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || await realpath(parent).catch(() => "") !== parent)) throw new Error("attachment object directory is unsafe");
-        }
-        if (item.kind === "run_artifacts" && !/^[A-Za-z0-9_-]{1,128}$/u.test(item.objectRef)) throw new Error("invalid run artifact ref");
-        if (item.kind === "run_artifacts") {
-          const runsRoot = path.join(this.dataDirectory, "runs");
-          const runsInfo = await lstat(runsRoot).catch(() => undefined);
-          if (runsInfo && (!runsInfo.isDirectory() || runsInfo.isSymbolicLink() || await realpath(runsRoot).catch(() => "") !== runsRoot)) throw new Error("run artifact root is unsafe");
-        }
-        const info = await lstat(target).catch(() => undefined);
-        if (info) {
-          if (item.kind === "attachment_object") {
-            if (info.isDirectory() && !info.isSymbolicLink()) throw new Error("object path is a directory");
-            await unlink(target);
-            const parent = path.dirname(target);
-            await rm(parent, { recursive: false }).catch(() => undefined);
-          } else if (item.kind === "file_backup_object") {
-            if (!info.isFile() || info.isSymbolicLink() || !await readManagedObject(this.dataDirectory, "file-objects", item.objectRef)) {
-              throw new Error("file backup object is unsafe or failed integrity checks");
+          const info = await lstat(target).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+          if (info) {
+            if (item.kind === "attachment_object") {
+              if (info.isDirectory() && !info.isSymbolicLink()) throw new Error("object path is a directory");
+              await unlink(target);
+              const parent = path.dirname(target);
+              await rm(parent, { recursive: false }).catch(() => undefined);
+            } else if (item.kind === "file_backup_object") {
+              if (!info.isFile() || info.isSymbolicLink() || !await readManagedObject(this.dataDirectory, "file-objects", item.objectRef)) {
+                throw new Error("file backup object is unsafe or failed integrity checks");
+              }
+              await unlink(target);
+              await rm(path.dirname(target), { recursive: false }).catch(() => undefined);
             }
-            await unlink(target);
-            await rm(path.dirname(target), { recursive: false }).catch(() => undefined);
-          } else if (info.isDirectory() && !info.isSymbolicLink()) await rm(target, { recursive: true, force: true });
-          else await unlink(target);
+          }
         }
         this.storage.garbage.complete(item);
       } catch (error) {
@@ -442,12 +502,12 @@ export class ProjectPickerService {
     if (!/^[a-f0-9]{64}$/u.test(sha256)) throw fail("invalid_request", "文件备份引用无效。");
     return path.join(this.dataDirectory, "file-objects", sha256.slice(0, 2), sha256);
   }
-  private async writeObject(sha256: string, bytes: Buffer): Promise<void> {
+  private async writeObject(sha256: string, bytes: Buffer, stagingId: string): Promise<void> {
     if (digest(bytes) !== sha256) throw fail("conflict", "附件内容校验失败。");
     const destination = this.objectPath(sha256);
     await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
     if (await realpath(path.dirname(destination)).catch(() => "") !== path.dirname(destination)) throw fail("conflict", "本地附件对象目录路径不安全。");
-    const staging = path.join(this.objectRoot, ".staging", randomUUID());
+    const staging = path.join(this.objectRoot, ".staging", stagingId);
     const stagingDirectory = path.dirname(staging);
     if (await realpath(stagingDirectory).catch(() => "") !== stagingDirectory) throw fail("conflict", "本地附件暂存目录路径不安全。");
     const handle = await open(staging, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);

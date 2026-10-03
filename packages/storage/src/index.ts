@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -34,6 +34,12 @@ export class StorageError extends Error {
     this.name = "StorageError";
   }
 }
+export class ManagedObjectQuotaExceededError extends StorageError {
+  constructor() { super("conflict", "Managed object storage has reached its safe capacity limit"); this.name = "ManagedObjectQuotaExceededError"; }
+}
+export class ManagedObjectReservationBusyError extends StorageError {
+  constructor(message = "The same managed object is currently being stored") { super("db_busy", message); this.name = "ManagedObjectReservationBusyError"; }
+}
 
 export interface StorageOptions {
   /** File path or `:memory:`. Omit to use the stable XDG/home data directory. */
@@ -62,6 +68,18 @@ export interface CapabilityStateRecord {
 }
 export interface GarbageRecord { kind: "attachment_object" | "run_artifacts" | "file_backup_object"; objectRef: string; attempts: number; }
 export interface ContentObjectRecord { sha256: string; byteSize: number; createdAt: string; }
+export type ManagedObjectArea = "objects" | "file-objects";
+export interface ManagedObjectReservationRequest { reservationId: string; area: ManagedObjectArea; sha256: string; byteSize: number; }
+export interface ManagedObjectPhysicalFile { area: ManagedObjectArea; sha256: string; byteSize: number; }
+export interface ManagedObjectStagingFile { area: ManagedObjectArea; name: string; byteSize: number; }
+export interface ManagedObjectReservationInventory {
+  objects: ManagedObjectPhysicalFile[];
+  stagingFiles: ManagedObjectStagingFile[];
+  untrackedBytes: number;
+}
+export interface ManagedObjectReservationRecord extends ManagedObjectReservationRequest {
+  ownerPid: number; ownerStart: string; ownerBootId: string; createdAt: string; staleMarkedAt: string | null;
+}
 export interface FileChangesetRecord {
   id: string; conversationId: string; projectId: string; runId: string | null; undoOfChangesetId: string | null;
   status: "open" | "applied" | "partial" | "conflict" | "undone"; createdAt: string; updatedAt: string;
@@ -93,6 +111,11 @@ export interface SessionSnapshotRecord {
 }
 export interface RunRecord extends V2Run { request: JsonValue; }
 export interface RunAttemptRecord extends V2RunAttempt {}
+export interface AttemptExecutionSafetyRecord {
+  attemptId: string; state: "unknown" | "in_flight" | "safe";
+  checkpointKind: "pre_call" | "conversation_turn" | "workflow_stage" | null;
+  checkpointId: string | null; snapshotId: string | null; updatedAt: string;
+}
 export interface CheckpointRecord {
   id: string; runId: string; attemptId: string; phaseId: string; inputSha256: string;
   outputRef: string | null; status: "completed" | "failed" | "interrupted"; createdAt: string;
@@ -130,6 +153,7 @@ export class Storage {
   readonly attachments: AttachmentRepository;
   readonly attachmentResults: AttachmentResultRepository;
   readonly contentObjects: ContentObjectRepository;
+  readonly managedObjects: ManagedObjectReservationRepository;
   readonly fileChangesets: FileChangesetRepository;
   readonly fileOperations: FileOperationRepository;
   readonly projectRules: ProjectRulesRepository;
@@ -140,6 +164,7 @@ export class Storage {
   readonly snapshots: SessionSnapshotRepository;
   readonly runs: RunRepository;
   readonly attempts: RunAttemptRepository;
+  readonly attemptSafety: AttemptExecutionSafetyRepository;
   readonly events: RunEventRepository;
   readonly checkpoints: CheckpointRepository;
   readonly usage: UsageRepository;
@@ -157,6 +182,7 @@ export class Storage {
     this.attachments = new AttachmentRepository(context);
     this.attachmentResults = new AttachmentResultRepository(context);
     this.contentObjects = new ContentObjectRepository(context);
+    this.managedObjects = new ManagedObjectReservationRepository(context);
     this.fileChangesets = new FileChangesetRepository(context);
     this.fileOperations = new FileOperationRepository(context);
     this.projectRules = new ProjectRulesRepository(context);
@@ -167,6 +193,7 @@ export class Storage {
     this.snapshots = new SessionSnapshotRepository(context);
     this.runs = new RunRepository(context);
     this.attempts = new RunAttemptRepository(context);
+    this.attemptSafety = new AttemptExecutionSafetyRepository(context);
     this.events = new RunEventRepository(context);
     this.checkpoints = new CheckpointRepository(context);
     this.usage = new UsageRepository(context);
@@ -332,6 +359,16 @@ export class AttachmentRepository {
     this.context.atomic(() => { for (const input of inputs) ids.push(this.add(input).id); });
     return ids.map((id) => this.get(id)!);
   }
+  addManyReserved(inputs: Array<Omit<AttachmentRecord, "createdAt"> & { createdAt?: string }>, reservationIds: string[]): AttachmentRecord[] {
+    const ids: string[] = [];
+    this.context.atomic((db) => {
+      for (const input of inputs) ids.push(this.add(input).id);
+      consumeManagedObjectReservations(db, reservationIds, uniqueObjectRequests(inputs.map((input) => ({
+        area: "objects" as const, sha256: input.objectSha256, byteSize: input.byteSize,
+      }))));
+    });
+    return ids.map((id) => this.get(id)!);
+  }
   get(id: string): AttachmentRecord | undefined {
     const row = this.context.db.prepare("SELECT * FROM attachments WHERE id = ?").get(id) as AttachmentRow | undefined;
     return row && mapAttachment(row);
@@ -373,9 +410,21 @@ export class AttachmentResultRepository {
     });
     return this.get(input.id)!;
   }
+  createReserved(input: Omit<AttachmentResultRecord, "createdAt" | "mediaType"> & { createdAt?: string }, reservationId: string): AttachmentResultRecord {
+    const record = this.context.atomic((db) => {
+      const created = this.create(input);
+      consumeManagedObjectReservations(db, [reservationId], [{ area: "objects", sha256: input.objectSha256, byteSize: input.byteSize }]);
+      return created;
+    });
+    return this.get(record.id)!;
+  }
   get(id: string): AttachmentResultRecord | undefined {
     const row = this.context.db.prepare("SELECT * FROM attachment_results WHERE id = ?").get(id) as AttachmentResultRow | undefined;
     return row && mapAttachmentResult(row);
+  }
+  hasRunResults(runId: string): boolean {
+    assertId(runId, "Run id");
+    return Boolean(this.context.db.prepare("SELECT 1 FROM attachment_results WHERE run_id = ? LIMIT 1").get(runId));
   }
   getForConversation(id: string, conversationId: string): AttachmentResultRecord | undefined {
     const row = this.context.db.prepare("SELECT * FROM attachment_results WHERE id = ? AND conversation_id = ?").get(id, conversationId) as AttachmentResultRow | undefined;
@@ -401,6 +450,14 @@ export class ContentObjectRepository {
     });
     return this.get(input.sha256)!;
   }
+  registerReserved(input: ContentObjectRecord, reservationId: string): ContentObjectRecord {
+    const record = this.context.atomic((db) => {
+      const registered = this.register(input);
+      consumeManagedObjectReservations(db, [reservationId], [{ area: "file-objects", sha256: input.sha256, byteSize: input.byteSize }]);
+      return registered;
+    });
+    return this.get(record.sha256)!;
+  }
   get(sha256: string): ContentObjectRecord | undefined {
     const row = this.context.db.prepare("SELECT sha256, byte_size, created_at FROM content_objects WHERE sha256 = ?").get(sha256) as ContentObjectRow | undefined;
     return row && { sha256: row.sha256, byteSize: row.byte_size, createdAt: row.created_at };
@@ -410,6 +467,147 @@ export class ContentObjectRepository {
   }
   usedBytes(): number {
     return this.totalBytes() + new AttachmentRepository(this.context).totalBytes();
+  }
+}
+
+export class ManagedObjectReservationRepository {
+  constructor(private readonly context: Context) {}
+
+  reserveBatch(input: {
+    requests: ManagedObjectReservationRequest[];
+    maxBytes: number;
+    inventory: ManagedObjectReservationInventory;
+    observedReservations: ManagedObjectReservationRecord[];
+    createdAt?: string;
+  }): string[] {
+    if (!Number.isSafeInteger(input.maxBytes) || input.maxBytes < 0) throw new StorageError("invalid_input", "Managed object capacity is invalid");
+    const requests = input.requests.map((request) => {
+      assertId(request.reservationId, "Managed object reservation id");
+      if (request.area !== "objects" && request.area !== "file-objects") throw new StorageError("invalid_input", "Managed object area is invalid");
+      if (!/^[a-f0-9]{64}$/u.test(request.sha256)) throw new StorageError("invalid_input", "Managed object hash is invalid");
+      const maxBytes = request.area === "objects" ? 20 * 1024 * 1024 : 65_536;
+      if (!Number.isSafeInteger(request.byteSize) || request.byteSize < 0 || request.byteSize > maxBytes) throw new StorageError("invalid_input", "Managed object size is invalid");
+      return request;
+    });
+    if (new Set(requests.map((request) => request.reservationId)).size !== requests.length ||
+        new Set(requests.map((request) => `${request.area}:${request.sha256}`)).size !== requests.length) {
+      throw new StorageError("invalid_input", "Managed object reservation batch contains duplicate identities");
+    }
+    if (!Number.isSafeInteger(input.inventory.untrackedBytes) || input.inventory.untrackedBytes < 0) throw new StorageError("invalid_input", "Managed object inventory is invalid");
+    for (const file of input.inventory.objects) {
+      if ((file.area !== "objects" && file.area !== "file-objects") || !/^[a-f0-9]{64}$/u.test(file.sha256) || !Number.isSafeInteger(file.byteSize) || file.byteSize < 0) {
+        throw new StorageError("invalid_input", "Managed object inventory contains an invalid object");
+      }
+    }
+    for (const file of input.inventory.stagingFiles) {
+      if ((file.area !== "objects" && file.area !== "file-objects") || !/^[A-Za-z0-9_-]{1,128}$/u.test(file.name) || !Number.isSafeInteger(file.byteSize) || file.byteSize < 0) {
+        throw new StorageError("invalid_input", "Managed object inventory contains an invalid staging file");
+      }
+    }
+    if (new Set(input.observedReservations.map((reservation) => reservation.reservationId)).size !== input.observedReservations.length) {
+      throw new StorageError("invalid_input", "Managed object reservation snapshot contains duplicate identities");
+    }
+    const createdAt = input.createdAt ?? new Date().toISOString();
+    assertTimestamp(createdAt);
+    const owner = currentProcessIdentity();
+    const result = this.context.atomic((db) => {
+      const existingReservations = db.prepare("SELECT reservation_id, area, sha256, byte_size, owner_pid, owner_start, owner_boot_id, created_at, stale_marked_at FROM managed_object_reservations")
+        .all() as ManagedObjectReservationRow[];
+      let newlyMarkedStale = false;
+      let requiresRescan = false;
+      const observedById = new Map(input.observedReservations.map((reservation) => [reservation.reservationId, reservation]));
+      for (const reservation of existingReservations) {
+        const state = reservationOwnerState(reservation, owner.bootId);
+        if (state === "unknown") throw new StorageError("conflict", "Cannot verify a managed object reservation owner; capacity changes are blocked");
+        if (state === "alive" && reservation.stale_marked_at !== null) throw new StorageError("conflict", "A live managed object reservation has an invalid stale marker");
+        if (state === "dead" && reservation.stale_marked_at === null) {
+          db.prepare("UPDATE managed_object_reservations SET stale_marked_at = ? WHERE reservation_id = ? AND stale_marked_at IS NULL")
+            .run(createdAt, reservation.reservation_id);
+          newlyMarkedStale = true;
+        } else if (state === "dead" && reservation.stale_marked_at !== null) {
+          const observed = observedById.get(reservation.reservation_id);
+          if (!observed || !sameReservationSnapshot(reservation, observed)) requiresRescan = true;
+          else db.prepare("DELETE FROM managed_object_reservations WHERE reservation_id = ? AND stale_marked_at = ?")
+            .run(reservation.reservation_id, reservation.stale_marked_at);
+        }
+      }
+      if (newlyMarkedStale || requiresRescan) return { retry: true as const, ids: [] as string[] };
+
+      const activeReservations = db.prepare("SELECT reservation_id, area, sha256, byte_size, owner_pid, owner_start, owner_boot_id, created_at, stale_marked_at FROM managed_object_reservations")
+        .all() as ManagedObjectReservationRow[];
+      const requestedKeys = new Set(requests.map((request) => `${request.area}:${request.sha256}`));
+      if (activeReservations.some((reservation) => requestedKeys.has(`${reservation.area}:${reservation.sha256}`))) {
+        throw new ManagedObjectReservationBusyError();
+      }
+      for (const request of requests) {
+        const queued = request.area === "objects"
+          ? db.prepare("SELECT status FROM garbage_queue WHERE kind = 'attachment_object' AND object_ref = ?").get(request.sha256) as { status: string } | undefined
+          : db.prepare("SELECT status FROM file_object_garbage WHERE sha256 = ?").get(request.sha256) as { status: string } | undefined;
+        if (queued?.status === "deleting") throw new ManagedObjectReservationBusyError("The managed object is being reclaimed; retry after cleanup");
+      }
+
+      const sizes = new Map<string, number>();
+      const addSize = (area: ManagedObjectArea, sha256: string, byteSize: number): void => {
+        const key = `${area}:${sha256}`;
+        const current = sizes.get(key);
+        if (current !== undefined && current !== byteSize) throw new StorageError("conflict", "Managed object metadata disagrees about the physical object size");
+        sizes.set(key, byteSize);
+      };
+      for (const row of db.prepare("SELECT sha256, byte_size FROM content_objects").all() as Array<{ sha256: string; byte_size: number }>) addSize("file-objects", row.sha256, row.byte_size);
+      for (const row of db.prepare("SELECT sha256, byte_size FROM attachment_objects").all() as Array<{ sha256: string; byte_size: number }>) addSize("objects", row.sha256, row.byte_size);
+      for (const reservation of activeReservations) addSize(reservation.area, reservation.sha256, reservation.byte_size);
+      for (const object of input.inventory.objects) addSize(object.area, object.sha256, object.byteSize);
+
+      const activeReservationIds = new Map(activeReservations.map((reservation) => [reservation.reservation_id, reservation.area]));
+      let stagingBytes = 0;
+      for (const file of input.inventory.stagingFiles) {
+        if (activeReservationIds.get(file.name) !== file.area) stagingBytes += file.byteSize;
+      }
+      let usedBytes = input.inventory.untrackedBytes + stagingBytes;
+      for (const byteSize of sizes.values()) usedBytes += byteSize;
+      if (!Number.isSafeInteger(usedBytes)) throw new StorageError("conflict", "Managed object capacity accounting exceeded the supported range");
+
+      let requiredBytes = 0;
+      for (const request of requests) {
+        const key = `${request.area}:${request.sha256}`;
+        const accounted = sizes.get(key);
+        if (accounted !== undefined) {
+          if (accounted !== request.byteSize) throw new StorageError("conflict", "Managed object metadata does not match the requested content");
+        } else requiredBytes += request.byteSize;
+      }
+      if (!Number.isSafeInteger(requiredBytes) || usedBytes + requiredBytes > input.maxBytes) {
+        throw new ManagedObjectQuotaExceededError();
+      }
+      const insert = db.prepare(`INSERT INTO managed_object_reservations(reservation_id, area, sha256, byte_size, owner_pid, owner_start, owner_boot_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+      for (const request of requests) insert.run(request.reservationId, request.area, request.sha256, request.byteSize,
+        owner.pid, owner.start, owner.bootId, createdAt);
+      return { retry: false as const, ids: requests.map((request) => request.reservationId) };
+    });
+    if (result.retry) throw new ManagedObjectReservationBusyError("A dead managed object reservation is being reconciled against disk");
+    return result.ids;
+  }
+
+  releaseMany(reservationIds: string[]): void {
+    if (!reservationIds.length) return;
+    if (new Set(reservationIds).size !== reservationIds.length) throw new StorageError("invalid_input", "Managed object reservation release contains duplicates");
+    const owner = currentProcessIdentity();
+    this.context.atomic((db) => {
+      for (const reservationId of reservationIds) {
+        assertId(reservationId, "Managed object reservation id");
+        const row = db.prepare("SELECT owner_pid, owner_start, owner_boot_id FROM managed_object_reservations WHERE reservation_id = ?")
+          .get(reservationId) as Pick<ManagedObjectReservationRow, "owner_pid" | "owner_start" | "owner_boot_id"> | undefined;
+        if (!row) continue;
+        if (!sameReservationOwner(row, owner)) throw new StorageError("conflict", "Cannot release a managed object reservation owned by another process");
+        db.prepare("DELETE FROM managed_object_reservations WHERE reservation_id = ?").run(reservationId);
+      }
+    });
+  }
+
+  list(): ManagedObjectReservationRecord[] {
+    return (this.context.db.prepare("SELECT reservation_id, area, sha256, byte_size, owner_pid, owner_start, owner_boot_id, created_at, stale_marked_at FROM managed_object_reservations ORDER BY area, sha256")
+      .all() as ManagedObjectReservationRow[]).map((row) => ({ reservationId: row.reservation_id, area: row.area, sha256: row.sha256,
+      byteSize: row.byte_size, ownerPid: row.owner_pid, ownerStart: row.owner_start, ownerBootId: row.owner_boot_id, createdAt: row.created_at, staleMarkedAt: row.stale_marked_at }));
   }
 }
 
@@ -543,6 +741,24 @@ export class FileOperationRepository {
     });
     return this.get(input.id)!;
   }
+  prepareReserved(input: {
+    id: string; changesetId: string; relativePath: string; kind: FileOperationKind; preVersion: string | null;
+    preHash: string | null; expectedPostHash: string | null; backupSha256: string | null; resultSha256: string | null; createdAt?: string;
+  }, objects: ContentObjectRecord[], reservationIds: string[]): FileOperationRecord {
+    const expectedHashes = new Set([input.backupSha256, input.resultSha256].filter((hash): hash is string => hash !== null));
+    const uniqueObjects = uniqueObjectRequests(objects.map((object) => ({ area: "file-objects" as const, sha256: object.sha256, byteSize: object.byteSize })));
+    if (uniqueObjects.length !== expectedHashes.size || uniqueObjects.some((object) => !expectedHashes.has(object.sha256)) ||
+        objects.length !== uniqueObjects.length || reservationIds.length !== uniqueObjects.length) {
+      throw new StorageError("invalid_input", "Reserved file objects must match the operation references exactly");
+    }
+    const record = this.context.atomic((db) => {
+      for (const object of objects) new ContentObjectRepository(this.context).register(object);
+      const prepared = this.prepare(input);
+      consumeManagedObjectReservations(db, reservationIds, uniqueObjects);
+      return prepared;
+    });
+    return this.get(record.id)!;
+  }
   get(id: string): FileOperationRecord | undefined {
     const row = this.context.db.prepare("SELECT * FROM file_operations WHERE id = ?").get(id) as FileOperationRow | undefined;
     return row && mapFileOperation(row);
@@ -550,6 +766,11 @@ export class FileOperationRepository {
   list(changesetId: string): FileOperationRecord[] {
     assertId(changesetId, "Changeset id");
     return (this.context.db.prepare("SELECT * FROM file_operations WHERE changeset_id = ? ORDER BY sequence").all(changesetId) as FileOperationRow[]).map(mapFileOperation);
+  }
+  hasRunOperations(runId: string): boolean {
+    assertId(runId, "Run id");
+    return Boolean(this.context.db.prepare(`SELECT 1 FROM file_operations o JOIN file_changesets c ON c.id = o.changeset_id
+      WHERE c.run_id = ? LIMIT 1`).get(runId));
   }
   listPrepared(limit = 1000): FileOperationRecord[] {
     if (!Number.isInteger(limit) || limit < 1 || limit > 10_000) throw new TypeError("Prepared file operation limit is invalid");
@@ -677,31 +898,53 @@ export class GarbageRepository {
   claim(item: Pick<GarbageRecord, "kind" | "objectRef">): boolean {
     return this.context.atomic((db) => {
       const row = item.kind === "file_backup_object"
-        ? db.prepare("SELECT status FROM file_object_garbage WHERE sha256 = ?").get(item.objectRef) as { status: string } | undefined
-        : db.prepare("SELECT status FROM garbage_queue WHERE kind = ? AND object_ref = ?").get(item.kind, item.objectRef) as { status: string } | undefined;
+        ? db.prepare("SELECT status, claim_pid, claim_start, claim_boot_id FROM file_object_garbage WHERE sha256 = ?").get(item.objectRef) as GarbageClaimRow | undefined
+        : db.prepare("SELECT status, claim_pid, claim_start, claim_boot_id FROM garbage_queue WHERE kind = ? AND object_ref = ?").get(item.kind, item.objectRef) as GarbageClaimRow | undefined;
       if (!row) return false;
+      if (row.status !== "pending") return false;
       if (item.kind === "attachment_object") {
+        if (db.prepare("SELECT 1 FROM managed_object_reservations WHERE area = 'objects' AND sha256 = ?").get(item.objectRef)) return false;
         const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM attachments WHERE object_sha256 = ?) + (SELECT COUNT(*) FROM attachment_results WHERE object_sha256 = ?) AS count").get(item.objectRef, item.objectRef), "count");
         if (refs > 0) { db.prepare("DELETE FROM garbage_queue WHERE kind = ? AND object_ref = ?").run(item.kind, item.objectRef); return false; }
       }
       if (item.kind === "file_backup_object") {
+        if (db.prepare("SELECT 1 FROM managed_object_reservations WHERE area = 'file-objects' AND sha256 = ?").get(item.objectRef)) return false;
         const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM file_operations WHERE backup_sha256 = ?) + (SELECT COUNT(*) FROM file_operations WHERE result_sha256 = ?) AS count").get(item.objectRef, item.objectRef), "count");
         if (refs > 0) { db.prepare("DELETE FROM file_object_garbage WHERE sha256 = ?").run(item.objectRef); return false; }
-        if (row.status !== "pending") return false;
-        return db.prepare("UPDATE file_object_garbage SET status = 'deleting' WHERE sha256 = ? AND status = 'pending'").run(item.objectRef).changes === 1;
       }
-      if (row.status !== "pending") return false;
-      return db.prepare("UPDATE garbage_queue SET status = 'deleting' WHERE kind = ? AND object_ref = ? AND status = 'pending'").run(item.kind, item.objectRef).changes === 1;
+      const owner = currentProcessIdentity();
+      const result = item.kind === "file_backup_object"
+        ? db.prepare("UPDATE file_object_garbage SET status = 'deleting', claim_pid = ?, claim_start = ?, claim_boot_id = ? WHERE sha256 = ? AND status = 'pending'")
+          .run(owner.pid, owner.start, owner.bootId, item.objectRef)
+        : db.prepare("UPDATE garbage_queue SET status = 'deleting', claim_pid = ?, claim_start = ?, claim_boot_id = ? WHERE kind = ? AND object_ref = ? AND status = 'pending'")
+          .run(owner.pid, owner.start, owner.bootId, item.kind, item.objectRef);
+      return result.changes === 1;
     });
   }
   resetClaims(): void {
+    let current: ProcessIdentity;
+    try { current = currentProcessIdentity(); }
+    catch { return; }
     this.context.atomic((db) => {
-      db.prepare("UPDATE garbage_queue SET status = 'pending' WHERE status = 'deleting'").run();
-      db.prepare("UPDATE file_object_garbage SET status = 'pending' WHERE status = 'deleting'").run();
+      const resetDeadClaims = (table: "garbage_queue" | "file_object_garbage"): void => {
+        const rows = db.prepare(`SELECT rowid, claim_pid, claim_start, claim_boot_id FROM ${table} WHERE status = 'deleting'`)
+          .all() as Array<{ rowid: number; claim_pid: number | null; claim_start: string | null; claim_boot_id: string | null }>;
+        for (const row of rows) {
+          // Claims from pre-007 databases and unverifiable owners remain fail-closed.
+          if (row.claim_pid === null || row.claim_start === null || row.claim_boot_id === null) continue;
+          const state = reservationOwnerState({ owner_pid: row.claim_pid, owner_start: row.claim_start, owner_boot_id: row.claim_boot_id }, current.bootId);
+          if (state === "dead") db.prepare(`UPDATE ${table} SET status = 'pending', claim_pid = NULL, claim_start = NULL, claim_boot_id = NULL WHERE rowid = ? AND status = 'deleting'`)
+            .run(row.rowid);
+        }
+      };
+      resetDeadClaims("garbage_queue");
+      resetDeadClaims("file_object_garbage");
     });
   }
   complete(item: Pick<GarbageRecord, "kind" | "objectRef">): void {
+    const owner = currentProcessIdentity();
     this.context.atomic((db) => {
+      assertGarbageClaimOwner(db, item, owner);
       if (item.kind === "attachment_object") {
         const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM attachments WHERE object_sha256 = ?) + (SELECT COUNT(*) FROM attachment_results WHERE object_sha256 = ?) AS count").get(item.objectRef, item.objectRef), "count");
         if (refs > 0) { db.prepare("DELETE FROM garbage_queue WHERE kind = ? AND object_ref = ?").run(item.kind, item.objectRef); return; }
@@ -709,6 +952,7 @@ export class GarbageRepository {
       } else if (item.kind === "file_backup_object") {
         const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM file_operations WHERE backup_sha256 = ?) + (SELECT COUNT(*) FROM file_operations WHERE result_sha256 = ?) AS count").get(item.objectRef, item.objectRef), "count");
         if (refs > 0) { db.prepare("DELETE FROM file_object_garbage WHERE sha256 = ?").run(item.objectRef); return; }
+        db.prepare("DELETE FROM file_object_garbage WHERE sha256 = ?").run(item.objectRef);
         db.prepare("DELETE FROM content_objects WHERE sha256 = ?").run(item.objectRef);
         return;
       }
@@ -716,9 +960,11 @@ export class GarbageRepository {
     });
   }
   fail(item: Pick<GarbageRecord, "kind" | "objectRef">, error: string): void {
+    const owner = currentProcessIdentity();
     this.context.atomic((db) => {
-      if (item.kind === "file_backup_object") db.prepare("UPDATE file_object_garbage SET status = 'pending', attempts = attempts + 1, last_error = ? WHERE sha256 = ?").run(error.slice(0, 512), item.objectRef);
-      else db.prepare("UPDATE garbage_queue SET status = 'pending', attempts = attempts + 1, last_error = ? WHERE kind = ? AND object_ref = ?").run(error.slice(0, 512), item.kind, item.objectRef);
+      assertGarbageClaimOwner(db, item, owner);
+      if (item.kind === "file_backup_object") db.prepare("UPDATE file_object_garbage SET status = 'pending', attempts = attempts + 1, last_error = ?, claim_pid = NULL, claim_start = NULL, claim_boot_id = NULL WHERE sha256 = ? AND status = 'deleting'").run(error.slice(0, 512), item.objectRef);
+      else db.prepare("UPDATE garbage_queue SET status = 'pending', attempts = attempts + 1, last_error = ?, claim_pid = NULL, claim_start = NULL, claim_boot_id = NULL WHERE kind = ? AND object_ref = ? AND status = 'deleting'").run(error.slice(0, 512), item.kind, item.objectRef);
     });
   }
 }
@@ -1163,6 +1409,10 @@ export class RunAttemptRepository {
       if (usageComplete) {
         const usage = db.prepare("SELECT cost_status FROM usage_records WHERE attempt_id = ?").get(attemptId) as { cost_status: string } | undefined;
         if (!usage || usage.cost_status === "unknown") throw new StorageError("invalid_input", "Complete attempt usage requires recorded cost provenance");
+        if (status === "interrupted") {
+          const safety = db.prepare("SELECT state FROM attempt_execution_safety WHERE attempt_id = ?").get(attemptId) as { state: string } | undefined;
+          if (safety?.state !== "safe") throw new StorageError("invalid_input", "Interrupted attempt usage is complete only at a durable safe checkpoint");
+        }
       }
       const attempt = parseV2RunAttempt({
         schemaVersion: 2, runId: row.run_id, attemptId: row.id, attemptNumber: row.attempt_number,
@@ -1180,6 +1430,124 @@ export class RunAttemptRepository {
   }
   list(runId: string): RunAttemptRecord[] {
     return (this.context.db.prepare("SELECT * FROM run_attempts WHERE run_id = ? ORDER BY attempt_number").all(runId) as AttemptRow[]).map(mapAttempt);
+  }
+}
+
+export class AttemptExecutionSafetyRepository {
+  constructor(private readonly context: Context) {}
+
+  get(attemptId: string): AttemptExecutionSafetyRecord | undefined {
+    assertId(attemptId, "Attempt id");
+    const row = this.context.db.prepare("SELECT * FROM attempt_execution_safety WHERE attempt_id = ?").get(attemptId) as AttemptExecutionSafetyRow | undefined;
+    return row && mapAttemptExecutionSafety(row);
+  }
+
+  initializeBeforeCall(input: UsageRecord): AttemptExecutionSafetyRecord {
+    assertKnownUsage(input);
+    if ([input.modelCalls, input.toolCalls, input.inputTokens, input.outputTokens, input.cacheReadTokens, input.cacheWriteTokens, input.totalTokens].some((value) => value !== 0) || input.estimatedCostUsd !== 0) {
+      throw new StorageError("invalid_input", "A pre-call checkpoint must contain zero attempt-local usage");
+    }
+    return this.context.atomic((db) => {
+      assertRunningAttempt(db, input.attemptId);
+      const current = db.prepare("SELECT state FROM attempt_execution_safety WHERE attempt_id = ?").get(input.attemptId) as { state: string } | undefined;
+      if (!current || current.state !== "unknown") throw new StorageError("conflict", "Attempt safety state is not available for its initial checkpoint");
+      new UsageRepository(this.context).record(input);
+      db.prepare("UPDATE attempt_execution_safety SET state = 'safe', checkpoint_kind = 'pre_call', checkpoint_id = NULL, snapshot_id = NULL, updated_at = ? WHERE attempt_id = ?")
+        .run(input.updatedAt, input.attemptId);
+      return this.get(input.attemptId)!;
+    });
+  }
+
+  modelCallStarted(input: UsageRecord): AttemptExecutionSafetyRecord {
+    assertUnknownUsage(input);
+    return this.context.atomic((db) => {
+      assertRunningAttempt(db, input.attemptId);
+      if (!db.prepare("SELECT 1 FROM attempt_execution_safety WHERE attempt_id = ?").get(input.attemptId)) throw new StorageError("not_found", "Attempt safety state was not found");
+      const previousRow = db.prepare("SELECT * FROM usage_records WHERE attempt_id = ?").get(input.attemptId) as UsageRow | undefined;
+      if (!previousRow) throw new StorageError("conflict", "A model call cannot start before attempt usage is durably initialized");
+      const previous = mapUsage(previousRow);
+      if (previous.costStatus === "unknown" || input.modelCalls !== previous.modelCalls + 1 || !usageCountersCover(input, previous)) {
+        throw new StorageError("conflict", "Model call start must extend the settled attempt usage without losing counters");
+      }
+      new UsageRepository(this.context).record(input);
+      db.prepare("UPDATE attempt_execution_safety SET state = 'in_flight', checkpoint_kind = NULL, checkpoint_id = NULL, snapshot_id = NULL, updated_at = ? WHERE attempt_id = ?")
+        .run(input.updatedAt, input.attemptId);
+      return this.get(input.attemptId)!;
+    });
+  }
+
+  recordSettledUsage(input: UsageRecord): UsageRecord {
+    return this.context.atomic((db) => {
+      assertRunningAttempt(db, input.attemptId);
+      const current = db.prepare("SELECT state FROM attempt_execution_safety WHERE attempt_id = ?").get(input.attemptId) as { state: string } | undefined;
+      if (current?.state !== "in_flight") throw new StorageError("conflict", "Settled usage has no persisted in-flight call");
+      const previousRow = db.prepare("SELECT * FROM usage_records WHERE attempt_id = ?").get(input.attemptId) as UsageRow | undefined;
+      if (!previousRow) throw new StorageError("conflict", "Settled usage has no persisted in-flight counters");
+      const previous = mapUsage(previousRow);
+      if (previous.costStatus !== "unknown" || input.modelCalls !== previous.modelCalls || !usageCountersCover(input, previous)) {
+        throw new StorageError("conflict", "Settled usage must cover the persisted in-flight attempt counters");
+      }
+      return new UsageRepository(this.context).record(input);
+    });
+  }
+
+  saveConversationCheckpoint(input: {
+    attemptId: string; conversationId: string;
+    snapshot: Omit<SessionSnapshotRecord, "version"> & { version?: number };
+    usage: UsageRecord;
+  }): { snapshot: SessionSnapshotRecord; safety: AttemptExecutionSafetyRecord } {
+    assertId(input.attemptId, "Attempt id"); assertId(input.conversationId, "Conversation id");
+    assertKnownUsage(input.usage);
+    if (input.usage.attemptId !== input.attemptId || input.snapshot.conversationId !== input.conversationId || input.usage.modelCalls < 1) {
+      throw new StorageError("invalid_input", "Conversation checkpoint identity or usage is invalid");
+    }
+    return this.context.atomic((db) => {
+      assertRunningAttempt(db, input.attemptId);
+      const attempt = db.prepare("SELECT run_id FROM run_attempts WHERE id = ?").get(input.attemptId) as { run_id: string } | undefined;
+      const run = attempt && db.prepare("SELECT conversation_id FROM runs WHERE id = ?").get(attempt.run_id) as { conversation_id: string } | undefined;
+      if (!run || run.conversation_id !== input.conversationId) throw new StorageError("conflict", "Conversation checkpoint does not belong to the attempt");
+      const current = db.prepare("SELECT state FROM attempt_execution_safety WHERE attempt_id = ?").get(input.attemptId) as { state: string } | undefined;
+      if (current?.state !== "in_flight") throw new StorageError("conflict", "Conversation checkpoint has no in-flight attempt to settle");
+      assertPersistedUsageMatches(db, input.usage);
+      const snapshot = new SessionSnapshotRepository(this.context).save(input.snapshot);
+      db.prepare("UPDATE attempt_execution_safety SET state = 'safe', checkpoint_kind = 'conversation_turn', checkpoint_id = ?, snapshot_id = ?, updated_at = ? WHERE attempt_id = ?")
+        .run(snapshot.id, snapshot.id, input.usage.updatedAt, input.attemptId);
+      return { snapshot, safety: this.get(input.attemptId)! };
+    });
+  }
+
+  saveWorkflowCheckpoint(input: { checkpoint: CheckpointRecord; usage: UsageRecord }): { checkpoint: CheckpointRecord; safety: AttemptExecutionSafetyRecord } {
+    assertKnownUsage(input.usage);
+    if (input.checkpoint.attemptId !== input.usage.attemptId || input.checkpoint.status !== "completed") throw new StorageError("invalid_input", "Workflow safety checkpoint identity is invalid");
+    return this.context.atomic((db) => {
+      assertRunningAttempt(db, input.checkpoint.attemptId);
+      const attempt = db.prepare("SELECT run_id FROM run_attempts WHERE id = ?").get(input.checkpoint.attemptId) as { run_id: string } | undefined;
+      if (!attempt || attempt.run_id !== input.checkpoint.runId) throw new StorageError("conflict", "Workflow checkpoint does not belong to the attempt");
+      const current = db.prepare("SELECT state FROM attempt_execution_safety WHERE attempt_id = ?").get(input.checkpoint.attemptId) as { state: string } | undefined;
+      if (current?.state !== "safe" && current?.state !== "in_flight") throw new StorageError("conflict", "Workflow checkpoint has no safe or settled execution state");
+      assertPersistedUsageMatches(db, input.usage);
+      const checkpoint = new CheckpointRepository(this.context).create(input.checkpoint);
+      db.prepare("UPDATE attempt_execution_safety SET state = 'safe', checkpoint_kind = 'workflow_stage', checkpoint_id = ?, snapshot_id = NULL, updated_at = ? WHERE attempt_id = ?")
+        .run(checkpoint.id, input.usage.updatedAt, input.checkpoint.attemptId);
+      return { checkpoint, safety: this.get(input.checkpoint.attemptId)! };
+    });
+  }
+
+  adoptWorkflowCheckpoint(input: { attemptId: string; checkpointId: string; usage: UsageRecord }): AttemptExecutionSafetyRecord {
+    assertId(input.attemptId, "Attempt id"); assertId(input.checkpointId, "Checkpoint id"); assertKnownUsage(input.usage);
+    if (input.usage.attemptId !== input.attemptId) throw new StorageError("invalid_input", "Workflow checkpoint usage attempt is invalid");
+    return this.context.atomic((db) => {
+      assertRunningAttempt(db, input.attemptId);
+      const currentAttempt = db.prepare("SELECT run_id FROM run_attempts WHERE id = ?").get(input.attemptId) as { run_id: string } | undefined;
+      const checkpoint = db.prepare("SELECT run_id, status FROM checkpoints WHERE id = ?").get(input.checkpointId) as { run_id: string; status: string } | undefined;
+      if (!currentAttempt || !checkpoint || checkpoint.run_id !== currentAttempt.run_id || checkpoint.status !== "completed") throw new StorageError("conflict", "Validated workflow checkpoint is unavailable for this run");
+      const current = db.prepare("SELECT state, checkpoint_kind FROM attempt_execution_safety WHERE attempt_id = ?").get(input.attemptId) as { state: string; checkpoint_kind: string | null } | undefined;
+      if (current?.state !== "safe" || (current.checkpoint_kind !== "pre_call" && current.checkpoint_kind !== "workflow_stage")) throw new StorageError("conflict", "A validated checkpoint cannot replace unknown or in-flight usage");
+      assertPersistedUsageMatches(db, input.usage);
+      db.prepare("UPDATE attempt_execution_safety SET state = 'safe', checkpoint_kind = 'workflow_stage', checkpoint_id = ?, snapshot_id = NULL, updated_at = ? WHERE attempt_id = ?")
+        .run(input.checkpointId, input.usage.updatedAt, input.attemptId);
+      return this.get(input.attemptId)!;
+    });
   }
 }
 
@@ -1282,6 +1650,21 @@ export class UsageRepository {
 
 export class IdempotencyRepository {
   constructor(private readonly context: Context) {}
+  lookup(input: V2IdempotencyRequest, expectedResult?: V2IdempotencyResult): IdempotencyResolution | undefined {
+    parseV2IdempotencyRequest(input);
+    if (expectedResult) parseV2IdempotencyResult(expectedResult);
+    const existing = this.context.db.prepare(`SELECT request_hash, resource_kind, resource_id FROM idempotency_keys
+      WHERE scope = ? AND endpoint = ? AND idempotency_key = ?`).get(input.scope, input.endpoint, input.key) as IdempotencyRow | undefined;
+    if (!existing) return undefined;
+    if (existing.request_hash !== input.requestHash) throw new StorageError("conflict", "Idempotency key was already used for a different request");
+    if (expectedResult && (existing.resource_kind !== expectedResult.resourceKind || existing.resource_id !== expectedResult.resourceId)) {
+      throw new StorageError("conflict", "Idempotency key refers to a different resource");
+    }
+    return {
+      result: { schemaVersion: 2, resourceKind: existing.resource_kind, resourceId: existing.resource_id },
+      replayed: true,
+    };
+  }
   resolve(input: V2IdempotencyRequest, result: V2IdempotencyResult, createdAt = new Date().toISOString()): IdempotencyResolution {
     parseV2IdempotencyRequest(input);
     parseV2IdempotencyResult(result);
@@ -1372,6 +1755,11 @@ type ProjectRow = { id: string; display_name: string; canonical_root: string; di
 type AttachmentRow = { id: string; conversation_id: string; object_sha256: string; file_name: string; relative_path: string; byte_size: number; media_type: AttachmentRecord["mediaType"]; created_at: string };
 type AttachmentResultRow = { id: string; conversation_id: string; run_id: string | null; source_attachment_id: string | null; object_sha256: string; file_name: string; byte_size: number; media_type: AttachmentResultRecord["mediaType"]; created_at: string };
 type ContentObjectRow = { sha256: string; byte_size: number; created_at: string };
+type ManagedObjectReservationRow = {
+  reservation_id: string; area: ManagedObjectArea; sha256: string; byte_size: number;
+  owner_pid: number; owner_start: string; owner_boot_id: string; created_at: string; stale_marked_at: string | null;
+};
+type GarbageClaimRow = { status: string; claim_pid: number | null; claim_start: string | null; claim_boot_id: string | null };
 type FileObjectGarbageRow = { sha256: string; byte_size: number; attempts: number };
 type FileChangesetRow = { id: string; conversation_id: string; project_id: string; run_id: string | null; undo_of_changeset_id: string | null; status: FileChangesetRecord["status"]; created_at: string; updated_at: string };
 type FileOperationRow = { id: string; changeset_id: string; sequence: number; relative_path: string; operation_kind: FileOperationKind; status: FileOperationStatus; pre_version: string | null; pre_hash: string | null; expected_post_hash: string | null; expected_post_identity: string | null; post_version: string | null; post_hash: string | null; backup_sha256: string | null; result_sha256: string | null; error_code: string | null; created_at: string; updated_at: string };
@@ -1382,6 +1770,7 @@ type MessageRow = { id: string; conversation_id: string; run_id: string | null; 
 type SnapshotRow = { id: string; conversation_id: string; version: number; sdk_version: string; format_version: string; snapshot_json: string; summary: string | null; created_at: string };
 type RunRow = { id: string; conversation_id: string; project_id: string | null; extension_id: string | null; status: V2RunStatus; request_hash: string; request_json: string; retry_of_run_id: string | null; created_at: string; updated_at: string; ended_at: string | null };
 type AttemptRow = { id: string; run_id: string; attempt_number: number; status: "running" | "completed" | "failed" | "cancelled" | "interrupted"; usage_complete: number; worker_boot_id: string | null; started_at: string; ended_at: string | null; error_json: string | null };
+type AttemptExecutionSafetyRow = { attempt_id: string; state: AttemptExecutionSafetyRecord["state"]; checkpoint_kind: AttemptExecutionSafetyRecord["checkpointKind"]; checkpoint_id: string | null; snapshot_id: string | null; updated_at: string };
 type CheckpointRow = { id: string; run_id: string; attempt_id: string; phase_id: string; input_sha256: string; output_ref: string | null; status: CheckpointRecord["status"]; created_at: string };
 type UsageRow = { attempt_id: string; model_id: string | null; model_calls: number; tool_calls: number; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; total_tokens: number; estimated_cost_usd: number | null; cost_status: UsageRecord["costStatus"]; pricing_version: string | null; updated_at: string };
 type IdempotencyRow = { request_hash: string; resource_kind: "run" | "conversation"; resource_id: string };
@@ -1432,6 +1821,10 @@ function mapAttempt(row: AttemptRow): RunAttemptRecord {
     status: row.status, usageComplete: row.usage_complete === 1, ...(row.worker_boot_id ? { workerBootId: row.worker_boot_id } : {}), startedAt: row.started_at,
     endedAt: row.ended_at, ...(row.error_json ? { error: parseJson(row.error_json) } : {}) });
 }
+function mapAttemptExecutionSafety(row: AttemptExecutionSafetyRow): AttemptExecutionSafetyRecord {
+  return { attemptId: row.attempt_id, state: row.state, checkpointKind: row.checkpoint_kind,
+    checkpointId: row.checkpoint_id, snapshotId: row.snapshot_id, updatedAt: row.updated_at };
+}
 function mapCheckpoint(row: CheckpointRow): CheckpointRecord {
   return { id: row.id, runId: row.run_id, attemptId: row.attempt_id, phaseId: row.phase_id,
     inputSha256: row.input_sha256, outputRef: row.output_ref, status: row.status, createdAt: row.created_at };
@@ -1441,6 +1834,40 @@ function mapUsage(row: UsageRow): UsageRecord {
     inputTokens: row.input_tokens, outputTokens: row.output_tokens, cacheReadTokens: row.cache_read_tokens, cacheWriteTokens: row.cache_write_tokens, totalTokens: row.total_tokens,
     estimatedCostUsd: row.estimated_cost_usd, costStatus: row.cost_status, pricingVersion: row.pricing_version, updatedAt: row.updated_at };
 }
+function assertRunningAttempt(db: DatabaseSync, attemptId: string): void {
+  const row = db.prepare("SELECT status FROM run_attempts WHERE id = ?").get(attemptId) as { status: string } | undefined;
+  if (!row) throw new StorageError("not_found", "Run attempt was not found");
+  if (row.status !== "running") throw new StorageError("conflict", "Attempt execution safety can change only while the attempt is running");
+}
+function assertKnownUsage(input: UsageRecord): void {
+  if ((input.costStatus !== "estimate" && input.costStatus !== "known") || input.estimatedCostUsd === null || !input.pricingVersion) {
+    throw new StorageError("invalid_input", "A safe checkpoint requires complete usage and pricing provenance");
+  }
+}
+function assertUnknownUsage(input: UsageRecord): void {
+  if (input.costStatus !== "unknown" || input.estimatedCostUsd !== null || input.pricingVersion !== null) {
+    throw new StorageError("invalid_input", "An in-flight model call must persist unknown cost status");
+  }
+}
+function assertPersistedUsageMatches(db: DatabaseSync, input: UsageRecord): void {
+  const row = db.prepare("SELECT * FROM usage_records WHERE attempt_id = ?").get(input.attemptId) as UsageRow | undefined;
+  if (!row) throw new StorageError("conflict", "A safe checkpoint requires usage already settled in durable storage");
+  const persisted = mapUsage(row);
+  if (persisted.costStatus === "unknown" ||
+      persisted.modelId !== input.modelId ||
+      persisted.modelCalls !== input.modelCalls || persisted.toolCalls !== input.toolCalls ||
+      persisted.inputTokens !== input.inputTokens || persisted.outputTokens !== input.outputTokens ||
+      persisted.cacheReadTokens !== input.cacheReadTokens || persisted.cacheWriteTokens !== input.cacheWriteTokens ||
+      persisted.totalTokens !== input.totalTokens || persisted.estimatedCostUsd !== input.estimatedCostUsd ||
+      persisted.costStatus !== input.costStatus || persisted.pricingVersion !== input.pricingVersion) {
+    throw new StorageError("conflict", "Safe checkpoint usage does not match the durably settled attempt ledger");
+  }
+}
+function usageCountersCover(candidate: UsageRecord, previous: UsageRecord): boolean {
+  return candidate.toolCalls >= previous.toolCalls && candidate.inputTokens >= previous.inputTokens &&
+    candidate.outputTokens >= previous.outputTokens && candidate.cacheReadTokens >= previous.cacheReadTokens &&
+    candidate.cacheWriteTokens >= previous.cacheWriteTokens && candidate.totalTokens >= previous.totalTokens;
+}
 function mapSlot(row: SlotRow): ActiveSlot {
   return { runId: row.active_run_id, claimToken: row.claim_token, generation: row.generation,
     workerBootId: row.worker_boot_id, heartbeatAt: row.heartbeat_at, leaseExpiresAt: row.lease_expires_at };
@@ -1448,6 +1875,113 @@ function mapSlot(row: SlotRow): ActiveSlot {
 function numberFrom(value: unknown, key: string): number {
   if (!value || typeof value !== "object" || !(key in value) || typeof (value as Record<string, unknown>)[key] !== "number") throw new Error("Invalid SQLite numeric result");
   return (value as Record<string, number>)[key]!;
+}
+
+interface ProcessIdentity { pid: number; start: string; bootId: string; }
+type ProcessStat = { state: "alive"; start: string } | { state: "dead" } | { state: "unknown" };
+const processReservationToken = randomUUID();
+
+function currentProcessIdentity(): ProcessIdentity {
+  if (process.platform === "linux") {
+    try {
+      const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      const stat = processStat(process.pid);
+      if (/^[a-f0-9-]{36}$/iu.test(bootId) && stat.state === "alive") return { pid: process.pid, start: stat.start, bootId: `linux:${bootId}` };
+    } catch { /* Use the conservative PID probe below when procfs is unavailable. */ }
+  }
+  if (processExists(process.pid) !== "alive") throw new StorageError("conflict", "Cannot verify the current process identity for managed object reservations");
+  return { pid: process.pid, start: processReservationToken, bootId: "portable" };
+}
+
+function processStat(pid: number): ProcessStat {
+  try {
+    const value = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = value.lastIndexOf(")");
+    if (close < 0) return { state: "unknown" };
+    const fields = value.slice(close + 1).trim().split(/\s+/u);
+    const start = fields[19]; // Linux proc field 22 (starttime), after fields 1 and 2.
+    if (!start || !/^\d+$/u.test(start)) return { state: "unknown" };
+    return { state: "alive", start };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ESRCH") return { state: "dead" };
+    return { state: "unknown" };
+  }
+}
+
+function reservationOwnerState(row: Pick<ManagedObjectReservationRow, "owner_pid" | "owner_start" | "owner_boot_id">, currentBootId: string): "alive" | "dead" | "unknown" {
+  if (row.owner_boot_id.startsWith("linux:")) {
+    if (!currentBootId.startsWith("linux:")) return processExists(row.owner_pid) === "dead" ? "dead" : "alive";
+    if (row.owner_boot_id !== currentBootId) return "dead";
+    const stat = processStat(row.owner_pid);
+    if (stat.state !== "alive") return stat.state;
+    return stat.start === row.owner_start ? "alive" : "dead";
+  }
+  if (row.owner_boot_id === "portable") {
+    if (row.owner_pid === process.pid && row.owner_start === processReservationToken) return "alive";
+    const state = processExists(row.owner_pid);
+    return state === "dead" ? "dead" : "alive"; // An existing or uncheckable PID is retained conservatively.
+  }
+  return "unknown";
+}
+
+function processExists(pid: number): "alive" | "dead" | "unknown" {
+  try { process.kill(pid, 0); return "alive"; }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "dead";
+    if (code === "EPERM") return "unknown";
+    return "unknown";
+  }
+}
+
+function sameReservationOwner(row: Pick<ManagedObjectReservationRow, "owner_pid" | "owner_start" | "owner_boot_id">, owner: ProcessIdentity): boolean {
+  return row.owner_pid === owner.pid && row.owner_start === owner.start && row.owner_boot_id === owner.bootId;
+}
+
+function assertGarbageClaimOwner(db: DatabaseSync, item: Pick<GarbageRecord, "kind" | "objectRef">, owner: ProcessIdentity): void {
+  const row = item.kind === "file_backup_object"
+    ? db.prepare("SELECT status, claim_pid, claim_start, claim_boot_id FROM file_object_garbage WHERE sha256 = ?").get(item.objectRef) as GarbageClaimRow | undefined
+    : db.prepare("SELECT status, claim_pid, claim_start, claim_boot_id FROM garbage_queue WHERE kind = ? AND object_ref = ?").get(item.kind, item.objectRef) as GarbageClaimRow | undefined;
+  if (!row || row.status !== "deleting" || row.claim_pid === null || row.claim_start === null || row.claim_boot_id === null ||
+      !sameReservationOwner({ owner_pid: row.claim_pid, owner_start: row.claim_start, owner_boot_id: row.claim_boot_id }, owner)) {
+    throw new StorageError("conflict", "Garbage claim is no longer owned by this process");
+  }
+}
+
+function sameReservationSnapshot(row: ManagedObjectReservationRow, observed: ManagedObjectReservationRecord): boolean {
+  return row.reservation_id === observed.reservationId && row.area === observed.area && row.sha256 === observed.sha256 &&
+    row.byte_size === observed.byteSize && row.owner_pid === observed.ownerPid && row.owner_start === observed.ownerStart &&
+    row.owner_boot_id === observed.ownerBootId && row.created_at === observed.createdAt && row.stale_marked_at === observed.staleMarkedAt;
+}
+
+function uniqueObjectRequests(requests: Array<{ area: ManagedObjectArea; sha256: string; byteSize: number }>): Array<{ area: ManagedObjectArea; sha256: string; byteSize: number }> {
+  const unique = new Map<string, { area: ManagedObjectArea; sha256: string; byteSize: number }>();
+  for (const request of requests) {
+    const key = `${request.area}:${request.sha256}`;
+    const existing = unique.get(key);
+    if (existing && existing.byteSize !== request.byteSize) throw new StorageError("conflict", "Managed object metadata does not match");
+    unique.set(key, request);
+  }
+  return [...unique.values()];
+}
+
+function consumeManagedObjectReservations(db: DatabaseSync, reservationIds: string[], expected: Array<{ area: ManagedObjectArea; sha256: string; byteSize: number }>): void {
+  if (new Set(reservationIds).size !== reservationIds.length || reservationIds.length !== expected.length) {
+    throw new StorageError("invalid_input", "Managed object reservations do not match the objects being registered");
+  }
+  const owner = currentProcessIdentity();
+  const expectedById = new Map(reservationIds.map((id, index) => [id, expected[index]!]));
+  for (const reservationId of reservationIds) {
+    assertId(reservationId, "Managed object reservation id");
+    const row = db.prepare("SELECT reservation_id, area, sha256, byte_size, owner_pid, owner_start, owner_boot_id, created_at, stale_marked_at FROM managed_object_reservations WHERE reservation_id = ?")
+      .get(reservationId) as ManagedObjectReservationRow | undefined;
+    const wanted = expectedById.get(reservationId);
+    if (!row || !wanted || row.area !== wanted.area || row.sha256 !== wanted.sha256 || row.byte_size !== wanted.byteSize || !sameReservationOwner(row, owner)) {
+      throw new StorageError("conflict", "Managed object reservation does not match the object being registered");
+    }
+    db.prepare("DELETE FROM managed_object_reservations WHERE reservation_id = ?").run(reservationId);
+  }
 }
 
 function safeJson(value: unknown): string {

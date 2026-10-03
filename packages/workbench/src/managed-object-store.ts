@@ -1,10 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, open, realpath, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
-import type { AttachmentRecord, Storage } from "@pi-workbench/storage";
+import { ManagedObjectQuotaExceededError, ManagedObjectReservationBusyError, StorageError, type AttachmentRecord, type ManagedObjectArea, type ManagedObjectReservationInventory, type ManagedObjectReservationRequest, type Storage } from "@pi-workbench/storage";
 
 export const MAX_MANAGED_OBJECT_BYTES = 2 * 1024 * 1024 * 1024 - 64 * 1024 * 1024;
+interface AttachmentResultView {
+  schemaVersion: 2; resultId: string; conversationId: string; sourceAttachmentId: string | null;
+  fileName: string; byteSize: number; mediaType: "text/plain; charset=utf-8"; createdAt: string;
+}
 
 export function sha256(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
 
@@ -21,7 +25,7 @@ async function validateDirectory(directory: string): Promise<void> {
   if (!info.isDirectory() || info.isSymbolicLink() || await realpath(directory).catch(() => "") !== directory) failClosed();
 }
 
-export async function writeManagedObject(dataDirectory: string, area: "file-objects" | "objects", digest: string, bytes: Buffer): Promise<void> {
+export async function writeManagedObject(dataDirectory: string, area: "file-objects" | "objects", digest: string, bytes: Buffer, stagingId: string = randomUUID()): Promise<void> {
   if (sha256(bytes) !== digest) failClosed();
   const destination = objectPath(dataDirectory, area, digest);
   const parent = path.dirname(destination);
@@ -35,7 +39,8 @@ export async function writeManagedObject(dataDirectory: string, area: "file-obje
   }
   const stagingDirectory = path.join(root, ".staging");
   await validateDirectory(stagingDirectory);
-  const staging = path.join(stagingDirectory, randomUUID());
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(stagingId)) failClosed();
+  const staging = path.join(stagingDirectory, stagingId);
   const handle = await open(staging, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600).catch(failClosed);
   try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
   try {
@@ -50,6 +55,76 @@ export async function writeManagedObject(dataDirectory: string, area: "file-obje
   }
   const stored = await readManagedObject(dataDirectory, area, digest);
   if (!stored || !stored.equals(bytes)) failClosed();
+}
+
+async function inventoryArea(dataDirectory: string, area: ManagedObjectArea): Promise<ManagedObjectReservationInventory> {
+  const inventory: ManagedObjectReservationInventory = { objects: [], stagingFiles: [], untrackedBytes: 0 };
+  const root = path.join(dataDirectory, area);
+  const rootInfo = await lstat(root).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; return failClosed(); });
+  if (!rootInfo) return inventory;
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || await realpath(root).catch(() => "") !== root) failClosed();
+  const entries = await readdir(root, { withFileTypes: true }).catch(failClosed);
+  for (const entry of entries) {
+    const target = path.join(root, entry.name);
+    if (entry.name === ".staging") {
+      const info = await lstat(target).catch(failClosed);
+      if (!info.isDirectory() || info.isSymbolicLink() || await realpath(target).catch(() => "") !== target) failClosed();
+      for (const staged of await readdir(target, { withFileTypes: true }).catch(failClosed)) {
+        const stagedPath = path.join(target, staged.name);
+        const stagedInfo = await lstat(stagedPath).catch(failClosed);
+        if (!staged.isFile() || !stagedInfo.isFile() || stagedInfo.isSymbolicLink() || stagedInfo.nlink !== 1 || !Number.isSafeInteger(stagedInfo.size) || stagedInfo.size < 0) failClosed();
+        inventory.stagingFiles.push({ area, name: staged.name, byteSize: stagedInfo.size });
+      }
+      continue;
+    }
+    if (!entry.isDirectory() || !/^[a-f0-9]{2}$/u.test(entry.name)) failClosed();
+    const directoryInfo = await lstat(target).catch(failClosed);
+    if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink() || await realpath(target).catch(() => "") !== target) failClosed();
+    for (const object of await readdir(target, { withFileTypes: true }).catch(failClosed)) {
+      const objectPath = path.join(target, object.name);
+      const objectInfo = await lstat(objectPath).catch(failClosed);
+      if (!object.isFile() || !objectInfo.isFile() || objectInfo.isSymbolicLink() || objectInfo.nlink !== 1 || !Number.isSafeInteger(objectInfo.size) || objectInfo.size < 0) failClosed();
+      if (/^[a-f0-9]{64}$/u.test(object.name) && object.name.slice(0, 2) === entry.name) {
+        inventory.objects.push({ area, sha256: object.name, byteSize: objectInfo.size });
+      } else inventory.untrackedBytes += objectInfo.size;
+    }
+  }
+  return inventory;
+}
+
+export async function managedObjectInventory(dataDirectory: string): Promise<ManagedObjectReservationInventory> {
+  const absolute = path.resolve(dataDirectory);
+  if (absolute !== dataDirectory || await realpath(dataDirectory).catch(() => "") !== dataDirectory) failClosed();
+  const [attachments, backups] = await Promise.all([inventoryArea(dataDirectory, "objects"), inventoryArea(dataDirectory, "file-objects")]);
+  return { objects: [...attachments.objects, ...backups.objects], stagingFiles: [...attachments.stagingFiles, ...backups.stagingFiles],
+    untrackedBytes: attachments.untrackedBytes + backups.untrackedBytes };
+}
+
+export async function reserveManagedObjects(storage: Storage, dataDirectory: string, requests: Array<Omit<ManagedObjectReservationRequest, "reservationId">>, maxBytes = MAX_MANAGED_OBJECT_BYTES): Promise<ManagedObjectReservationRequest[]> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new TypeError("Managed object capacity must be a non-negative safe integer");
+  const unique = new Map<string, ManagedObjectReservationRequest>();
+  for (const request of requests) {
+    const key = `${request.area}:${request.sha256}`;
+    const existing = unique.get(key);
+    if (existing && existing.byteSize !== request.byteSize) throw new Error("Managed object metadata does not match");
+    if (!existing) unique.set(key, { ...request, reservationId: randomUUID() });
+  }
+  const reservations = [...unique.values()];
+  if (!reservations.length) return [];
+  const deadline = Date.now() + 30_000;
+  let pauseMs = 10;
+  while (true) {
+    const observedReservations = storage.managedObjects.list();
+    const inventory = await managedObjectInventory(dataDirectory);
+    try {
+      storage.managedObjects.reserveBatch({ requests: reservations, maxBytes, inventory, observedReservations });
+      return reservations;
+    } catch (error) {
+      if ((!(error instanceof ManagedObjectReservationBusyError) && !(error instanceof StorageError && error.code === "db_busy")) || Date.now() >= deadline) throw error;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, pauseMs));
+      pauseMs = Math.min(pauseMs * 2, 250);
+    }
+  }
 }
 
 export async function readManagedObject(dataDirectory: string, area: "file-objects" | "objects", digest: string): Promise<Buffer | null> {
@@ -70,14 +145,38 @@ export async function readManagedObject(dataDirectory: string, area: "file-objec
   } finally { await handle.close(); }
 }
 
-export async function storeFileBackup(storage: Storage, dataDirectory: string, bytes: Buffer): Promise<string> {
+export async function storeFileBackup(storage: Storage, dataDirectory: string, bytes: Buffer, maxManagedObjectBytes = MAX_MANAGED_OBJECT_BYTES): Promise<string> {
+  if (bytes.byteLength > 65_536) throw new Error("单个文件备份上限为 64 KiB。");
   const digest = sha256(bytes);
-  const existing = storage.contentObjects.get(digest);
-  if (!existing && storage.contentObjects.totalBytes() + storage.attachments.totalBytes() + bytes.byteLength > MAX_MANAGED_OBJECT_BYTES) {
-    throw new Error("本地备份空间达到安全上限，已拒绝无备份写入。");
+  let reservations: ManagedObjectReservationRequest[] = [];
+  let failure: unknown;
+  let failed = false;
+  let writeAttempted = false;
+  try {
+    reservations = await reserveManagedObjects(storage, dataDirectory, [{ area: "file-objects", sha256: digest, byteSize: bytes.byteLength }], maxManagedObjectBytes);
+    const reservation = reservations[0]!;
+    writeAttempted = true;
+    await writeManagedObject(dataDirectory, "file-objects", digest, bytes, reservation.reservationId);
+    storage.contentObjects.registerReserved({ sha256: digest, byteSize: bytes.byteLength, createdAt: new Date().toISOString() }, reservation.reservationId);
+  } catch (error) {
+    failed = true;
+    failure = error instanceof ManagedObjectQuotaExceededError
+      ? new Error("本地备份空间达到安全上限，已拒绝无备份写入。", { cause: error }) : error;
+    if (writeAttempted && reservations.length) {
+      try {
+        storage.contentObjects.register({ sha256: digest, byteSize: bytes.byteLength, createdAt: new Date().toISOString() });
+        storage.garbage.enqueue({ kind: "file_backup_object", objectRef: digest });
+      } catch (cleanupError) {
+        if (failure instanceof Error) Object.defineProperty(failure, "garbageEnqueueError", { value: cleanupError, configurable: true });
+      }
+    }
   }
-  await writeManagedObject(dataDirectory, "file-objects", digest, bytes);
-  storage.contentObjects.register({ sha256: digest, byteSize: bytes.byteLength, createdAt: new Date().toISOString() });
+  try { storage.managedObjects.releaseMany(reservations.map((reservation) => reservation.reservationId)); }
+  catch (releaseError) {
+    if (!failed) { failed = true; failure = releaseError; }
+    else if (failure instanceof Error) Object.defineProperty(failure, "reservationReleaseError", { value: releaseError, configurable: true });
+  }
+  if (failed) throw failure;
   return digest;
 }
 
@@ -94,7 +193,7 @@ export function attachmentRecordView(record: AttachmentRecord) {
 }
 
 export async function storeAttachmentResult(input: {
-  storage: Storage; dataDirectory: string; conversationId: string; runId: string; fileName: string; text: string; sourceAttachmentId?: string;
+  storage: Storage; dataDirectory: string; conversationId: string; runId: string; fileName: string; text: string; sourceAttachmentId?: string; maxManagedObjectBytes?: number;
 }) {
   const fileName = input.fileName.trim();
   if (!fileName || fileName.length > 128 || fileName === "." || fileName === ".." || /[\\/:\u0000-\u001f\u007f]/u.test(fileName)) throw new Error("结果文件名必须是单一文件名。");
@@ -103,15 +202,38 @@ export async function storeAttachmentResult(input: {
   if (bytes.toString("utf8") !== input.text || bytes.byteLength > 65_536) throw new Error("单个文本结果上限为 64 KiB。");
   if (input.sourceAttachmentId && !input.storage.attachments.getForConversation(input.sourceAttachmentId, input.conversationId)) throw new Error("源附件不属于当前对话。");
   const digest = sha256(bytes);
-  const existing = input.storage.attachments.referenceCount(digest) > 0;
-  if (!existing && input.storage.contentObjects.totalBytes() + input.storage.attachments.totalBytes() + bytes.byteLength > MAX_MANAGED_OBJECT_BYTES) {
-    throw new Error("本地附件空间达到安全上限，已拒绝保存结果。");
+  let reservations: ManagedObjectReservationRequest[] = [];
+  let saved: AttachmentResultView | undefined;
+  let failure: unknown;
+  let failed = false;
+  let writeAttempted = false;
+  try {
+    reservations = await reserveManagedObjects(input.storage, input.dataDirectory, [{ area: "objects", sha256: digest, byteSize: bytes.byteLength }], input.maxManagedObjectBytes ?? MAX_MANAGED_OBJECT_BYTES);
+    const reservation = reservations[0]!;
+    writeAttempted = true;
+    await writeManagedObject(input.dataDirectory, "objects", digest, bytes, reservation.reservationId);
+    const record = input.storage.attachmentResults.createReserved({ id: randomUUID(), conversationId: input.conversationId,
+      runId: input.runId, sourceAttachmentId: input.sourceAttachmentId ?? null, objectSha256: digest, fileName, byteSize: bytes.byteLength }, reservation.reservationId);
+    saved = { schemaVersion: 2, resultId: record.id, conversationId: record.conversationId, sourceAttachmentId: record.sourceAttachmentId,
+      fileName: record.fileName, byteSize: record.byteSize, mediaType: record.mediaType, createdAt: record.createdAt };
+  } catch (error) {
+    failed = true;
+    failure = error instanceof ManagedObjectQuotaExceededError
+      ? new Error("本地附件空间达到安全上限，已拒绝保存结果。", { cause: error }) : error;
+    if (writeAttempted && reservations.length) {
+      try { input.storage.garbage.enqueue({ kind: "attachment_object", objectRef: digest }); }
+      catch (cleanupError) {
+        if (failure instanceof Error) Object.defineProperty(failure, "garbageEnqueueError", { value: cleanupError, configurable: true });
+      }
+    }
   }
-  await writeManagedObject(input.dataDirectory, "objects", digest, bytes);
-  const record = input.storage.attachmentResults.create({ id: randomUUID(), conversationId: input.conversationId,
-    runId: input.runId, sourceAttachmentId: input.sourceAttachmentId ?? null, objectSha256: digest, fileName, byteSize: bytes.byteLength });
-  return { schemaVersion: 2, resultId: record.id, conversationId: record.conversationId, sourceAttachmentId: record.sourceAttachmentId,
-    fileName: record.fileName, byteSize: record.byteSize, mediaType: record.mediaType, createdAt: record.createdAt };
+  try { input.storage.managedObjects.releaseMany(reservations.map((reservation) => reservation.reservationId)); }
+  catch (releaseError) {
+    if (!failed) { failed = true; failure = releaseError; }
+    else if (failure instanceof Error) Object.defineProperty(failure, "reservationReleaseError", { value: releaseError, configurable: true });
+  }
+  if (failed) throw failure;
+  return saved!;
 }
 
 export async function readAttachmentObject(storage: Storage, dataDirectory: string, attachment: AttachmentRecord): Promise<Buffer> {

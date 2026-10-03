@@ -1,6 +1,6 @@
 import path from "node:path";
 import { PublicAnalysisCancelledError, runPublicRepositoryAnalysis } from "@pi-workbench/reporting";
-import { openStorage } from "@pi-workbench/storage";
+import { openStorage, type UsageRecord } from "@pi-workbench/storage";
 import {
   CapabilityCancelledError,
   CapabilityRegistryError,
@@ -31,6 +31,16 @@ function isFakeRepository(urlValue: string): boolean {
     return url.protocol === "https:" && url.hostname === "github.com" && !url.port && !url.username && !url.password && !url.search && !url.hash &&
       parts?.[1]?.toLowerCase() === "demo" && parts[2]?.replace(/\.git$/iu, "").toLowerCase() === "harborlight";
   } catch { return false; }
+}
+
+function durableUsage(attemptId: string, usage: import("@pi-workbench/protocol").Usage, complete: boolean): UsageRecord {
+  return {
+    attemptId, modelId: null, modelCalls: usage.modelCalls, toolCalls: usage.toolCalls,
+    inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens,
+    cacheWriteTokens: usage.cacheWriteTokens, totalTokens: usage.totalTokens,
+    estimatedCostUsd: complete ? usage.estimatedCostUsd : null, costStatus: complete ? "estimate" : "unknown",
+    pricingVersion: complete ? usage.pricingVersion : null, updatedAt: new Date().toISOString(),
+  };
 }
 
 function emitAnalysisEvents(context: CapabilityContext) {
@@ -81,7 +91,15 @@ export function createPublicRepositoryAnalysisExtension(options: PublicRepositor
             checkpointStore: {
               list: (runId) => workflowStorage.checkpoints.list(runId),
               create: (record) => workflowStorage.checkpoints.create(record),
+              createSafe: (record, usage) => workflowStorage.attemptSafety.saveWorkflowCheckpoint({
+                checkpoint: record, usage: durableUsage(context.attemptId, usage, true),
+              }).checkpoint,
+              adoptSafe: (record, usage) => { workflowStorage.attemptSafety.adoptWorkflowCheckpoint({
+                attemptId: context.attemptId, checkpointId: record.id, usage: durableUsage(context.attemptId, usage, true),
+              }); },
             },
+            onModelCallStarted: (usage) => { workflowStorage.attemptSafety.modelCallStarted(durableUsage(context.attemptId, usage, false)); },
+            onUsageCheckpoint: (usage, complete) => { workflowStorage.attemptSafety.recordSettledUsage(durableUsage(context.attemptId, usage, complete)); },
             ...(options.mode === "online" && options.githubToken ? { githubToken: options.githubToken } : {}),
             ...(options.mode === "fake" ? { fetch: await createFakeSnapshotFetch({ repositoryRoot: options.fixtureRoot, sha: FAKE_REPOSITORY_SHA }) } : {}),
             signal: context.signal,

@@ -6,9 +6,58 @@ import {
   V2PickerSelectProjectRequestSchema, V2ProjectRulesAcceptRequestSchema,
   V2ChangesetUndoRequestSchema, V2CleanupRequestSchema,
   UpdateCapabilityStateRequestSchema,
-  WorkbenchApiErrorSchema, type V2Error, type V2SubmitRunRequest,
+  WorkbenchApiErrorSchema, type V2Error, type V2RunEvent, type V2SubmitRunRequest,
 } from "@pi-workbench/protocol";
 import { createWorkbenchService, type WorkbenchServiceOptions, type ServiceError } from "./service.js";
+
+const SSE_PENDING_EVENT_LIMIT = 4096;
+type SseReset = { schemaVersion: 2; type: "stream.reset"; runId: string; data: { reason: "event_history_expired"; earliestAvailableSequence: number; latestSequence: number; latestEventId?: string } };
+
+/** Bounded queue for one SSE response; on overflow it discards only unsent events and yields a reset cursor. */
+export class BoundedSseEventQueue {
+  private readonly pending: V2RunEvent[] = [];
+  private lastSequence = 0;
+  private overflow: SseReset | undefined;
+  constructor(private readonly runId: string, private readonly limit = SSE_PENDING_EVENT_LIMIT) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("SSE event queue limit must be a positive safe integer");
+  }
+  get length(): number { return this.pending.length; }
+  get reset(): SseReset | undefined { return this.overflow; }
+  enqueue(event: V2RunEvent): boolean {
+    if (this.overflow) {
+      if (event.sequence > this.overflow.data.latestSequence) {
+        this.overflow = { ...this.overflow, data: { ...this.overflow.data, latestSequence: event.sequence, latestEventId: event.eventId } };
+        this.lastSequence = event.sequence;
+      }
+      return false;
+    }
+    if (event.sequence <= this.lastSequence) return false;
+    if (this.pending.length >= this.limit) {
+      this.pending.length = 0;
+      this.lastSequence = event.sequence;
+      this.overflow = {
+        schemaVersion: 2, type: "stream.reset", runId: this.runId,
+        data: { reason: "event_history_expired", earliestAvailableSequence: Math.max(1, event.sequence - this.limit + 1),
+          latestSequence: event.sequence, latestEventId: event.eventId },
+      };
+      return false;
+    }
+    this.lastSequence = event.sequence;
+    this.pending.push(event);
+    return true;
+  }
+  shift(): V2RunEvent | undefined { return this.pending.shift(); }
+  takeReset(): SseReset | undefined {
+    const reset = this.overflow;
+    this.overflow = undefined;
+    return reset;
+  }
+}
+export function canWriteSseHeartbeat(state: {
+  closed: boolean; destroyed: boolean; pumping: boolean; backpressured: boolean; pendingEvents: number; resetPending: boolean;
+}): boolean {
+  return !state.closed && !state.destroyed && !state.pumping && !state.backpressured && state.pendingEvents === 0 && !state.resetPending;
+}
 
 function parseRequest(value: unknown): V2SubmitRunRequest {
   try { return parse(V2SubmitRunRequestSchema, value); }
@@ -288,34 +337,61 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
     const raw = reply.raw;
     raw.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform", connection: "keep-alive", "x-accel-buffering": "no" });
     raw.flushHeaders();
-    const queue = [] as typeof subscription.replay;
-    const seen = new Set<string>();
+    const queue = new BoundedSseEventQueue(request.params.runId);
     let closed = false;
     let pumping = false;
     let initializing = true;
-    let terminalQueued = subscription.finished;
+    let terminalQueued = false;
+    let backpressured = false;
     function enqueue(event: typeof subscription.replay[number]): void {
-      if (closed || seen.has(event.eventId)) return;
-      seen.add(event.eventId); queue.push(event);
+      if (closed) return;
+      const accepted = queue.enqueue(event);
+      if (!accepted && queue.reset) {
+        terminalQueued = false;
+        if (!initializing) void pump();
+        return;
+      }
+      if (!accepted) return;
       if (["run.completed", "run.failed", "run.cancelled", "run.interrupted"].includes(event.type)) terminalQueued = true;
       if (!initializing) void pump();
     }
     function writeControl(reset: NonNullable<typeof subscription.reset>): void {
       raw.write(`event: stream.reset\ndata: ${JSON.stringify(reset)}\n\n`);
     }
+    function waitForDrain(): Promise<void> {
+      return new Promise<void>((resolve) => {
+        const resume = () => { backpressured = false; raw.off("close", resume); raw.off("error", resume); raw.off("drain", resume); resolve(); };
+        raw.once("drain", resume); raw.once("close", resume); raw.once("error", resume);
+      });
+    }
     async function pump(): Promise<void> {
       if (pumping || closed) return;
       pumping = true;
       try {
-        while (queue.length && !closed && !raw.destroyed) {
+        while ((queue.length || queue.reset) && !closed && !raw.destroyed) {
+          if (queue.reset) {
+            writeControl(queue.takeReset()!);
+            subscription.unsubscribe();
+            raw.end();
+            return;
+          }
           const event = queue.shift()!;
           const ok = raw.write(`id: ${event.eventId}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-          if (!ok) await new Promise<void>((resolve) => raw.once("drain", resolve));
+          if (!ok) { backpressured = true; await waitForDrain(); }
+        }
+        if (!closed && !raw.destroyed && queue.reset) {
+          writeControl(queue.takeReset()!);
+          subscription.unsubscribe();
+          raw.end();
+          return;
         }
         if (!closed && terminalQueued && queue.length === 0) raw.end();
       } finally { pumping = false; }
     }
-    const heartbeat = setInterval(() => { if (!closed && !raw.destroyed) raw.write(": keep-alive\n\n"); }, 15_000);
+    const heartbeat = setInterval(() => {
+      if (!canWriteSseHeartbeat({ closed, destroyed: raw.destroyed, pumping, backpressured, pendingEvents: queue.length, resetPending: Boolean(queue.reset) })) return;
+      if (!raw.write(": keep-alive\n\n")) { backpressured = true; void waitForDrain(); }
+    }, 15_000);
     heartbeat.unref();
     function cleanup() {
       if (closed) return;
@@ -325,9 +401,9 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
     raw.once("close", cleanup); raw.once("error", cleanup); request.raw.once("aborted", cleanup);
     if (subscription.reset) writeControl(subscription.reset);
     for (const event of subscription.replay) enqueue(event);
+    if (subscription.finished) terminalQueued = true;
     initializing = false;
     void pump();
-    if (subscription.finished && !subscription.replay.length) raw.end();
     return reply;
   });
   app.get<{ Params: { runId: string; kind: string } }>("/api/v2/runs/:runId/artifacts/:kind", async (request, reply) => {

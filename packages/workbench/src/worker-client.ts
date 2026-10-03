@@ -115,6 +115,8 @@ export class WorkerClient {
     return true;
   }
 
+  waitForExit(timeoutMs = 1_000): Promise<boolean> { return waitForExit(this.child, timeoutMs); }
+
   private send(command: WorkerOutbound): void {
     if (this.closed || !this.child.connected) throw new Error("Worker IPC channel is unavailable");
     this.child.send(command, (error) => { if (error) this.taskReject?.(error); });

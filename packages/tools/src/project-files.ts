@@ -68,7 +68,7 @@ function within(root: string, target: string): boolean {
 }
 function safeText(bytes: Buffer): string {
   if (bytes.includes(0)) throw fail("not_text", "目标不是允许的 UTF-8 文本文件。");
-  try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
   catch { throw fail("not_text", "目标不是允许的 UTF-8 文本文件。"); }
 }
 function validateText(text: string): Buffer {
