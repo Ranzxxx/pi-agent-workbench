@@ -27,7 +27,10 @@ function localHostname(hostname: string): boolean {
 }
 function localHostHeader(value: string | undefined): boolean {
   if (!value) return false;
-  try { return localHostname(new URL(`http://${value}`).hostname); } catch { return false; }
+  try {
+    const parsed = new URL(`http://${value}`);
+    return localHostname(parsed.hostname) && !parsed.username && !parsed.password && parsed.pathname === "/" && !parsed.search && !parsed.hash;
+  } catch { return false; }
 }
 function localSocket(address: string | undefined): boolean {
   if (!address) return false;
@@ -37,15 +40,21 @@ function localSocket(address: string | undefined): boolean {
 }
 function checkedOrigin(request: import("fastify").FastifyRequest, required: boolean): string | undefined {
   const origin = header(request, "origin");
-  if (!origin && !required) return undefined;
-  if (!origin || !localSocket(request.raw.socket.remoteAddress) || !localHostHeader(header(request, "host")) || !localHostHeader(header(request, "x-forwarded-host")) && header(request, "x-forwarded-host") !== undefined) {
+  if (!localSocket(request.raw.socket.remoteAddress) || !localHostHeader(header(request, "host")) || !localHostHeader(header(request, "x-forwarded-host")) && header(request, "x-forwarded-host") !== undefined) {
     throw Object.assign(new Error("仅允许来自本机工作台的请求。"), { statusCode: 403, code: "invalid_request" });
   }
   if (header(request, "sec-fetch-site") === "cross-site") throw Object.assign(new Error("已拒绝跨站本地请求。"), { statusCode: 403, code: "invalid_request" });
+  if (!origin && !required) return undefined;
+  if (!origin) throw Object.assign(new Error("请求缺少来源。"), { statusCode: 403, code: "invalid_request" });
   let parsed: URL;
   try { parsed = new URL(origin); } catch { throw Object.assign(new Error("请求来源无效。"), { statusCode: 403, code: "invalid_request" }); }
   if (!localHostname(parsed.hostname) || !["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
     throw Object.assign(new Error("仅允许来自本机工作台的请求。"), { statusCode: 403, code: "invalid_request" });
+  }
+  // Next's loopback rewrite supplies the browser-facing authority here.
+  const authority = header(request, "x-forwarded-host") ?? header(request, "host")!;
+  if (parsed.host !== new URL(`${parsed.protocol}//${authority}`).host) {
+    throw Object.assign(new Error("请求来源与工作台地址不匹配。"), { statusCode: 403, code: "invalid_request" });
   }
   return parsed.origin;
 }
@@ -62,6 +71,20 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
   const service = await createWorkbenchService(options);
   const app = Fastify({ logger: false, bodyLimit: 64 * 1024 });
   app.addHook("onClose", async () => service.close());
+  app.addHook("onRequest", async (request) => {
+    const route = request.routeOptions.url;
+    if (!route?.startsWith("/api/")) return;
+    const unsafe = request.method !== "GET" && request.method !== "HEAD";
+    const origin = checkedOrigin(request, unsafe);
+    if (route === "/api/v1/health" || route === "/api/v2/health" || route === "/api/v2/picker/session") return;
+    try {
+      // EventSource and artifact links carry cookies, but cannot set a CSRF header.
+      service.validatePickerSession(sessionCookie(request), header(request, "x-csrf-token"), origin, unsafe);
+    } catch (error) {
+      if ((error as Partial<ServiceError>).code === "not_found") Object.assign(error as object, { statusCode: 401 });
+      throw error;
+    }
+  });
   app.setErrorHandler((error, request, reply) => {
     const known = error as Partial<ServiceError>;
     const statusCode = Number.isInteger(known.statusCode) ? known.statusCode! : 500;
@@ -116,7 +139,10 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
     const origin = checkedOrigin(request, true)!;
     const session = service.createPickerSession(origin);
     const secure = origin.startsWith("https:") ? "; Secure" : "";
-    reply.header("set-cookie", `piwb_picker_session=${session.sessionId}; HttpOnly; SameSite=Strict; Path=/api/v2; Max-Age=14400${secure}`);
+    reply.header("set-cookie", [
+      `piwb_picker_session=${session.sessionId}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=14400${secure}`,
+      `piwb_picker_session=; HttpOnly; SameSite=Strict; Path=/api/v2; Max-Age=0${secure}`,
+    ]);
     reply.header("cache-control", "no-store");
     return { schemaVersion: 2, csrfToken: session.csrfToken, expiresAt: session.expiresAt };
   });

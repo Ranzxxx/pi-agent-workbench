@@ -92,13 +92,13 @@ export class ProjectPickerService {
     return { sessionId, csrfToken, expiresAt: new Date(expiresAt).toISOString() };
   }
 
-  validateSession(sessionId: string | undefined, csrfToken: string | undefined, origin?: string): void {
+  validateSession(sessionId: string | undefined, csrfToken: string | undefined, origin?: string, requireCsrf = true): void {
     const session = sessionId ? this.sessions.get(sessionId) : undefined;
     if (!session || session.expiresAt <= Date.now()) {
       if (sessionId) this.sessions.delete(sessionId);
       throw fail("not_found", "本地选择会话已过期，请刷新页面重试。");
     }
-    if (!csrfToken || !sameSecret(csrfToken, session.csrf)) throw fail("invalid_request", "本地请求校验失败，请刷新页面重试。");
+    if ((requireCsrf || csrfToken !== undefined) && (!csrfToken || !sameSecret(csrfToken, session.csrf))) throw fail("invalid_request", "本地请求校验失败，请刷新页面重试。");
     if (origin && origin !== session.origin) throw fail("invalid_request", "请求来源与当前工作台不匹配。");
   }
 

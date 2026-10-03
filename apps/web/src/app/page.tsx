@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { CapabilityCatalogEntry, Conversation, ConversationSummary, WorkbenchEvent, WorkbenchRun, V2AttachmentResult, V2Changeset, V2ChangesetSummary, V2Conversation, V2ConversationSummary, V2Run, V2RunSubmission, V2CleanupPreview, V2ChangesetUndoResult } from "@pi-workbench/protocol";
 import { RunArtifacts } from "./run-artifacts";
 import { retryStartupRead } from "./startup";
+import { createWorkbenchFetch } from "./api-client";
 
 const API = "/api/v2";
 const SUGGESTIONS = ["帮我制定一个清晰的实施计划", "解释一下 Agent 是如何工作的", "把这个想法拆解成可执行的步骤"];
@@ -22,8 +23,7 @@ type PickerRoot = { label: string; token: string };
 type LocalAttachment = { schemaVersion: 2; attachmentId: string; conversationId: string; fileName: string; relativePath: string; byteSize: number; mediaType: string; createdAt: string };
 type LocalAttachmentResult = V2AttachmentResult;
 type ProjectRuleView = { schemaVersion: 2; projectId: string; sourcePath: string; sourceSha256: string; sourceVersion: string; content: string; acceptedAt: string; revokedAt?: string | null };
-let pickerCsrfToken: string | null = null;
-let pickerSessionRequest: Promise<string> | null = null;
+const workbenchFetch = createWorkbenchFetch(API);
 
 function normalizeConversation(value: V2Conversation): UiConversation {
   return {
@@ -90,7 +90,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (init?.body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json");
   const timeoutSignal = AbortSignal.timeout(API_REQUEST_TIMEOUT_MS);
   const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
-  const response = await fetch(`${API}${path}`, { ...init, headers, signal });
+  const response = await workbenchFetch(path, { ...init, headers, signal });
   const body = await response.json().catch((error: unknown) => {
     if (signal.aborted) throw signal.reason;
     if (response.ok) throw error;
@@ -99,30 +99,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) throw Object.assign(new Error(body?.message ?? body?.error?.message ?? `请求失败 (${response.status})`), { status: response.status });
   return normalizeApiValue(body) as T;
 }
-async function openPickerSession(): Promise<string> {
-  if (pickerCsrfToken) return pickerCsrfToken;
-  if (!pickerSessionRequest) {
-    pickerSessionRequest = api<{ csrfToken: string }>("/picker/session", { method: "POST", body: "{}" })
-      .then((session) => { pickerCsrfToken = session.csrfToken; return session.csrfToken; });
-  }
-  const pending = pickerSessionRequest;
-  try { return await pending; }
-  finally { if (pickerSessionRequest === pending) pickerSessionRequest = null; }
-}
-async function pickerApi<T>(path: string, init?: RequestInit, retry = true): Promise<T> {
-  const csrfToken = await openPickerSession();
-  const headers = new Headers(init?.headers);
-  headers.set("x-csrf-token", csrfToken);
-  try { return await api<T>(path, { ...init, headers }); }
-  catch (error) {
-    if (retry && error && typeof error === "object" && "status" in error && error.status === 404) {
-      if (pickerCsrfToken === csrfToken) pickerCsrfToken = null;
-      await openPickerSession();
-      return pickerApi<T>(path, init, false);
-    }
-    throw error;
-  }
-}
+const pickerApi = api;
 function key(): string { return crypto.randomUUID(); }
 function formatBytes(bytes: number): string { return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KiB`; }
 function Icon({ name }: { name: "plus" | "chat" | "grid" | "settings" | "send" | "stop" | "paperclip" | "spark" | "close" | "trash" | "folder" }) {
@@ -755,8 +732,7 @@ export default function HomePage() {
   }
   async function downloadAttachment(item: LocalAttachment) {
     try {
-      if (!pickerCsrfToken) await openPickerSession();
-      const response = await fetch(`${API}/conversations/${encodeURIComponent(item.conversationId)}/attachments/${encodeURIComponent(item.attachmentId)}`, { headers: { "x-csrf-token": pickerCsrfToken! } });
+      const response = await workbenchFetch(`/conversations/${encodeURIComponent(item.conversationId)}/attachments/${encodeURIComponent(item.attachmentId)}`);
       if (!response.ok) throw new Error("附件不可用或本地会话已过期。");
       const file = await response.blob();
       const url = URL.createObjectURL(file); const anchor = document.createElement("a"); anchor.href = url; anchor.download = item.fileName; anchor.click(); URL.revokeObjectURL(url);
@@ -764,8 +740,7 @@ export default function HomePage() {
   }
   async function downloadAttachmentResult(item: LocalAttachmentResult) {
     try {
-      if (!pickerCsrfToken) await openPickerSession();
-      const response = await fetch(`${API}/conversations/${encodeURIComponent(item.conversationId)}/attachment-results/${encodeURIComponent(item.resultId)}`, { headers: { "x-csrf-token": pickerCsrfToken! } });
+      const response = await workbenchFetch(`/conversations/${encodeURIComponent(item.conversationId)}/attachment-results/${encodeURIComponent(item.resultId)}`);
       if (!response.ok) throw new Error("结果文件不可用或本地会话已过期。");
       const file = await response.blob();
       const url = URL.createObjectURL(file); const anchor = document.createElement("a"); anchor.href = url; anchor.download = item.fileName; anchor.click(); URL.revokeObjectURL(url);

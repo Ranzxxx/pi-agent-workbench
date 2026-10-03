@@ -7,6 +7,7 @@ import test from "node:test";
 import { createWorkbenchApp } from "@pi-workbench/server";
 import { openStorage, resolveDatabasePath } from "@pi-workbench/storage";
 import { createProjectFileAccess } from "@pi-workbench/tools";
+import { localFetch } from "../../apps/server/tests/local-client.ts";
 import { createPersistedFileJournal } from "../../packages/workbench/src/file-journal.ts";
 
 const fixtureRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../fixtures/v02-workspace/sample-project");
@@ -59,7 +60,7 @@ async function openSample(request: (route: string, init?: RequestInit) => Promis
 
 async function waitForRun(baseUrl: string, runId: string, wanted?: string) {
   for (let attempt = 0; attempt < 400; attempt += 1) {
-    const response = await fetch(`${baseUrl}/api/v2/runs/${runId}`);
+    const response = await localFetch(`${baseUrl}/api/v2/runs/${runId}`);
     assert.equal(response.status, 200);
     const run = await response.json() as { status: string; runId: string; result?: { status: string; reply?: string; extensionResult?: { extensionId: string } } };
     if (wanted ? run.status === wanted : ["completed", "failed", "cancelled", "interrupted"].includes(run.status)) return run;
@@ -161,20 +162,20 @@ test("v0.2 flow A keeps project edits, undo, attachments, and the other conversa
   } finally { finished.close(); }
   const deletion = await session.request(`/conversations/${opened.conversation.conversationId}`, { method: "DELETE" });
   assert.equal(deletion.status, 200);
-  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${opened.conversation.conversationId}`)).status, 404);
-  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${other.conversationId}`)).status, 200);
+  assert.equal((await localFetch(`${baseUrl}/api/v2/conversations/${opened.conversation.conversationId}`)).status, 404);
+  assert.equal((await localFetch(`${baseUrl}/api/v2/conversations/${other.conversationId}`)).status, 200);
   assert.equal(await readFile(path.join(projectRoot, "notes.md"), "utf8"), "user update\n");
   const projects = await session.request("/projects").then((response) => response.json()) as { projects: Array<{ projectId: string }> };
   assert.equal(projects.projects.some((item) => item.projectId === opened.project.projectId), true);
 
-  const continued = await fetch(`${baseUrl}/api/v2/runs`, {
+  const continued = await localFetch(`${baseUrl}/api/v2/runs`, {
     method: "POST", headers: { "content-type": "application/json", "idempotency-key": "v02-continue" },
     body: JSON.stringify({ schemaVersion: 2, conversationId: other.conversationId, input: { kind: "message", text: "continue after the other conversation was deleted" } }),
   });
   assert.equal(continued.status, 202);
   const continuedRun = await continued.json() as { runId: string };
   assert.equal((await waitForRun(baseUrl, continuedRun.runId, "completed")).status, "completed");
-  const replay = await fetch(`${baseUrl}/api/v2/runs`, {
+  const replay = await localFetch(`${baseUrl}/api/v2/runs`, {
     method: "POST", headers: { "content-type": "application/json", "idempotency-key": "v02-continue" },
     body: JSON.stringify({ schemaVersion: 2, conversationId: other.conversationId, input: { kind: "message", text: "continue after the other conversation was deleted" } }),
   });
@@ -183,11 +184,11 @@ test("v0.2 flow A keeps project edits, undo, attachments, and the other conversa
 
   await app.close();
   ({ app, baseUrl } = await startApp(dataDirectory, pickerRoot));
-  const restored = await fetch(`${baseUrl}/api/v2/conversations/${other.conversationId}`).then((response) => response.json()) as { messages: Array<{ role: string; content: string }> };
+  const restored = await localFetch(`${baseUrl}/api/v2/conversations/${other.conversationId}`).then((response) => response.json()) as { messages: Array<{ role: string; content: string }> };
   assert.equal(restored.messages.length, 2);
   assert.equal(restored.messages[0]?.role, "user");
   assert.match(restored.messages.map((message) => message.content).join("\n"), /continue after the other conversation was deleted/u);
-  assert.equal((await fetch(`${baseUrl}/api/v2/conversations/${opened.conversation.conversationId}`)).status, 404);
+  assert.equal((await localFetch(`${baseUrl}/api/v2/conversations/${opened.conversation.conversationId}`)).status, 404);
   assert.equal(await readFile(path.join(projectRoot, "notes.md"), "utf8"), "user update\n");
 });
 
@@ -196,21 +197,21 @@ test("v0.2 flow B keeps capability selection on the current request and replays 
   const { app, baseUrl } = await startApp(path.join(parent, "state"), parent);
   t.after(async () => { await app.close().catch(() => undefined); await rm(parent, { recursive: true, force: true }); });
   const session = await sessionFor(baseUrl);
-  const conversation = await fetch(`${baseUrl}/api/v2/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  const conversation = await localFetch(`${baseUrl}/api/v2/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
   assert.equal(conversation.status, 201);
   const created = await conversation.json() as { conversationId: string };
   const call = { schemaVersion: 2, conversationId: created.conversationId, input: { kind: "capability", capabilityId: "development_greeting_tool", input: {}, prompt: "[[demo:greeting-tool]]" } };
-  const disabled = await fetch(`${baseUrl}/api/v2/runs`, { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify(call) });
+  const disabled = await localFetch(`${baseUrl}/api/v2/runs`, { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify(call) });
   assert.equal(disabled.status, 409);
   const enabled = await session.request("/capabilities/development_greeting_tool/state", { method: "PATCH", body: JSON.stringify({ schemaVersion: 2, enabled: true }) });
   assert.equal(enabled.status, 200);
-  const submitted = await fetch(`${baseUrl}/api/v2/runs`, { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify(call) });
+  const submitted = await localFetch(`${baseUrl}/api/v2/runs`, { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify(call) });
   assert.equal(submitted.status, 202);
   const capabilityRun = await submitted.json() as { runId: string };
   const completed = await waitForRun(baseUrl, capabilityRun.runId, "completed");
   assert.equal(completed.result?.extensionResult?.extensionId, "development_greeting_tool");
 
-  const plain = await fetch(`${baseUrl}/api/v2/runs`, {
+  const plain = await localFetch(`${baseUrl}/api/v2/runs`, {
     method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() },
     body: JSON.stringify({ schemaVersion: 2, conversationId: created.conversationId, input: { kind: "message", text: "ordinary follow-up without a capability" } }),
   });
@@ -218,11 +219,11 @@ test("v0.2 flow B keeps capability selection on the current request and replays 
   const plainDone = await waitForRun(baseUrl, plainRun.runId, "completed");
   assert.equal(plainDone.result?.extensionResult, undefined);
 
-  const events = await fetch(`${baseUrl}/api/v2/runs/${capabilityRun.runId}/events`);
+  const events = await localFetch(`${baseUrl}/api/v2/runs/${capabilityRun.runId}/events`);
   const frames = (await events.text()).split(/\r?\n\r?\n/u).filter((frame) => /^event: /mu.test(frame) && !/^event: stream\.reset$/mu.test(frame));
   const firstId = frames[0]?.match(/^id: ([A-Za-z0-9_-]+)$/mu)?.[1];
   assert.ok(firstId);
-  const resumed = await fetch(`${baseUrl}/api/v2/runs/${capabilityRun.runId}/events`, { headers: { "last-event-id": firstId } });
+  const resumed = await localFetch(`${baseUrl}/api/v2/runs/${capabilityRun.runId}/events`, { headers: { "last-event-id": firstId } });
   const resumedText = await resumed.text();
   assert.equal(resumedText.includes(`id: ${firstId}`), false);
   assert.match(resumedText, /event: run\.completed/u);

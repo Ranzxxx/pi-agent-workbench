@@ -201,6 +201,7 @@ export class ProjectFileAccess {
     if (!this.journal) throw fail("io_error", "文件写入日志不可用；已拒绝创建。");
     const bytes = validateText(text);
     const absolute = await this.resolve(relativePath, "missing");
+    if (!hasTextExtension(path.basename(relativePath))) throw fail("not_text", "此文件类型不在允许创建列表中。");
     const mutation = await this.journal.prepare({ relativePath, kind: "create", preVersion: null, preHash: null, preimage: null, postimage: bytes, postHash: digest(bytes) });
     return this.write(relativePath, absolute, bytes, mutation, "create");
   }
@@ -256,6 +257,7 @@ export class ProjectFileAccess {
   private async write(relativePath: string, absolute: string, bytes: Buffer, mutation: { operationId: string }, mode: "create" | "replace", expectedVersion?: string, fileMode = 0o600): Promise<ProjectFileContents> {
     const parent = path.dirname(absolute);
     const staging = path.join(parent, ".piwb-" + randomUUID() + ".tmp");
+    let committed = false;
     try {
       await this.revalidateParent(relativePath);
       if (mode === "create") {
@@ -278,11 +280,13 @@ export class ProjectFileAccess {
           if (error.code === "EEXIST") throw fail("conflict", "新建目标已被其他程序创建，未覆盖。");
           throw error;
         });
+        committed = true;
         await unlink(staging);
       } else {
         const current = await this.readFile(relativePath);
         if (current.token !== expectedVersion) throw fail("conflict", "文件版本在提交前发生变化，未覆盖。");
         await rename(staging, absolute);
+        committed = true;
       }
       await this.syncDirectory(parent);
       const written = await this.readFile(relativePath);
@@ -291,8 +295,9 @@ export class ProjectFileAccess {
       return written;
     } catch (error) {
       await unlink(staging).catch(() => undefined);
-      const current = await this.versionOf(relativePath).catch(() => null);
-      const state = (error as ProjectFileError).code === "conflict" ? "conflict" : current?.sha256 === digest(bytes) ? "uncertain" : "not_applied";
+      // After link/rename, a failed read, sync or journal acknowledgement cannot
+      // prove that no write occurred. Recovery must inspect the recorded identity.
+      const state = committed ? "uncertain" : (error as ProjectFileError).code === "conflict" ? "conflict" : "not_applied";
       await this.journal!.failed({ operationId: mutation.operationId, state, code: (error as ProjectFileError).code ?? (error as NodeJS.ErrnoException).code ?? "io_error" }).catch(() => undefined);
       throw error;
     }
