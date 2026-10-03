@@ -40,7 +40,7 @@ for (const version of [4, 5]) {
       assert.throws(() => openStorage({ path, readOnly: true }), StorageSchemaError);
 
       const store = openStorage({ path });
-      assert.equal(store.diagnostics.schemaVersion, 6);
+      assert.equal(store.diagnostics.schemaVersion, 8);
       assert.equal(store.projects.list().length, 1);
       assert.equal(store.messages.list("conversation")[0]?.content, "Preserved message");
       const operation = store.fileOperations.list("changeset")[0]!;
@@ -53,7 +53,7 @@ for (const version of [4, 5]) {
       try {
         assert.deepEqual(verify.prepare("SELECT applied_at FROM schema_migrations WHERE version = 4").get(), appliedAt);
         assert.equal(verify.prepare("SELECT checksum FROM schema_migrations WHERE version = 4").get()?.checksum, migrationChecksum(loadCoreMigrations()[3]!.sql));
-        assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count, 6);
+        assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count, 8);
         assert.throws(() => verify.prepare("UPDATE file_operations SET result_sha256 = ? WHERE id = 'operation'").run("b".repeat(64)), /FOREIGN KEY/);
         assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
       } finally { verify.close(); }
@@ -62,6 +62,77 @@ for (const version of [4, 5]) {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 }
+
+test("schema 6 upgrades to managed object reservations without changing existing object rows", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-quota-migration-"));
+  const path = join(root, "workbench.sqlite");
+  const contentHash = "c".repeat(64);
+  const attachmentHash = "d".repeat(64);
+  try {
+    const db = new DatabaseSync(path);
+    db.exec("PRAGMA journal_mode=WAL");
+    applyMigrations(db, loadCoreMigrations().slice(0, 6));
+    db.prepare("INSERT INTO content_objects(sha256, byte_size, created_at) VALUES (?, 9, ?)").run(contentHash, at);
+    db.prepare("INSERT INTO attachment_objects(sha256, byte_size, created_at) VALUES (?, 11, ?)").run(attachmentHash, at);
+    db.prepare("INSERT INTO file_object_garbage(sha256, queued_at, status) VALUES (?, ?, 'deleting')").run(contentHash, at);
+    db.prepare("INSERT INTO garbage_queue(kind, object_ref, queued_at, status) VALUES ('run_artifacts', 'legacy_claim', ?, 'deleting')").run(at);
+    db.close();
+
+    const store = openStorage({ path });
+    assert.equal(store.diagnostics.schemaVersion, 8);
+    assert.equal(store.contentObjects.totalBytes(), 9);
+    assert.equal(store.attachments.totalBytes(), 11);
+    assert.deepEqual(store.managedObjects.list(), []);
+    store.garbage.resetClaims();
+    store.close();
+
+    const verify = new DatabaseSync(path, { readOnly: true });
+    try {
+      const latest = verify.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all().at(-1) as { version: number; name: string };
+      assert.equal(latest.version, 8);
+      assert.equal(latest.name, "attempt_usage_safety");
+      assert.equal(verify.prepare("SELECT status FROM file_object_garbage WHERE sha256=?").get(contentHash)?.status, "deleting");
+      assert.equal(verify.prepare("SELECT status FROM garbage_queue WHERE object_ref='legacy_claim'").get()?.status, "deleting");
+      assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally { verify.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("schema 7 upgrade defaults old attempts to unknown and attempt safety preserves conversation deletion", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-usage-safety-migration-"));
+  const path = join(root, "workbench.sqlite");
+  try {
+    const db = new DatabaseSync(path);
+    db.exec("PRAGMA journal_mode=WAL");
+    applyMigrations(db, loadCoreMigrations().slice(0, 7));
+    db.exec(`
+      INSERT INTO conversations(id, project_id, pi_session_id, title, status, created_at, updated_at)
+        VALUES ('legacy_conversation', NULL, NULL, 'Legacy conversation', 'active', '${at}', '${at}');
+      INSERT INTO runs(id, conversation_id, project_id, extension_id, status, request_hash, request_json, retry_of_run_id, created_at, updated_at, ended_at)
+        VALUES ('legacy_run', 'legacy_conversation', NULL, NULL, 'interrupted', '${"e".repeat(64)}', '{"kind":"message","text":"legacy"}', NULL, '${at}', '${at}', '${at}');
+      INSERT INTO run_attempts(id, run_id, attempt_number, status, usage_complete, worker_boot_id, started_at, ended_at, error_json)
+        VALUES ('legacy_attempt', 'legacy_run', 1, 'interrupted', 0, NULL, '${at}', '${at}', NULL);
+      INSERT INTO session_snapshots(id, conversation_id, version, sdk_version, format_version, snapshot_json, summary, created_at)
+        VALUES ('legacy_snapshot', 'legacy_conversation', 1, '0.86.1', 'pi-session-v3', '{"formatVersion":"pi-session-v3"}', NULL, '${at}');
+    `);
+    db.close();
+
+    let store = openStorage({ path });
+    assert.equal(store.diagnostics.schemaVersion, 8);
+    assert.deepEqual(store.attemptSafety.get("legacy_attempt"), {
+      attemptId: "legacy_attempt", state: "unknown", checkpointKind: null,
+      checkpointId: null, snapshotId: null, updatedAt: at,
+    });
+    store.close();
+
+    store = openStorage({ path });
+    store.conversations.deletePermanently("legacy_conversation");
+    assert.equal(store.attemptSafety.get("legacy_attempt"), undefined);
+    assert.equal(store.snapshots.latest("legacy_conversation"), undefined);
+    store.close();
+    openStorage({ path }).close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 for (const mutation of ["unknown_checksum", "unexpected_schema"] as const) {
   test(`legacy compatibility refuses ${mutation} without changing database history or journal mode`, () => {

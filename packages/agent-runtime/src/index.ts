@@ -44,6 +44,9 @@ export interface RuntimeOptions {
   /** Previously persisted attempts for this same run; usage returned by this session remains attempt-local. */
   initialUsage?: Usage;
   initialUsageComplete?: boolean;
+  /** Internal durable-accounting hooks. Call-start must synchronously persist before a provider stream is created. */
+  onModelCallStarted?: (usage: Usage) => void;
+  onUsageCheckpoint?: (usage: Usage, usageComplete: boolean) => void;
   compactionSettings?: { reserveTokens: number; keepRecentTokens: number };
   /**
    * 应用层的成功门：先校验报告内容/证据，再发布产物并返回引用。
@@ -156,6 +159,8 @@ export async function createSession(options: RuntimeOptions) {
     if (cancelReason) return blockedStream(model);
     const reason = ledger.modelCall();
     if (reason) { abort(reason); return blockedStream(model); }
+    try { options.onModelCallStarted?.(ledger.snapshot()); }
+    catch { ledger.markIncomplete(); abort("cost_limit"); return blockedStream(model); }
     return originalStream(model, context, {
       ...streamOptions,
       maxTokens: Math.min(model.maxTokens, ledger.budget.maxOutputTokens, ledger.remainingTokens()),
@@ -181,6 +186,7 @@ export async function createSession(options: RuntimeOptions) {
       if ((event.message.stopReason === "error" || event.message.stopReason === "aborted") && event.message.usage.totalTokens === 0 && ledger.snapshot().modelCalls > 0) {
         ledger.markIncomplete();
       }
+      options.onUsageCheckpoint?.(ledger.snapshot(), ledger.usageComplete);
       const reason = ledger.exhausted();
       if (reason) abort(reason);
     } else if (event.type === "compaction_start") {
@@ -194,6 +200,7 @@ export async function createSession(options: RuntimeOptions) {
         const reason = ledger.exhausted();
         if (reason && !cancelReason) abort(reason);
       } else ledger.markIncomplete();
+      options.onUsageCheckpoint?.(ledger.snapshot(), ledger.usageComplete);
       try { options.onRuntimeStatus?.({ phase: "compaction", state: event.aborted ? "aborted" : event.errorMessage ? "failed" : "completed", reason: event.reason }); } catch { observerErrors++; }
     } else if (event.type === "tool_execution_start") {
       // 在 SDK 校验工具参数前计数，因而无效参数也消耗一次配额；执行体仍由 beforeToolCall 控门。

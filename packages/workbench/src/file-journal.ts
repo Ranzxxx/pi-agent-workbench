@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { Storage } from "@pi-workbench/storage";
+import { ManagedObjectQuotaExceededError, type FileOperationRecord, type Storage } from "@pi-workbench/storage";
 import { createProjectFileAccess, type ProjectFileJournal } from "@pi-workbench/tools";
-import { sha256, storeFileBackup } from "./managed-object-store.js";
+import { MAX_MANAGED_OBJECT_BYTES, reserveManagedObjects, sha256, writeManagedObject } from "./managed-object-store.js";
 import type { WorkerEventPayload } from "./worker-ipc.js";
 
 export function createPersistedFileJournal(input: {
@@ -22,13 +22,37 @@ export function createPersistedFileJournal(input: {
       const ownerChangesetId = await changesetId();
       let backupSha256: string | null = null;
       let resultSha256: string | null = null;
-      if (operation.preimage) backupSha256 = await storeFileBackup(input.storage, input.dataDirectory, operation.preimage);
-      if (operation.postimage) resultSha256 = await storeFileBackup(input.storage, input.dataDirectory, operation.postimage);
-      const record = input.storage.fileOperations.prepare({
-        id: randomUUID(), changesetId: ownerChangesetId, relativePath: operation.relativePath, kind: operation.kind,
-        preVersion: operation.preVersion, preHash: operation.preHash, expectedPostHash: operation.postHash,
-        backupSha256, resultSha256,
-      });
+      for (const bytes of [operation.preimage, operation.postimage]) if (bytes && bytes.byteLength > 65_536) throw new Error("单个文件备份上限为 64 KiB。");
+      const objectBytes = new Map<string, Buffer>();
+      if (operation.preimage) { backupSha256 = sha256(operation.preimage); objectBytes.set(backupSha256, operation.preimage); }
+      if (operation.postimage) { resultSha256 = sha256(operation.postimage); objectBytes.set(resultSha256, operation.postimage); }
+      const reservationRequests = [...objectBytes].map(([digest, bytes]) => ({ area: "file-objects" as const, sha256: digest, byteSize: bytes.byteLength }));
+      let reservations: Awaited<ReturnType<typeof reserveManagedObjects>> = [];
+      let reserved = false;
+      let record: FileOperationRecord;
+      try {
+        reservations = await reserveManagedObjects(input.storage, input.dataDirectory, reservationRequests, MAX_MANAGED_OBJECT_BYTES);
+        reserved = true;
+        const reservationByDigest = new Map(reservations.map((reservation) => [reservation.sha256, reservation.reservationId]));
+        for (const [digest, bytes] of objectBytes) await writeManagedObject(input.dataDirectory, "file-objects", digest, bytes, reservationByDigest.get(digest)!);
+        const createdAt = new Date().toISOString();
+        record = input.storage.fileOperations.prepareReserved({
+          id: randomUUID(), changesetId: ownerChangesetId, relativePath: operation.relativePath, kind: operation.kind,
+          preVersion: operation.preVersion, preHash: operation.preHash, expectedPostHash: operation.postHash,
+          backupSha256, resultSha256, createdAt,
+        }, [...objectBytes].map(([digest, bytes]) => ({ sha256: digest, byteSize: bytes.byteLength, createdAt })),
+        reservations.map((reservation) => reservation.reservationId));
+      } catch (error) {
+        let failure: unknown = error instanceof ManagedObjectQuotaExceededError
+          ? new Error("本地备份空间达到安全上限，已拒绝无备份写入。", { cause: error }) : error;
+        if (reserved) {
+          try { for (const digest of objectBytes.keys()) input.storage.garbage.enqueue({ kind: "file_backup_object", objectRef: digest }); }
+          catch (cleanupError) { if (failure instanceof Error) Object.defineProperty(failure, "garbageEnqueueError", { value: cleanupError, configurable: true }); }
+        }
+        try { input.storage.managedObjects.releaseMany(reservations.map((reservation) => reservation.reservationId)); }
+        catch (releaseError) { if (failure instanceof Error) Object.defineProperty(failure, "reservationReleaseError", { value: releaseError, configurable: true }); }
+        throw failure;
+      }
       operationChangesets.set(record.id, ownerChangesetId);
       await input.emit?.({ type: "file_change_prepared", data: {
         changesetId: ownerChangesetId, operationId: record.id, path: record.relativePath, kind: record.kind,

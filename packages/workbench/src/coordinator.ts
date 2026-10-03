@@ -18,15 +18,16 @@ import type { WorkerEventPayload } from "./worker-ipc.js";
 import { createCapabilityRegistry, CapabilityRegistryError, publicRepositoryCapability } from "./registry.js";
 import { createPublicRepositoryAnalysisExtension } from "./public-repository-extension.js";
 import { createDevelopmentGreetingExtension } from "./development-extension.js";
-import type { WorkbenchMode } from "./model-config.js";
+import { DEEPSEEK_PRICING, FAKE_PRICING, type WorkbenchMode } from "./model-config.js";
 import { ProjectPickerService, type PickerSessionStart } from "./project-picker.js";
 import { recoverPreparedFileOperations } from "./file-journal.js";
 import { createPersistedFileJournal } from "./file-journal.js";
 import { createProjectFileAccess } from "@pi-workbench/tools";
-import { readFileBackup, readManagedObject } from "./managed-object-store.js";
+import { readFileBackup, readManagedObject, sha256 } from "./managed-object-store.js";
 
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
 const EVENT_LIMIT = 1000;
+const EVENT_REPLAY_LIMIT = 4096;
 const KEY_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
 
 export interface WorkbenchServiceOptions {
@@ -277,7 +278,13 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
       const run = storage.runs.get(runId);
       if (!run || terminal(run.status)) return;
       const attempt = storage.attempts.list(runId).at(-1);
-      if (attempt?.status === "running") storage.attempts.finish(attempt.attemptId, "interrupted", now());
+      if (attempt?.status === "running") {
+        const safety = storage.attemptSafety.get(attempt.attemptId);
+        const usage = storage.usage.get(attempt.attemptId);
+        const usageComplete = safety?.state === "safe" && usage !== undefined && usage.costStatus !== "unknown" &&
+          usage.estimatedCostUsd !== null && usage.pricingVersion !== null;
+        storage.attempts.finish(attempt.attemptId, "interrupted", now(), undefined, usageComplete);
+      }
       const current = storage.runs.get(runId)!;
       if (["accepted", "running", "cancelling"].includes(current.status)) storage.runs.updateStatus(runId, "interrupted", now(), now());
       if (attempt) event = appendV2(runId, { type: "run.interrupted", data: { reason } }, false);
@@ -374,43 +381,52 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   async function beginExecution(runId: string): Promise<void> {
     const client = worker;
     if (!client || workerUnavailable) throw makeError("worker_unavailable", "The Worker is not confirmed ready; no model call was started.", 503, true);
-    const run = getRunRecord(runId);
-    const attempts = storage.attempts.list(runId);
-    const currentAttempt = attempts.at(-1);
-    if (!currentAttempt) throw makeError("conflict", "Run has no active attempt.", 409);
-    const priorAttempts = attempts.slice(0, -1);
-    let initialUsage: import("@pi-workbench/protocol").Usage | undefined;
-    let initialUsageComplete = true;
-    if (priorAttempts.length) {
-      const records = priorAttempts.map((attempt) => ({ attempt, usage: storage.usage.get(attempt.attemptId) }));
-      const pricingVersion = records.find((item) => item.usage?.pricingVersion)?.usage?.pricingVersion ?? "unknown-pricing";
-      initialUsageComplete = records.every((item) => item.attempt.usageComplete && item.usage && item.usage.costStatus !== "unknown" && item.usage.pricingVersion === pricingVersion);
-      if (records.every((item) => item.usage)) {
-        initialUsage = {
-          modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
-          totalTokens: 0, estimatedCostUsd: 0, pricingVersion,
-        };
-        for (const { usage } of records) {
-          initialUsage.modelCalls += usage!.modelCalls; initialUsage.toolCalls += usage!.toolCalls;
-          initialUsage.inputTokens += usage!.inputTokens; initialUsage.outputTokens += usage!.outputTokens;
-          initialUsage.cacheReadTokens += usage!.cacheReadTokens; initialUsage.cacheWriteTokens += usage!.cacheWriteTokens;
-          initialUsage.totalTokens += usage!.totalTokens;
-          if (usage!.estimatedCostUsd !== null) initialUsage.estimatedCostUsd += usage!.estimatedCostUsd;
-          else initialUsageComplete = false;
-        }
-        if (!records.every((item) => item.usage?.pricingVersion === pricingVersion)) initialUsageComplete = false;
-      }
-    }
-    const snapshotRecord = storage.snapshots.latest(run.conversationId);
-    const snapshot = snapshotRecord?.snapshot as unknown as ConversationSessionSnapshot | undefined;
-    const conversation = getConversationRecord(run.conversationId);
-    const projectRecord = conversation.projectId ? storage.projects.get(conversation.projectId) : undefined;
-    const rulesRecord = conversation.projectId ? storage.projectRules.get(conversation.projectId) : undefined;
-    const project = projectRecord ? {
-      projectId: projectRecord.id, canonicalRoot: projectRecord.canonicalRoot, directoryIdentity: projectRecord.directoryIdentity,
-      ...(rulesRecord && !rulesRecord.revokedAt ? { acceptedRules: { sourcePath: rulesRecord.sourcePath, sourceSha256: rulesRecord.sourceSha256, content: rulesRecord.content } } : {}),
-    } : undefined;
     try {
+      const run = getRunRecord(runId);
+      const attempts = storage.attempts.list(runId);
+      const currentAttempt = attempts.at(-1);
+      if (!currentAttempt) throw makeError("conflict", "Run has no active attempt.", 409);
+      const priorAttempts = attempts.slice(0, -1);
+      let initialUsage: import("@pi-workbench/protocol").Usage | undefined;
+      let initialUsageComplete = true;
+      if (priorAttempts.length) {
+        const records = priorAttempts.map((attempt) => ({ attempt, usage: storage.usage.get(attempt.attemptId) }));
+        const pricingVersion = records.find((item) => item.usage?.pricingVersion)?.usage?.pricingVersion ?? "unknown-pricing";
+        initialUsageComplete = records.every((item) => item.attempt.usageComplete && item.usage && item.usage.costStatus !== "unknown" && item.usage.pricingVersion === pricingVersion);
+        if (records.every((item) => item.usage)) {
+          initialUsage = {
+            modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+            totalTokens: 0, estimatedCostUsd: 0, pricingVersion,
+          };
+          for (const { usage } of records) {
+            initialUsage.modelCalls += usage!.modelCalls; initialUsage.toolCalls += usage!.toolCalls;
+            initialUsage.inputTokens += usage!.inputTokens; initialUsage.outputTokens += usage!.outputTokens;
+            initialUsage.cacheReadTokens += usage!.cacheReadTokens; initialUsage.cacheWriteTokens += usage!.cacheWriteTokens;
+            initialUsage.totalTokens += usage!.totalTokens;
+            if (usage!.estimatedCostUsd !== null) initialUsage.estimatedCostUsd += usage!.estimatedCostUsd;
+            else initialUsageComplete = false;
+          }
+          if (!records.every((item) => item.usage?.pricingVersion === pricingVersion)) initialUsageComplete = false;
+        }
+      }
+      const snapshotRecord = storage.snapshots.latest(run.conversationId);
+      const snapshot = snapshotRecord?.snapshot as unknown as ConversationSessionSnapshot | undefined;
+      const conversation = getConversationRecord(run.conversationId);
+      const projectRecord = conversation.projectId ? storage.projects.get(conversation.projectId) : undefined;
+      const rulesRecord = conversation.projectId ? storage.projectRules.get(conversation.projectId) : undefined;
+      const project = projectRecord ? {
+        projectId: projectRecord.id, canonicalRoot: projectRecord.canonicalRoot, directoryIdentity: projectRecord.directoryIdentity,
+        ...(rulesRecord && !rulesRecord.revokedAt ? { acceptedRules: { sourcePath: rulesRecord.sourcePath, sourceSha256: rulesRecord.sourceSha256, content: rulesRecord.content } } : {}),
+      } : undefined;
+      const safety = storage.attemptSafety.get(currentAttempt.attemptId);
+      if (safety?.state === "unknown") {
+        const pricingVersion = options.mode === "fake" ? FAKE_PRICING.version : DEEPSEEK_PRICING.version;
+        storage.attemptSafety.initializeBeforeCall({
+          attemptId: currentAttempt.attemptId, modelId: null, modelCalls: 0, toolCalls: 0,
+          inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0,
+          estimatedCostUsd: 0, costStatus: "estimate", pricingVersion, updatedAt: now(),
+        });
+      }
       const result = await client.execute({ runId, attemptId: currentAttempt.attemptId, conversationId: run.conversationId, input: parse(V2RunSubmissionSchema, run.request),
         ...(initialUsage ? { initialUsage } : {}), initialUsageComplete,
         ...(snapshot ? { snapshot } : {}), ...(project ? { project } : {}) }, {
@@ -418,7 +434,9 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
       });
       await finalizeRun(runId, result);
     } catch {
-      if (client.isAlive) {
+      if (client.isAlive && await client.waitForExit(1_000)) {
+        recoverRunAfterExit(runId);
+      } else if (client.isAlive) {
         // A live worker that could not prove a durable result keeps the slot fenced.
         workerUnavailable = true;
         try { storage.workerIdentity.setStatus(client.bootId, "uncertain"); } catch { /* Keep the original storage failure. */ }
@@ -554,36 +572,109 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
 
   function subscribeV2(runId: string, rawCursor?: string, listener?: (event: V2RunEvent) => void): V2EventSubscription {
     getRunRecord(runId);
-    let afterSequence = 0;
-    let reset: V2EventSubscription["reset"];
-    const latestSequence = storage.events.latestSequence(runId);
-    let lastEventId: string | undefined;
-    if (rawCursor && rawCursor !== "0") {
-      const cursorSequence = storage.events.sequenceById(runId, rawCursor);
-      if (cursorSequence === undefined) {
-        const page = storage.events.after({ schemaVersion: 2, runId, afterSequence: latestSequence }, EVENT_LIMIT);
-        const latestEvent = page.nextCursor.lastEventId;
-        reset = {
-          schemaVersion: 2, type: "stream.reset", runId,
-          data: { reason: "event_history_expired", earliestAvailableSequence: latestSequence ? Math.max(1, latestSequence - EVENT_LIMIT + 1) : 1, latestSequence, ...(latestEvent ? { latestEventId: latestEvent } : {}) },
-        };
-        afterSequence = latestSequence; lastEventId = latestEvent;
-      } else { afterSequence = cursorSequence; lastEventId = rawCursor; }
-    }
-    const seen = new Set<string>();
     const listeners = subscribers.get(runId) ?? new Set<(event: V2RunEvent) => void>();
     subscribers.set(runId, listeners);
+    let replaying = true;
+    let active = true;
+    const buffered: V2RunEvent[] = [];
+    let lastDeliveredSequence = 0;
+    const deliver = (event: V2RunEvent) => {
+      if (!active || event.sequence <= lastDeliveredSequence) return;
+      lastDeliveredSequence = event.sequence;
+      listener?.(event);
+    };
     const wrapped = (event: V2RunEvent) => {
-      if (event.sequence <= afterSequence || seen.has(event.eventId)) return;
-      seen.add(event.eventId); listener?.(event);
+      if (replaying) { buffered.push(event); return; }
+      deliver(event);
     };
     if (listener) listeners.add(wrapped);
-    const page = storage.events.after({ schemaVersion: 2, runId, afterSequence, ...(lastEventId ? { lastEventId } : {}) }, EVENT_LIMIT);
-    for (const event of page.events) { seen.add(event.eventId); }
-    return {
-      replay: page.events, ...(reset ? { reset } : {}), finished: terminal(getRunRecord(runId).status),
-      unsubscribe: () => { if (listener) listeners.delete(wrapped); if (listeners.size === 0) subscribers.delete(runId); },
-    };
+
+    try {
+      const highWaterSequence = storage.events.latestSequence(runId);
+      let afterSequence = 0;
+      let reset: V2EventSubscription["reset"];
+      let lastEventId: string | undefined;
+      if (rawCursor && rawCursor !== "0") {
+        const cursorSequence = storage.events.sequenceById(runId, rawCursor);
+        if (cursorSequence === undefined) {
+          const latestEvent = highWaterSequence > 0
+            ? storage.events.after({ schemaVersion: 2, runId, afterSequence: highWaterSequence - 1 }, 1).events[0]
+            : undefined;
+          reset = {
+            schemaVersion: 2, type: "stream.reset", runId,
+            data: { reason: "event_history_expired", earliestAvailableSequence: highWaterSequence ? Math.max(1, highWaterSequence - EVENT_REPLAY_LIMIT + 1) : 1,
+              latestSequence: highWaterSequence, ...(latestEvent?.sequence === highWaterSequence ? { latestEventId: latestEvent.eventId } : {}) },
+          };
+          afterSequence = highWaterSequence; lastEventId = latestEvent?.eventId;
+        } else { afterSequence = cursorSequence; lastEventId = rawCursor; }
+      }
+      const requestedSequence = afterSequence;
+      lastDeliveredSequence = Math.max(highWaterSequence, requestedSequence);
+      const latestEventAtWatermark = () => highWaterSequence > 0
+        ? storage.events.after({ schemaVersion: 2, runId, afterSequence: highWaterSequence - 1 }, 1).events[0]
+        : undefined;
+      const makeReset = (earliestAvailableSequence: number): NonNullable<V2EventSubscription["reset"]> => {
+        const latestEvent = latestEventAtWatermark();
+        return {
+          schemaVersion: 2, type: "stream.reset", runId,
+          data: { reason: "event_history_expired", earliestAvailableSequence, latestSequence: highWaterSequence,
+            ...(latestEvent?.sequence === highWaterSequence ? { latestEventId: latestEvent.eventId } : {}) },
+        };
+      };
+      let replay: V2RunEvent[] = [];
+      const replayDistance = highWaterSequence - afterSequence;
+      if (replayDistance > EVENT_REPLAY_LIMIT) {
+        reset = makeReset(Math.max(1, highWaterSequence - EVENT_REPLAY_LIMIT + 1));
+        afterSequence = highWaterSequence;
+        lastEventId = reset.data.latestEventId;
+      }
+
+      if (!reset) {
+        let cursorSequence = afterSequence;
+        let cursorEventId = lastEventId;
+        let gapSequence: number | undefined;
+        while (cursorSequence < highWaterSequence) {
+          const page = storage.events.after({ schemaVersion: 2, runId, afterSequence: cursorSequence, ...(cursorEventId ? { lastEventId: cursorEventId } : {}) },
+            Math.min(EVENT_LIMIT, highWaterSequence - cursorSequence));
+          if (page.events.length === 0) { gapSequence = highWaterSequence; break; }
+          let expectedSequence = cursorSequence + 1;
+          for (const event of page.events) {
+            if (event.sequence > highWaterSequence) { gapSequence = cursorSequence + 1; break; }
+            if (event.sequence !== expectedSequence) { gapSequence = event.sequence; break; }
+            replay.push(event);
+            cursorSequence = event.sequence;
+            cursorEventId = event.eventId;
+            expectedSequence++;
+          }
+          if (gapSequence !== undefined) break;
+        }
+        if (gapSequence !== undefined || cursorSequence !== highWaterSequence) {
+          const earliest = gapSequence && gapSequence > 0 ? gapSequence : Math.max(1, cursorSequence + 1);
+          reset = makeReset(earliest);
+          replay = [];
+          afterSequence = highWaterSequence;
+          lastEventId = reset.data.latestEventId;
+        }
+      }
+      const subscription: V2EventSubscription = {
+        replay, ...(reset ? { reset } : {}), finished: terminal(getRunRecord(runId).status),
+        unsubscribe: () => { active = false; if (listener) listeners.delete(wrapped); if (listeners.size === 0) subscribers.delete(runId); },
+      };
+      // `subscribeV2` is synchronous and SQLite page reads do not yield to the event loop.
+      // Registering before the high-water query closes the setup gap; this buffer only handles
+      // deliberate synchronous re-entrancy and is ordered after the fixed historical watermark.
+      queueMicrotask(() => {
+        buffered.sort((left, right) => left.sequence - right.sequence);
+        replaying = false;
+        for (const event of buffered) deliver(event);
+      });
+      return subscription;
+    } catch (error) {
+      active = false;
+      if (listener) listeners.delete(wrapped);
+      if (listeners.size === 0) subscribers.delete(runId);
+      throw error;
+    }
   }
 
   function legacyEvent(event: V2RunEvent): WorkbenchEvent | undefined {
@@ -664,11 +755,30 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   }
   function continueV2(runId: string, key: string): { run: V2Run; replayed: boolean } {
     if (typeof key !== "string" || !KEY_PATTERN.test(key)) throw makeError("invalid_request", "A valid Idempotency-Key header is required.", 400);
+    const inputHash = hash({ runId, operation: "continue" });
+    try {
+      const existing = storage.idempotency.lookup({
+        schemaVersion: 2, scope: runId, endpoint: "POST /api/v2/runs/:id/continue", key, requestHash: inputHash,
+      }, { schemaVersion: 2, resourceKind: "run", resourceId: runId });
+      if (existing) return { run: v2Run(runId), replayed: true };
+    } catch (error) { translateError(error); }
+    const previousAttempt = storage.attempts.list(runId).at(-1);
+    const safety = previousAttempt ? storage.attemptSafety.get(previousAttempt.attemptId) : undefined;
+    if (safety?.state === "safe" && safety.checkpointKind === "conversation_turn") {
+      throw makeError("conflict", "完整对话回复的用量已结算，但最终结果尚未确认；为避免重复提交原请求，暂不支持继续此运行。", 409);
+    }
     if (fileMutationActive) throw makeError("active_task", "当前正在撤销文件修改，暂不能继续任务。", 409);
     if (workerUnavailable || !worker?.isAlive) throw makeError("worker_unavailable", "The Worker is not confirmed ready.", 503, true);
+    const usage = previousAttempt ? storage.usage.get(previousAttempt.attemptId) : undefined;
+    const checkpointValid = safety?.checkpointKind === "pre_call" ||
+      (safety?.checkpointKind === "workflow_stage" && safety.checkpointId !== null &&
+        storage.checkpoints.get(safety.checkpointId)?.status === "completed");
+    if (!previousAttempt?.usageComplete || safety?.state !== "safe" || !checkpointValid || !usage || usage.costStatus === "unknown" ||
+        usage.estimatedCostUsd === null || usage.pricingVersion === null || storage.fileOperations.hasRunOperations(runId) || storage.attachmentResults.hasRunResults(runId)) {
+      throw makeError("conflict", "本次运行的用量或安全检查点不完整，已拒绝继续以避免重复模型调用或文件操作。", 409);
+    }
     const workerClient = worker;
     const heartbeatAt = now();
-    const inputHash = hash({ runId, operation: "continue" });
     let continued: ReturnType<typeof storage.runs.continueIdempotent>;
     try {
       continued = storage.runs.continueIdempotent(runId, {
@@ -784,9 +894,12 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
       const last = lastApplied ?? group.at(-1)!;
       const beforeBytes = first.preHash === null ? null : first.backupSha256 ? await readFileBackup(storage, dataDirectory, first.backupSha256) : null;
       const afterBytes = last.expectedPostHash === null ? null : last.resultSha256 ? await readFileBackup(storage, dataDirectory, last.resultSha256) : null;
-      if ((first.preHash !== null && !beforeBytes) || (last.expectedPostHash !== null && !afterBytes)) throw makeError("conflict", "A file diff object is missing or failed integrity checks.", 409);
-      const beforeText = beforeBytes ? new TextDecoder("utf-8", { fatal: true }).decode(beforeBytes) : null;
-      const afterText = afterBytes ? new TextDecoder("utf-8", { fatal: true }).decode(afterBytes) : null;
+      if ((first.preHash !== null && (!beforeBytes || sha256(beforeBytes) !== first.preHash)) ||
+          (last.expectedPostHash !== null && (!afterBytes || sha256(afterBytes) !== last.expectedPostHash))) {
+        throw makeError("conflict", "A file diff object is missing, corrupt, or does not match its recorded file hash.", 409);
+      }
+      const beforeText = beforeBytes ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(beforeBytes) : null;
+      const afterText = afterBytes ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(afterBytes) : null;
       const status = group.some((item) => item.status === "uncertain" || item.status === "prepared") ? "uncertain"
         : group.some((item) => item.status === "conflict") ? "conflict"
           : group.some((item) => item.status === "applied") ? "applied"
@@ -888,9 +1001,12 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
           if (!first.backupSha256) throw new Error("Missing file backup");
           const before = await readFileBackup(storage, dataDirectory, first.backupSha256);
           if (!before) throw new Error("Missing file backup");
-          const text = new TextDecoder("utf-8", { fatal: true }).decode(before);
-          if (current) await access.restoreFile(filePath, current.token, text);
-          else await access.createFile(filePath, text);
+          if (sha256(before) !== first.preHash) throw new Error("File backup does not match its original preimage hash");
+          const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(before);
+          const restored = current
+            ? await access.restoreFile(filePath, current.token, text)
+            : await access.createFile(filePath, text);
+          if (restored.sha256 !== first.preHash) throw new Error("Restored file does not match its original preimage hash");
         }
         storage.fileOperations.markUndone(group.map((operation) => operation.id));
         undonePaths.push(filePath);

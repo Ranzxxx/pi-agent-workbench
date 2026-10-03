@@ -1,18 +1,21 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { request as httpRequest } from "node:http";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { openStorage, resolveDatabasePath, StorageError } from "@pi-workbench/storage";
 import { createWorkbenchApp } from "../src/app.js";
-import { localFetch, injectedSessionHeaders } from "./local-client.js";
+import { localFetch, injectedSessionHeaders, localSessionHeaders } from "./local-client.js";
 import type { V2Conversation, V2Run } from "@pi-workbench/protocol";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function temporaryRoot(): Promise<string> { return mkdtemp(path.join(os.tmpdir(), "pi-workbench-task011-")); }
-async function createApp(root: string) {
-  const app = await createWorkbenchApp({ mode: "fake", dataDirectory: root });
+async function createApp(root: string, workerEntryPath?: string) {
+  const app = await createWorkbenchApp({ mode: "fake", dataDirectory: root, ...(workerEntryPath ? { workerEntryPath } : {}) });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   return { app, baseUrl: address };
 }
@@ -108,6 +111,33 @@ await test("v2 Worker persists ordinary conversations and real SSE replays after
   assert.equal(db.snapshots.latest(conversation.conversationId)?.sdkVersion, "0.86.1");
   assert.ok(db.events.latestSequence(first.runId) >= eventIds.length);
   assert.equal(db.attempts.list(first.runId).length, 1);
+  const attempt = db.attempts.list(first.runId).at(-1)!;
+  const syntheticHistory: Array<ReturnType<typeof db.events.append>> = [];
+  for (let index = 0; index < 1205; index++) {
+    syntheticHistory.push(db.events.append({ eventId: crypto.randomUUID(), runId: first.runId, attemptId: attempt.attemptId, type: "run.progress",
+      data: { phase: "sse-page-test", message: `historical ${index}` } }));
+  }
+  const highWater = db.events.latestSequence(first.runId);
+  const pagedResponse = await localFetch(`${baseUrl}/api/v2/runs/${first.runId}/events`);
+  const pagedFrames = (await pagedResponse.text()).split(/\r?\n\r?\n/u).filter((frame) => /^id: /mu.test(frame));
+  const pagedEvents = pagedFrames.map((frame) => JSON.parse(frame.match(/^data: (.+)$/mu)?.[1] ?? "null") as { eventId: string; sequence: number; type: string });
+  assert.equal(pagedEvents.length, highWater, "SSE must stream every replay page even when the run is terminal");
+  assert.deepEqual(pagedEvents.map((event) => event.sequence), Array.from({ length: highWater }, (_, index) => index + 1));
+  assert.ok(pagedEvents.some((event) => event.type === "run.completed"));
+
+  const pagedResume = await localFetch(`${baseUrl}/api/v2/runs/${first.runId}/events`, { headers: { "last-event-id": syntheticHistory[99]!.eventId } });
+  const pagedResumeFrames = (await pagedResume.text()).split(/\r?\n\r?\n/u).filter((frame) => /^id: /mu.test(frame));
+  const pagedResumeEvents = pagedResumeFrames.map((frame) => JSON.parse(frame.match(/^data: (.+)$/mu)?.[1] ?? "null") as { eventId: string; sequence: number });
+  assert.equal(pagedResumeEvents[0]?.sequence, syntheticHistory[99]!.sequence + 1);
+  assert.equal(pagedResumeEvents.at(-1)?.sequence, highWater);
+  assert.equal(pagedResumeEvents.some((event) => event.eventId === syntheticHistory[99]!.eventId), false);
+
+  const invalidCursorResponse = await localFetch(`${baseUrl}/api/v2/runs/${first.runId}/events`, { headers: { "last-event-id": "unknown-event-id" } });
+  const invalidCursorFrames = (await invalidCursorResponse.text()).split(/\r?\n\r?\n/u).filter((frame) => /^event: stream\.reset$/mu.test(frame));
+  assert.equal(invalidCursorFrames.length, 1);
+  const reset = JSON.parse(invalidCursorFrames[0]!.match(/^data: (.+)$/mu)?.[1] ?? "null") as { data: { latestSequence: number; latestEventId: string } };
+  assert.equal(reset.data.latestSequence, highWater);
+  assert.equal(reset.data.latestEventId, syntheticHistory.at(-1)?.eventId);
   db.close();
 
   await app.close();
@@ -131,6 +161,62 @@ await test("v2 Worker persists ordinary conversations and real SSE replays after
   assert.notEqual(retried.runId, failed.runId);
   assert.equal(retried.retryOfRunId, failed.runId);
   assert.equal((await waitForRun(baseUrl, retried.runId, "failed")).status, "failed");
+});
+
+await test("a paused HTTP SSE client receives the full replay before a live terminal event", { timeout: 45_000 }, async (t) => {
+  const root = await temporaryRoot();
+  const workerEntryPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../packages/workbench/tests/fixtures/usage-safety-worker.ts");
+  const { app, baseUrl } = await createApp(root, workerEntryPath);
+  t.after(async () => { await app.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); });
+  const conversation = await createConversation(baseUrl);
+  const submitted = await submit(baseUrl, conversation.conversationId, "[[test:before-call]] hold while SSE replays");
+  assert.equal(submitted.status, 202);
+  const run = await submitted.json() as V2Run;
+  await waitForRun(baseUrl, run.runId, "running");
+  const marker = path.join(root, "usage-safety-before-call-paused");
+  for (let attempt = 0; attempt < 200 && !existsSync(marker); attempt++) await sleep(10);
+  assert.ok(existsSync(marker), "the Worker fixture must reach its deterministic pre-call pause");
+
+  const db = openStorage({ dataDirectory: { dataDirectory: root } });
+  const attempt = db.attempts.list(run.runId).at(-1)!;
+  for (let index = 0; index < 1205; index++) {
+    db.events.append({ eventId: crypto.randomUUID(), runId: run.runId, attemptId: attempt.attemptId, type: "run.progress",
+      data: { phase: "slow-client-replay", message: `${index}: ${"x".repeat(1900)}` } });
+  }
+  db.close();
+
+  const request = httpRequest(new URL(`/api/v2/runs/${run.runId}/events`, baseUrl), { headers: await localSessionHeaders(baseUrl) });
+  t.after(() => request.destroy());
+  const responsePromise = new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+    request.once("response", resolve);
+    request.once("error", reject);
+  });
+  request.end();
+  const response = await responsePromise;
+  assert.equal(response.statusCode, 200);
+  response.pause();
+
+  const workerDb = openStorage({ dataDirectory: { dataDirectory: root } });
+  const identity = workerDb.workerIdentity.get();
+  assert.ok(identity);
+  process.kill(identity!.pid, "SIGKILL");
+  workerDb.close();
+  assert.equal((await waitForRun(baseUrl, run.runId, "interrupted")).status, "interrupted");
+
+  const bodyPromise = new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    response.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    response.once("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    response.once("error", reject);
+  });
+  response.resume();
+  const body = await bodyPromise;
+  const frames = body.split(/\r?\n\r?\n/u).filter((frame) => /^id: /mu.test(frame));
+  const events = frames.map((frame) => JSON.parse(frame.match(/^data: (.+)$/mu)?.[1] ?? "null") as { sequence: number; type: string });
+  assert.ok(events.length > 1205);
+  assert.deepEqual(events.map((event) => event.sequence), Array.from({ length: events.length }, (_, index) => index + 1));
+  assert.equal(new Set(frames.map((frame) => frame.match(/^id: (.+)$/mu)?.[1])).size, frames.length);
+  assert.equal(events.at(-1)?.type, "run.interrupted", "the live terminal event follows full replay and closes the stream");
 });
 
 await test("capability catalog, guarded state updates, disabled rejection, and tool extension execution", { timeout: 30_000 }, async (t) => {
@@ -294,14 +380,21 @@ await test("API restart detects Worker exit, marks run interrupted and only cont
   duplicateDb.close();
   await localFetch(`${baseUrl}/api/v2/runs/${run.runId}/cancel`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
   assert.equal((await waitForRun(baseUrl, run.runId, "cancelled")).status, "cancelled");
+  const duplicateAfterTerminal = await localFetch(`${baseUrl}/api/v2/runs/${run.runId}/continue`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": continueKey }, body: "{}",
+  });
+  assert.equal(duplicateAfterTerminal.status, 200, "an already committed replay succeeds even after its run becomes terminal");
+  const terminalReplayDb = openStorage({ dataDirectory: { dataDirectory: root } });
+  assert.equal(terminalReplayDb.attempts.list(run.runId).length, 2, "replay must not create a new attempt");
+  terminalReplayDb.close();
   await app.close();
   ({ app, baseUrl } = await createApp(root));
   assert.equal((await fetchRun(baseUrl, run.runId)).status, "cancelled");
 });
 
-await test("terminal result and session snapshot roll back together on persistence failure", { timeout: 30_000 }, async (t) => {
+await test("terminal result rollback preserves the settled conversation checkpoint", { timeout: 30_000 }, async (t) => {
   const root = await temporaryRoot();
-  const { app, baseUrl } = await createApp(root);
+  let { app, baseUrl } = await createApp(root);
   t.after(async () => { await app.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); });
   const raw = new DatabaseSync(resolveDatabasePath({ dataDirectory: root }));
   raw.exec(`CREATE TRIGGER fail_terminal_event BEFORE INSERT ON run_events WHEN NEW.event_type = 'run.completed' BEGIN SELECT RAISE(ABORT, 'injected terminal event failure'); END;`);
@@ -318,17 +411,34 @@ await test("terminal result and session snapshot roll back together on persisten
   const store = openStorage({ dataDirectory: { dataDirectory: root } });
   assert.equal(store.runs.get(run.runId)?.status, "running");
   assert.equal(store.results.get(run.runId), undefined);
-  assert.equal(store.snapshots.latest(conversation.conversationId), undefined);
+  const safeSnapshot = store.snapshots.latest(conversation.conversationId);
+  assert.ok(safeSnapshot, "the settled conversation checkpoint remains durable when terminal finalization fails");
   assert.equal(store.messages.list(conversation.conversationId).length, 1);
-  assert.equal(store.attempts.list(run.runId)[0]?.status, "running");
+  const attempt = store.attempts.list(run.runId)[0];
+  assert.equal(attempt?.status, "running");
+  assert.equal(store.attemptSafety.get(attempt!.attemptId)?.state, "safe");
+  assert.equal(store.attemptSafety.get(attempt!.attemptId)?.snapshotId, safeSnapshot.id);
+  const settledUsage = store.usage.get(attempt!.attemptId);
+  assert.ok(settledUsage?.modelCalls && settledUsage.modelCalls > 0);
+  assert.equal(attempt?.usageComplete, false, "the still-running attempt has not committed terminal usage completion");
   assert.equal(store.activeSlot.get().runId, run.runId);
   store.close();
   raw.exec("DROP TRIGGER fail_terminal_event");
   raw.close();
   await app.close();
+  ({ app, baseUrl } = await createApp(root));
+  assert.equal(await waitForWorker(baseUrl), true);
+  assert.equal((await fetchRun(baseUrl, run.runId)).status, "interrupted");
+  const rejectedContinue = await localFetch(`${baseUrl}/api/v2/runs/${run.runId}/continue`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: "{}",
+  });
+  assert.equal(rejectedContinue.status, 409);
+  assert.match((await rejectedContinue.json() as { message: string }).message, /完整对话回复的用量已结算/u);
   const recovered = openStorage({ dataDirectory: { dataDirectory: root } });
-  assert.equal(recovered.runs.get(run.runId)?.status, "interrupted");
-  assert.equal(recovered.snapshots.latest(conversation.conversationId), undefined);
+  assert.equal(recovered.snapshots.latest(conversation.conversationId)?.id, safeSnapshot.id);
+  assert.equal(recovered.results.get(run.runId), undefined);
+  assert.equal(recovered.attempts.list(run.runId).length, 1, "a settled conversation checkpoint cannot create a retry attempt");
+  assert.deepEqual(recovered.usage.get(attempt!.attemptId), settledUsage, "rejection must not invoke the provider or alter settled usage");
   recovered.close();
 });
 
@@ -378,10 +488,26 @@ await test("nonterminal event and usage persistence failures fence the Worker wi
     const store = openStorage({ dataDirectory: { dataDirectory } });
     assert.equal(store.runs.get(run.runId)?.status, "running");
     assert.equal(store.results.get(run.runId), undefined);
-    assert.equal(store.snapshots.latest(conversation.conversationId), undefined);
     assert.equal(store.messages.list(conversation.conversationId).length, 1);
     assert.equal(store.activeSlot.get().runId, run.runId);
-    assert.equal(store.usage.get(store.attempts.list(run.runId)[0]!.attemptId), undefined);
+    if (name === "usage-record") assert.equal(store.workerIdentity.get()?.status, "uncertain");
+    const attempt = store.attempts.list(run.runId)[0]!;
+    const safety = store.attemptSafety.get(attempt.attemptId);
+    const snapshot = store.snapshots.latest(conversation.conversationId);
+    const usage = store.usage.get(attempt.attemptId);
+    if (name === "message-delta") {
+      assert.ok(snapshot, "the settled message-delta failure keeps its complete conversation checkpoint");
+      assert.equal(safety?.state, "safe");
+      assert.equal(safety?.checkpointKind, "conversation_turn");
+      assert.equal(safety?.snapshotId, snapshot.id);
+      assert.ok(usage && usage.costStatus === "estimate" && usage.modelCalls > 0);
+      assert.equal(attempt.usageComplete, false, "terminal usage completion is not committed while finalization failed");
+    } else {
+      assert.equal(snapshot, undefined, "a usage persistence failure must not create a conversation checkpoint");
+      assert.equal(safety?.state, "unknown", "a rolled-back pre-call transaction does not fabricate a settled or in-flight record");
+      assert.equal(usage, undefined, "usage stays fail closed when its initial transaction fails");
+      assert.equal(attempt.usageComplete, false);
+    }
     store.close();
     raw.close();
     raw = undefined;
@@ -393,7 +519,18 @@ await test("nonterminal event and usage persistence failures fence the Worker wi
     assert.equal(recoveredRun.statusCode, 200);
     assert.equal((JSON.parse(recoveredRun.body) as V2Run).status, "interrupted");
     const recovered = openStorage({ dataDirectory: { dataDirectory } });
-    assert.equal(recovered.snapshots.latest(conversation.conversationId), undefined);
+    const recoveredSnapshot = recovered.snapshots.latest(conversation.conversationId);
+    if (name === "message-delta") {
+      assert.equal(recoveredSnapshot?.id, snapshot?.id);
+      const recoveredAttempt = recovered.attempts.list(run.runId)[0]!;
+      assert.equal(recovered.attemptSafety.get(recoveredAttempt.attemptId)?.state, "safe");
+      assert.ok(recovered.usage.get(recoveredAttempt.attemptId)?.costStatus === "estimate");
+    } else {
+      assert.equal(recoveredSnapshot, undefined);
+      const recoveredAttempt = recovered.attempts.list(run.runId)[0]!;
+      assert.equal(recovered.attemptSafety.get(recoveredAttempt.attemptId)?.state, "unknown");
+      assert.equal(recovered.usage.get(recoveredAttempt.attemptId), undefined);
+    }
     recovered.close();
     await app.close();
     app = undefined;

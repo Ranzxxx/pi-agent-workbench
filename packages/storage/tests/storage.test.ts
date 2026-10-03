@@ -36,11 +36,11 @@ test("stable data directory honors override, XDG, and home fallback", () => {
 
 test("new database migrates to WAL/FULL with foreign keys, and repeated open preserves schema", () => withDb((_root, path) => {
   const first = openStorage({ path });
-  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 6 });
+  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 8 });
   assert.equal(first.projects.list().length, 0);
   first.close();
   const reopened = openStorage({ path });
-  assert.equal(reopened.diagnostics.schemaVersion, 6);
+  assert.equal(reopened.diagnostics.schemaVersion, 8);
   assert.equal(reopened.projects.list().length, 0);
   reopened.close();
 }));
@@ -128,6 +128,80 @@ test("nested repository calls participate in the outer storage transaction", () 
   }));
   assert.equal(store.projects.get("project_atomic"), undefined);
   assert.equal(store.conversations.get("conversation_atomic"), undefined);
+  store.close();
+}));
+
+test("safe checkpoints require the exact attempt usage already settled in durable storage", () => withDb((_root, path) => {
+  const store = openStorage({ path });
+  const { run, attempt } = createBase(store, "safe_usage");
+  const zeroUsage = {
+    attemptId: attempt.attemptId, modelId: null, modelCalls: 0, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0,
+    estimatedCostUsd: 0, costStatus: "estimate" as const, pricingVersion: "fake-v1", updatedAt: at,
+  };
+  store.attemptSafety.initializeBeforeCall(zeroUsage);
+  const reusable = store.checkpoints.create({ id: "safe_usage_old_checkpoint", runId: run.runId, attemptId: attempt.attemptId,
+    phaseId: "snapshot", inputSha256: hash, outputRef: "snapshot.json", status: "completed", createdAt: at });
+
+  // Starting another provider call must invalidate the preceding safe ledger
+  // before a caller can publish an old known snapshot as a fresh checkpoint.
+  assert.throws(() => store.attemptSafety.modelCallStarted({ ...zeroUsage, modelCalls: 2, estimatedCostUsd: null,
+    costStatus: "unknown", pricingVersion: null, updatedAt: "2026-10-01T00:00:01.000Z" }), StorageError);
+  assert.equal(store.attemptSafety.get(attempt.attemptId)?.state, "safe");
+  store.attemptSafety.modelCallStarted({ ...zeroUsage, modelCalls: 1, estimatedCostUsd: null,
+    costStatus: "unknown", pricingVersion: null, updatedAt: "2026-10-01T00:00:01.000Z" });
+  assert.equal(store.attemptSafety.get(attempt.attemptId)?.state, "in_flight");
+  assert.equal(store.usage.get(attempt.attemptId)?.costStatus, "unknown");
+  assert.throws(() => store.attemptSafety.saveWorkflowCheckpoint({
+    checkpoint: { id: "safe_usage_stale_workflow", runId: run.runId, attemptId: attempt.attemptId,
+      phaseId: "report", inputSha256: hash, outputRef: "report.json", status: "completed", createdAt: at },
+    usage: zeroUsage,
+  }), StorageError);
+  assert.throws(() => store.attemptSafety.saveConversationCheckpoint({
+    attemptId: attempt.attemptId, conversationId: "conversation_safe_usage",
+    snapshot: { id: "safe_usage_stale_snapshot", conversationId: "conversation_safe_usage", sdkVersion: "0.86.1",
+      formatVersion: "pi-session-v3", snapshot: { formatVersion: "pi-session-v3" }, summary: null, createdAt: at },
+    usage: zeroUsage,
+  }), StorageError);
+  assert.throws(() => store.attemptSafety.adoptWorkflowCheckpoint({ attemptId: attempt.attemptId, checkpointId: reusable.id, usage: zeroUsage }), StorageError);
+  assert.equal(store.checkpoints.get("safe_usage_stale_workflow"), undefined);
+  assert.equal(store.snapshots.latest("conversation_safe_usage"), undefined);
+  assert.equal(store.attemptSafety.get(attempt.attemptId)?.state, "in_flight");
+
+  const settled = { ...zeroUsage, modelCalls: 1, inputTokens: 2, totalTokens: 2,
+    estimatedCostUsd: 0.125, updatedAt: "2026-10-01T00:00:02.000Z" };
+  assert.throws(() => store.attemptSafety.recordSettledUsage({ ...settled, modelCalls: 0 }), StorageError);
+  store.attemptSafety.recordSettledUsage(settled);
+  assert.throws(() => store.attemptSafety.saveWorkflowCheckpoint({
+    checkpoint: { id: "safe_usage_mismatched_workflow", runId: run.runId, attemptId: attempt.attemptId,
+      phaseId: "report", inputSha256: hash, outputRef: "report.json", status: "completed", createdAt: at },
+    usage: { ...settled, inputTokens: 1, totalTokens: 1 },
+  }), StorageError);
+  assert.equal(store.checkpoints.get("safe_usage_mismatched_workflow"), undefined);
+  assert.equal(store.attemptSafety.get(attempt.attemptId)?.state, "in_flight");
+
+  const saved = store.attemptSafety.saveWorkflowCheckpoint({
+    checkpoint: { id: "safe_usage_valid_workflow", runId: run.runId, attemptId: attempt.attemptId,
+      phaseId: "report", inputSha256: hash, outputRef: "report.json", status: "completed", createdAt: at },
+    usage: { ...settled, updatedAt: "2026-10-01T00:00:03.000Z" },
+  });
+  assert.equal(saved.safety.state, "safe");
+  assert.equal(saved.safety.checkpointId, "safe_usage_valid_workflow");
+  assert.deepEqual(store.usage.get(attempt.attemptId), settled);
+
+  assert.throws(() => store.attemptSafety.modelCallStarted({ ...settled, modelCalls: 3, estimatedCostUsd: null,
+    costStatus: "unknown", pricingVersion: null, updatedAt: "2026-10-01T00:00:04.000Z" }), StorageError);
+  assert.throws(() => store.attemptSafety.modelCallStarted({ ...settled, modelCalls: 2, inputTokens: 1, totalTokens: 1, estimatedCostUsd: null,
+    costStatus: "unknown", pricingVersion: null, updatedAt: "2026-10-01T00:00:04.000Z" }), StorageError);
+  assert.equal(store.attemptSafety.get(attempt.attemptId)?.state, "safe");
+  store.attemptSafety.modelCallStarted({ ...settled, modelCalls: 2, toolCalls: 1, estimatedCostUsd: null,
+    costStatus: "unknown", pricingVersion: null, updatedAt: "2026-10-01T00:00:04.000Z" });
+  assert.throws(() => store.attemptSafety.recordSettledUsage({ ...settled, modelCalls: 2, toolCalls: 0,
+    updatedAt: "2026-10-01T00:00:05.000Z" }), StorageError);
+  const secondSettled = { ...settled, modelCalls: 2, toolCalls: 1, inputTokens: 3, totalTokens: 3,
+    estimatedCostUsd: 0.25, updatedAt: "2026-10-01T00:00:05.000Z" };
+  store.attemptSafety.recordSettledUsage(secondSettled);
+  assert.deepEqual(store.usage.get(attempt.attemptId), secondSettled);
   store.close();
 }));
 
@@ -311,9 +385,15 @@ test("idempotency replays the same resource and rejects a changed request hash",
   const { run } = createBase(store);
   const key = { schemaVersion: 2 as const, scope: "local", endpoint: "POST /api/v2/runs", key: "dedupe-1", requestHash: run.requestHash };
   const result = { schemaVersion: 2 as const, resourceKind: "run" as const, resourceId: run.runId };
+  assert.equal(store.idempotency.lookup(key, result), undefined);
   assert.deepEqual(store.idempotency.resolve(key, result), { result, replayed: false });
   assert.deepEqual(store.idempotency.resolve(key, result), { result, replayed: true });
+  assert.deepEqual(store.idempotency.lookup(key, result), { result, replayed: true });
   assert.throws(() => store.idempotency.resolve({ ...key, requestHash: "b".repeat(64) }, result),
+    (error: unknown) => error instanceof StorageError && error.code === "conflict");
+  assert.throws(() => store.idempotency.lookup({ ...key, requestHash: "b".repeat(64) }, result),
+    (error: unknown) => error instanceof StorageError && error.code === "conflict");
+  assert.throws(() => store.idempotency.lookup(key, { ...result, resourceId: "run_other" }),
     (error: unknown) => error instanceof StorageError && error.code === "conflict");
   store.close();
 }));

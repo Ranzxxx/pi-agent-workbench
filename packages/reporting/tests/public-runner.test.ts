@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
@@ -309,6 +309,113 @@ test("continues from durable stage checkpoints with the same fixed snapshot and 
     assert.equal(faux.state.callCount, callCount, "idempotent replay must not call the model again");
     assert.equal(checkpointRows.length, checkpointCount, "idempotent replay must not duplicate stage checkpoints");
   } finally { controller.abort(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("reuses a completed publication across attempts without rebilling or rewriting artifacts", { timeout: 15000 }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-task017-publication-reuse-"));
+  const archive = fixtureArchive();
+  const fetcher: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url === "https://api.github.com/repos/sindresorhus/slugify") return response(JSON.stringify({ default_branch: "main" }), url);
+    if (url.endsWith("/commits/main")) return response(JSON.stringify({ sha, commit: { sha } }), url);
+    if (url.endsWith("/legacy.tar.gz/" + sha)) return response(archive.buffer.slice(archive.byteOffset, archive.byteOffset + archive.byteLength) as ArrayBuffer, url);
+    return new Response("", { status: 404 });
+  };
+  const faux = fauxProvider({ api: "publication-resume-test", provider: "publication-resume-test", models: [{ id: "test" }], tokenSize: { min: 8, max: 8 } });
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("list_files", {}), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("read_file", { path: "package.json" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("register_evidence", { id: "ev-license", path: "package.json", startLine: 3, endLine: 3, excerpt: "  \"license\": \"MIT\"" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage('{"status":"complete"}'),
+    fauxAssistantMessage(JSON.stringify({ title: "Publication recovery report", claims: [
+      { id: "license", kind: "fact", text: "The package declares the MIT license.", evidenceIds: ["ev-license"] },
+    ] })),
+  ]);
+  const checkpointRows: WorkflowCheckpointRecord[] = [];
+  const checkpointStore = {
+    list(runId: string) { return checkpointRows.filter((record) => record.runId === runId); },
+    create(record: WorkflowCheckpointRecord) { checkpointRows.push(record); return record; },
+  };
+  const common = {
+    repository: { url: "https://github.com/sindresorhus/slugify", ref: "main" },
+    cacheDirectory: path.join(root, "cache"), outputDirectory: path.join(root, "runs"),
+    workflowDirectory: path.join(root, "workflows", "run-publication-recovery"), checkpointStore,
+    credentials: new InMemoryCredentialStore(), provider: faux.provider, model: faux.getModel(),
+    budget: { timeoutMs: 5000, maxModelCalls: 6, maxToolCalls: 8, maxTokens: 32000, maxOutputTokens: 2000, maxCostUsd: 0.2 },
+    pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, fetch: fetcher,
+    runId: "run-publication-recovery",
+  };
+  try {
+    const first = await runPublicRepositoryAnalysis({ ...common, attemptId: "attempt-publication-one" });
+    assert.equal(first.status, "completed", JSON.stringify(first));
+    assert.equal(first.result.usage.modelCalls, 5);
+    assert.equal(checkpointRows.some((record) => record.phaseId === "publication" && record.status === "completed"), true);
+    const final = path.join(root, "runs", common.runId, "final");
+    const originalFiles = await Promise.all(["report.json", "report.md", "events.jsonl", "manifest.json"].map(async (name) => {
+      const filePath = path.join(final, name);
+      const [bytes, metadata] = await Promise.all([readFile(filePath), stat(filePath)]);
+      return [name, createHash("sha256").update(bytes).digest("hex"), metadata.ino, metadata.mtimeMs] as const;
+    }));
+    const callsBeforeResume = faux.state.callCount;
+
+    const resumed = await runPublicRepositoryAnalysis({ ...common, attemptId: "attempt-publication-two",
+      initialUsage: first.result.usage, initialUsageComplete: first.usageComplete });
+    assert.equal(resumed.status, "completed", JSON.stringify(resumed));
+    assert.equal(resumed.result.usage.modelCalls, 0, "a resumed attempt reports only work it performed");
+    assert.equal(faux.state.callCount, callsBeforeResume, "a publication-only recovery must not call the provider");
+    const resumedFiles = await Promise.all(originalFiles.map(async ([name]) => {
+      const filePath = path.join(final, name);
+      const [bytes, metadata] = await Promise.all([readFile(filePath), stat(filePath)]);
+      return [name, createHash("sha256").update(bytes).digest("hex"), metadata.ino, metadata.mtimeMs] as const;
+    }));
+    assert.deepEqual(resumedFiles, originalFiles, "recovery must preserve the original published bytes and files");
+    assert.deepEqual(resumed.artifacts, first.artifacts);
+    assert.equal(checkpointRows.filter((record) => record.phaseId === "publication" && record.status === "completed").length, 1);
+
+    faux.appendResponses([
+      fauxAssistantMessage('{"status":"complete"}'),
+      fauxAssistantMessage(JSON.stringify({ title: "Changed goal report", claims: [
+        { id: "different", kind: "unknown", text: "The requested value is not established.", reason: "No matching source evidence was found.", evidenceIds: [] },
+      ] })),
+    ]);
+    const changedGoal = await runPublicRepositoryAnalysis({ ...common, attemptId: "attempt-publication-three",
+      questions: [{ id: "different", question: "What is the release codename?" }],
+      initialUsage: first.result.usage, initialUsageComplete: first.usageComplete,
+      budget: { ...common.budget, maxModelCalls: 10 } });
+    assert.equal(changedGoal.status, "failed", "a valid old publication must not satisfy a changed analysis goal");
+    assert.match(changedGoal.result.status === "failed" ? changedGoal.result.error.message : "", /goal does not match/u);
+    assert.equal(faux.state.callCount, callsBeforeResume + 2, "the changed goal runs its own evidence and analysis calls before refusing reuse");
+    const afterChangedGoal = await Promise.all(originalFiles.map(async ([name]) => {
+      const filePath = path.join(final, name);
+      const [bytes, metadata] = await Promise.all([readFile(filePath), stat(filePath)]);
+      return [name, createHash("sha256").update(bytes).digest("hex"), metadata.ino, metadata.mtimeMs] as const;
+    }));
+    assert.deepEqual(afterChangedGoal, originalFiles, "refusing mismatched inputs must not rewrite the old publication");
+
+    const originalPublicationCheckpoint = checkpointRows.find((record) => record.phaseId === "publication" && record.status === "completed");
+    assert.ok(originalPublicationCheckpoint?.outputRef);
+    const checkpointOutputPath = path.join(root, "workflows", "run-publication-recovery", originalPublicationCheckpoint.outputRef);
+    const checkpointEnvelope = JSON.parse(await readFile(checkpointOutputPath, "utf8")) as Record<string, unknown>;
+    await writeFile(checkpointOutputPath, JSON.stringify({ ...checkpointEnvelope, payloadSha256: "0".repeat(64) }) + "\n");
+    const recoveredCorruptCheckpoint = await runPublicRepositoryAnalysis({ ...common, attemptId: "attempt-publication-four",
+      initialUsage: first.result.usage, initialUsageComplete: first.usageComplete });
+    assert.equal(recoveredCorruptCheckpoint.status, "completed", "a corrupt stage envelope may be recomputed from a verified final publication");
+    assert.equal(recoveredCorruptCheckpoint.result.usage.modelCalls, 0);
+    assert.equal(faux.state.callCount, callsBeforeResume + 2, "stage checkpoint recovery must not repeat provider calls");
+    const afterCheckpointRecovery = await Promise.all(originalFiles.map(async ([name]) => {
+      const filePath = path.join(final, name);
+      const [bytes, metadata] = await Promise.all([readFile(filePath), stat(filePath)]);
+      return [name, createHash("sha256").update(bytes).digest("hex"), metadata.ino, metadata.mtimeMs] as const;
+    }));
+    assert.deepEqual(afterCheckpointRecovery, originalFiles, "checkpoint recomputation must not rewrite the final publication");
+
+    const reportMarkdown = path.join(final, "report.md");
+    await writeFile(reportMarkdown, (await readFile(reportMarkdown)) + "corruption\n");
+    const corrupt = await runPublicRepositoryAnalysis({ ...common, attemptId: "attempt-publication-five",
+      initialUsage: first.result.usage, initialUsageComplete: first.usageComplete });
+    assert.equal(corrupt.status, "failed", "a final artifact that no longer matches its manifest must be rejected");
+    assert.match(corrupt.result.status === "failed" ? corrupt.result.error.message : "", /integrity validation/u);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("analysis requests a bounded evidence refresh and invalidates downstream inputs", { timeout: 15000 }, async () => {

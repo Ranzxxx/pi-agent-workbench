@@ -17,6 +17,7 @@ test("a request journals multiple edits and stores downloadable attachment resul
   await mkdir(projectRoot);
   await writeFile(path.join(projectRoot, "notes.txt"), "initial\n", "utf8");
   const store = openStorage({ dataDirectory: { dataDirectory } });
+  const collector = openStorage({ path: store.path });
   const projectStat = await lstat(projectRoot);
   store.projects.create({ id: "project_files", displayName: "Files", canonicalRoot: projectRoot, directoryIdentity: identity(projectStat), validationState: "valid" });
   store.conversations.create({ id: "conversation_files", projectId: "project_files", piSessionId: null, title: "Files" });
@@ -25,8 +26,22 @@ test("a request journals multiple edits and stores downloadable attachment resul
   const journal = createPersistedFileJournal({ storage: store, dataDirectory, changesetId: changeset.id });
   const files = createProjectFileAccess(projectRoot, identity(projectStat), journal);
   try {
+    const queuedPreimage = sha256(Buffer.from("initial\n"));
+    store.contentObjects.register({ sha256: queuedPreimage, byteSize: Buffer.byteLength("initial\n"), createdAt: new Date().toISOString() });
+    store.garbage.enqueue({ kind: "file_backup_object", objectRef: queuedPreimage });
+    const prepareReserved = store.fileOperations.prepareReserved.bind(store.fileOperations);
+    Object.defineProperty(store.fileOperations, "prepareReserved", {
+      configurable: true,
+      value: (...args: Parameters<typeof store.fileOperations.prepareReserved>) => {
+        assert.equal(collector.garbage.claim({ kind: "file_backup_object", objectRef: queuedPreimage }), false,
+          "a second SQLite connection must not claim an object while its journal reservation is active");
+        return prepareReserved(...args);
+      },
+    });
     const initial = await files.readFile("notes.txt");
     const middle = await files.editFile("notes.txt", initial.token, "middle\n");
+    assert.equal(collector.garbage.claim({ kind: "file_backup_object", objectRef: queuedPreimage }), false,
+      "the prepared file operation reference must replace the reservation before it is released");
     const final = await files.editFile("notes.txt", middle.token, "final\n");
     assert.equal(final.text, "final\n");
     const operations = store.fileOperations.list(changeset.id);
@@ -41,7 +56,7 @@ test("a request journals multiple edits and stores downloadable attachment resul
     assert.ok(saved);
     assert.equal((await readManagedObject(dataDirectory, "objects", saved!.objectSha256))?.toString("utf8"), "final\n");
     assert.equal((await readFile(path.join(projectRoot, "notes.txt"), "utf8")), "final\n");
-  } finally { store.close(); await rm(parent, { recursive: true, force: true }); }
+  } finally { collector.close(); store.close(); await rm(parent, { recursive: true, force: true }); }
 });
 
 test("restart recovery distinguishes expected postimage, preimage, and an external conflict", async () => {

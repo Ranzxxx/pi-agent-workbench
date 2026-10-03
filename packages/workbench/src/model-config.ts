@@ -24,6 +24,7 @@ export const DEEPSEEK_PRICING: Pricing = {
   cacheRead: 0.006,
   cacheWrite: 0,
 };
+export const FAKE_PRICING: Pricing = { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 export interface ModelConfiguration {
   credentials: CredentialStore;
@@ -82,7 +83,7 @@ function fakeConfigurationFromProvider(fake: ReturnType<typeof fauxProvider>, pr
     provider,
     model: fake.getModel(),
     credentials: new InMemoryCredentialStore(),
-    pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    pricing: FAKE_PRICING,
   };
 }
 
@@ -198,7 +199,7 @@ export async function createFakeRepositoryAnalysisConfiguration(repositoryRoot: 
     provider: fake.provider,
     model: fake.getModel(),
     credentials: new InMemoryCredentialStore(),
-    pricing: { version: "offline-zero", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as Pricing,
+    pricing: FAKE_PRICING,
     budget: { ...WORKBENCH_BUDGET, maxToolCalls: 8, maxModelCalls: 6, maxCostUsd: 1 },
     fetch: await createFakeSnapshotFetch({ repositoryRoot, sha }),
   };

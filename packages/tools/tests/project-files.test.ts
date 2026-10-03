@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, link, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -40,6 +41,39 @@ test("project files are confined to safe UTF-8 text and edits require the read v
     await files.removeCreatedFile("notes.md", created.token);
     assert.equal(await files.versionOf("notes.md"), null);
     assert.equal(calls.filter((call) => call.startsWith("prepare:")).length, 3);
+  } finally { await rm(parent, { recursive: true, force: true }); }
+});
+
+test("UTF-8 BOM stays in text roundtrips and file journal preimages remain byte exact", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "pi-project-files-bom-"));
+  const root = path.join(parent, "project");
+  await mkdir(root);
+  const original = Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from("before café\n", "utf8")]);
+  await writeFile(path.join(root, "bom.md"), original);
+  const prepared: Array<{ preHash: string | null; preimage: Buffer | null }> = [];
+  let next = 0;
+  const journal: ProjectFileJournal = {
+    async prepare(input) { prepared.push({ preHash: input.preHash, preimage: input.preimage }); next += 1; return { operationId: `operation_${next}`, changesetId: "changeset_bom" }; },
+    async applied() {}, async expectPostIdentity() {}, async failed() {},
+  };
+  const files = createProjectFileAccess(root, undefined, journal);
+  try {
+    const initial = await files.readFile("bom.md");
+    assert.equal(initial.text, "\uFEFFbefore café\n");
+    const noOp = await files.editFile("bom.md", initial.token, initial.text);
+    assert.equal(noOp.token, initial.token);
+    assert.deepEqual(await readFile(path.join(root, "bom.md")), original);
+    assert.equal(prepared.length, 0, "submitting the exact read text must not silently strip the BOM");
+
+    const edited = await files.editFile("bom.md", initial.token, "after café\n");
+    assert.equal(edited.text, "after café\n");
+    assert.deepEqual(prepared[0]?.preimage, original);
+    assert.equal(prepared[0]?.preHash, createHash("sha256").update(original).digest("hex"));
+    assert.deepEqual(await readFile(path.join(root, "bom.md")), Buffer.from("after café\n", "utf8"));
+
+    const created = await files.createFile("created.md", "\uFEFF新建\n");
+    assert.equal(created.text, "\uFEFF新建\n");
+    assert.deepEqual(await readFile(path.join(root, "created.md")), Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from("新建\n", "utf8")]));
   } finally { await rm(parent, { recursive: true, force: true }); }
 });
 

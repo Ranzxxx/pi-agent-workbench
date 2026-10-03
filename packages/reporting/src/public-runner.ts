@@ -64,6 +64,9 @@ export interface PublicAnalysisOptions {
   initialUsageComplete?: boolean;
   workflowDirectory?: string;
   checkpointStore?: WorkflowCheckpointStore;
+  /** Internal durable attempt accounting hooks; call-start persistence is synchronous before provider invocation. */
+  onModelCallStarted?: (usage: Usage) => void;
+  onUsageCheckpoint?: (usage: Usage, usageComplete: boolean) => void;
   githubToken?: string;
   fetch?: SnapshotOptions["fetch"];
   snapshotLimits?: SnapshotOptions["limits"];
@@ -79,6 +82,8 @@ export interface WorkflowCheckpointRecord {
 export interface WorkflowCheckpointStore {
   list(runId: string): WorkflowCheckpointRecord[] | Promise<WorkflowCheckpointRecord[]>;
   create(record: WorkflowCheckpointRecord): WorkflowCheckpointRecord | Promise<WorkflowCheckpointRecord>;
+  createSafe?(record: WorkflowCheckpointRecord, usage: Usage): WorkflowCheckpointRecord | Promise<WorkflowCheckpointRecord>;
+  adoptSafe?(record: WorkflowCheckpointRecord, usage: Usage): void | Promise<void>;
 }
 
 export interface PublicAnalysisSummary {
@@ -217,6 +222,17 @@ function reportMarkdown(report: Report): string {
   return lines.join("\n") + "\n";
 }
 
+function reportIdentitySha256(report: Report): string {
+  const { attemptId: _attemptId, ...logicalReport } = report;
+  return sha256(JSON.stringify(logicalReport));
+}
+
+function sameArtifacts(left: Artifact[], right: Artifact[]): boolean {
+  const order = (items: Artifact[]) => [...items].sort((a, b) =>
+    a.kind.localeCompare(b.kind) || a.path.localeCompare(b.path) || a.sha256.localeCompare(b.sha256));
+  return JSON.stringify(order(left)) === JSON.stringify(order(right));
+}
+
 async function artifact(directory: string, artifactPrefix: string, kind: Artifact["kind"]): Promise<Artifact> {
   const contents = await readFile(path.join(directory, kind));
   return { kind, path: artifactPrefix + "/" + kind, sha256: sha256(contents) };
@@ -342,7 +358,7 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
   const inputDigest = (value: unknown): string => sha256(JSON.stringify(value));
   const checkpoints = async (): Promise<WorkflowCheckpointRecord[]> => options.checkpointStore ? await options.checkpointStore.list(runId) : [];
 
-  async function readStageOutput<T>(phase: StageName, digest: string): Promise<{ found: boolean; value?: T }> {
+  async function readStageOutput<T>(phase: StageName, digest: string): Promise<{ found: boolean; value?: T; checkpoint?: WorkflowCheckpointRecord }> {
     const rows = await checkpoints();
     const matching = rows.filter((row) => row.phaseId === phase && row.inputSha256 === digest && row.status === "completed" && row.outputRef).reverse();
     for (const row of matching) {
@@ -355,7 +371,7 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
         const envelope = JSON.parse(await readFile(target, "utf8")) as StageEnvelope;
         if (envelope.formatVersion !== 1 || envelope.phase !== phase || envelope.inputSha256 !== digest ||
             envelope.payloadSha256 !== sha256(JSON.stringify(envelope.payload))) continue;
-        return { found: true, value: envelope.payload as T };
+        return { found: true, value: envelope.payload as T, checkpoint: row };
       } catch { /* Corrupt non-snapshot stages are recomputed from their immutable inputs. */ }
     }
     if (phase === "snapshot" && matching.length) throw new Error("The persisted fixed snapshot checkpoint is missing or corrupt; refusing to resolve a moving ref again");
@@ -376,14 +392,17 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
     const text = JSON.stringify(envelope) + "\n";
     const existing = await readFile(target, "utf8").catch(() => undefined);
     if (existing !== text) await writeAtomic(path.dirname(target), path.basename(target), text);
-    const record = await options.checkpointStore.create({
+    const checkpoint: WorkflowCheckpointRecord = {
       id: randomUUID(), runId, attemptId, phaseId: phase, inputSha256: digest, outputRef: reference,
       status: "completed", createdAt: new Date().toISOString(),
-    });
+    };
+    const record = options.checkpointStore.createSafe && usageComplete
+      ? await options.checkpointStore.createSafe(checkpoint, currentUsage)
+      : await options.checkpointStore.create(checkpoint);
     try { options.onWorkflowProgress?.({ type: "checkpoint_saved", data: { checkpointId: record.id, phase } }); } catch { /* Observer callbacks cannot break checkpoint persistence. */ }
   }
 
-  async function stage<T>(phase: StageName, input: unknown, work: () => Promise<T>, validate: (value: unknown) => T | Promise<T>): Promise<T> {
+  async function stage<T>(phase: StageName, input: unknown, work: () => Promise<T>, validate: (value: unknown, checkpoint?: WorkflowCheckpointRecord) => T | Promise<T>): Promise<T> {
     const digest = inputDigest({ phase, input });
     notifyProgress(phase, `Starting ${phase} stage.`);
     try {
@@ -391,8 +410,9 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
       const cached = await readStageOutput<T>(phase, digest);
       if (workflowSignal.aborted) throw new DOMException("Analysis cancelled", "AbortError");
       if (cached.found) {
-        const value = await validate(cached.value);
+        const value = await validate(cached.value, cached.checkpoint);
         if (workflowSignal.aborted) throw new DOMException("Analysis cancelled", "AbortError");
+        if (cached.checkpoint && usageComplete && options.checkpointStore?.adoptSafe) await options.checkpointStore.adoptSafe(cached.checkpoint, currentUsage);
         notifyProgress(phase, `Reusing ${phase} stage checkpoint.`);
         return value;
       }
@@ -420,11 +440,22 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
   async function modelStage(snapshot: SnapshotInfo, goal: string, prompt: string, tools: ReturnType<typeof createTools>, systemPrompt: string): Promise<{ result: RunResult; text: string }> {
     const remainingMs = Math.max(1, Math.floor(timeoutDeadline - performance.now()));
     let text = "";
+    const sessionUsageBase = structuredClone(currentUsage);
+    const addSessionUsage = (sessionUsage: Usage): Usage => {
+      const cumulative = structuredClone(sessionUsageBase);
+      addUsage(cumulative, sessionUsage);
+      return cumulative;
+    };
     const session = await createSession({
       cwd: snapshot.root, credentials: options.credentials, provider: options.provider, model: options.model,
       systemPrompt, tools, budget: { ...options.budget, timeoutMs: remainingMs }, pricing: options.pricing,
       runId, attemptId, initialUsage: priorAndCurrentUsage(), initialUsageComplete: usageComplete,
       onEvent: appendEvent,
+      onModelCallStarted(usage) { options.onModelCallStarted?.(addSessionUsage(usage)); },
+      onUsageCheckpoint(usage, complete) {
+        if (!complete) usageComplete = false;
+        options.onUsageCheckpoint?.(addSessionUsage(usage), complete);
+      },
       onRuntimeStatus(status) { try { options.onWorkflowProgress?.({ type: "runtime_status", data: status }); } catch { /* Observer callbacks cannot control compaction. */ } },
       finalize: async ({ text: responseText, signal }) => {
         if (signal.aborted) throw new Error("Analysis cancelled before stage output capture");
@@ -466,22 +497,30 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
     return { status: partial.result.status, result: partial.result, snapshot, directory: partial.artifacts.length ? path.join(root, runId, attemptId) : undefined, artifacts: partial.artifacts, usageComplete };
   }
 
-  async function validateExistingPublication(final: string, snapshot: SnapshotInfo): Promise<{ report: Report; artifacts: Artifact[]; terminalResult: RunResult } | undefined> {
+  async function validateExistingPublication(final: string, snapshot: SnapshotInfo, expectedGoal: string): Promise<{ report: Report; artifacts: Artifact[]; terminalResult: RunResult } | undefined> {
     const status = await lstat(final).catch(() => undefined);
     if (!status) return undefined;
     if (!status.isDirectory() || status.isSymbolicLink() || await realpath(final) !== final) throw new Error("Run publication path is not a safe directory");
     const manifestBytes = await readSafeRegularFile(final, "manifest.json");
     const manifest = parseManifest(JSON.parse(manifestBytes.toString("utf8")));
     if (manifest.runId !== runId || manifest.snapshotId !== snapshot.sha || manifest.status !== "completed") throw new Error("Existing run publication does not match the logical run key");
+    if (manifest.artifacts.length !== 3 || new Set(manifest.artifacts.map((item) => item.kind)).size !== 3 ||
+        !["report.json", "report.md", "events.jsonl"].every((kind) => manifest.artifacts.some((item) => item.kind === kind && item.path === kind))) {
+      throw new Error("Existing publication manifest does not contain the complete report artifact set");
+    }
     const report = parseReport(JSON.parse((await readSafeRegularFile(final, "report.json")).toString("utf8")));
     if (report.runId !== runId || report.attemptId !== manifest.attemptId || report.snapshotId !== snapshot.sha) throw new Error("Existing report identity does not match the fixed snapshot");
     const refs: Artifact[] = [];
     let terminalResult: RunResult | undefined;
+    let startedEvent: Extract<RunEvent, { type: "run.started" }> | undefined;
     for (const item of manifest.artifacts) {
       const bytes = await readSafeRegularFile(final, item.path);
       if (sha256(bytes) !== item.sha256) throw new Error("Existing run publication failed integrity validation");
       if (item.kind === "events.jsonl") {
         const archived = bytes.toString("utf8").trimEnd().split("\n").filter(Boolean).map((line) => parseEvent(JSON.parse(line)));
+        const starts = archived.filter((event): event is Extract<RunEvent, { type: "run.started" }> => event.type === "run.started");
+        if (starts.length !== 1 || archived[0] !== starts[0]) throw new Error("Existing publication has an ambiguous initial run input event");
+        startedEvent = starts[0];
         const terminal = archived.at(-1);
         if (!terminal || terminal.type !== "run.finished" || terminal.data.status !== "completed" || terminal.runId !== runId || terminal.attemptId !== manifest.attemptId) {
           throw new Error("Existing publication has no compatible terminal event");
@@ -491,6 +530,10 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
       refs.push({ kind: item.kind, path: `${runId}/final/${item.path}`, sha256: item.sha256 });
     }
     if (!terminalResult) throw new Error("Existing publication is missing its terminal event");
+    if (!startedEvent) throw new Error("Existing publication is missing its initial run input event");
+    if (startedEvent.runId !== runId || startedEvent.attemptId !== manifest.attemptId) throw new Error("Existing publication run input identity is invalid");
+    if (startedEvent.data.repository.url !== snapshot.canonicalUrl || startedEvent.data.repository.sha !== snapshot.sha) throw new Error("Existing publication repository input does not match the fixed snapshot");
+    if (startedEvent.data.goal !== expectedGoal) throw new Error("Existing publication goal does not match the current analysis goal");
     const artifacts = parseArtifacts([...refs, { kind: "manifest.json", path: `${runId}/final/manifest.json`, sha256: sha256(manifestBytes) }]);
     return { report, artifacts, terminalResult };
   }
@@ -580,7 +623,11 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
     const final = path.join(root, runId, "final");
     if (inside(snapshot.root, final) || inside(final, snapshot.root)) throw new Error("Output and snapshot paths must be separate");
     const reportText = JSON.stringify(report, null, 2) + "\n";
-    const previouslyPublished = await validateExistingPublication(final, snapshot);
+    const previouslyPublished = await validateExistingPublication(final, snapshot, goal);
+    const reportIdentity = reportIdentitySha256(report);
+    if (previouslyPublished && reportIdentitySha256(previouslyPublished.report) !== reportIdentity) {
+      throw new Error("Existing publication report does not match the current validated analysis");
+    }
     const reportDigest = previouslyPublished ? sha256(await readSafeRegularFile(final, "report.json")) : sha256(reportText);
     const publicationInput = { runId, snapshotSha: snapshot.sha, reportSha256: reportDigest };
     const publication = await stage<{ reportSha256: string; artifacts: Artifact[]; usage: Usage; usageAttemptId: string }>("publication", publicationInput, async () => {
@@ -612,19 +659,25 @@ export async function runPublicRepositoryAnalysis(options: PublicAnalysisOptions
           return { reportSha256: reportDigest, artifacts: [...core, { kind: "manifest.json", path: `${artifactPrefix}/manifest.json`, sha256: sha256(manifestText) }],
             usage: structuredClone(currentUsage), usageAttemptId: attemptId };
         } catch (error) { await rm(stageDirectory, { recursive: true, force: true }); throw error; }
-      }, (value) => {
+      }, async (value, checkpoint) => {
         if (typeof value !== "object" || value === null || (value as { reportSha256?: unknown }).reportSha256 !== reportDigest || !Array.isArray((value as { artifacts?: unknown }).artifacts)) {
           throw new Error("Publication checkpoint is invalid");
         }
         const candidate = value as { artifacts: unknown[]; usage?: unknown; usageAttemptId?: unknown };
-        if (candidate.usageAttemptId !== attemptId) throw new Error("Publication checkpoint usage identity mismatch");
-        const parsed = parseResult({ schemaVersion: 1, runId, attemptId, status: "completed", usage: candidate.usage,
+        const ownerAttemptId = checkpoint?.attemptId ?? attemptId;
+        if (!validId(ownerAttemptId) || candidate.usageAttemptId !== ownerAttemptId) throw new Error("Publication checkpoint usage identity mismatch");
+        const parsed = parseResult({ schemaVersion: 1, runId, attemptId: ownerAttemptId, status: "completed", usage: candidate.usage,
           endedAt: new Date().toISOString(), artifacts: candidate.artifacts });
         if (parsed.status !== "completed") throw new Error("Publication checkpoint result is not completed");
-        return { reportSha256: reportDigest, artifacts: parsed.artifacts, usage: parsed.usage, usageAttemptId: attemptId };
+        const verified = await validateExistingPublication(final, snapshot!, goal);
+        if (!verified || reportIdentitySha256(verified.report) !== reportIdentity || !sameArtifacts(parsed.artifacts, verified.artifacts)) {
+          throw new Error("Publication checkpoint does not match the verified final artifacts");
+        }
+        return { reportSha256: reportDigest, artifacts: verified.artifacts, usage: structuredClone(currentUsage), usageAttemptId: attemptId };
       });
-    const published = await validateExistingPublication(final, snapshot);
+    const published = await validateExistingPublication(final, snapshot, goal);
     if (!published) throw new Error("Completed publication is missing after its checkpoint");
+    if (reportIdentitySha256(published.report) !== reportIdentity) throw new Error("Final publication report changed after checkpoint validation");
     const result = parseResult({ schemaVersion: 1, runId, attemptId, status: "completed",
       usage: publication.usageAttemptId === attemptId ? publication.usage : currentUsage,
       endedAt: new Date().toISOString(), artifacts: published.artifacts });

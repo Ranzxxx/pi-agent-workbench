@@ -15,24 +15,58 @@ export interface AttachmentToolsAccess {
   saveTextResult(input: { fileName: string; text: string; sourceAttachmentId?: string }): Promise<unknown>;
 }
 
+const OUTPUT_LIMIT_BYTES = 60 * 1024;
+function isHighSurrogate(codeUnit: number): boolean { return codeUnit >= 0xd800 && codeUnit <= 0xdbff; }
+function isLowSurrogate(codeUnit: number): boolean { return codeUnit >= 0xdc00 && codeUnit <= 0xdfff; }
+function prefixLengthAtBoundary(text: string, requestedLength: number): number {
+  let length = Math.max(0, Math.min(text.length, requestedLength));
+  if (length > 0 && length < text.length && isHighSurrogate(text.charCodeAt(length - 1)) && isLowSurrogate(text.charCodeAt(length))) length--;
+  return length;
+}
+function assertPageBoundary(text: string, index: number): void {
+  if (index > 0 && index < text.length && isHighSurrogate(text.charCodeAt(index - 1)) && isLowSurrogate(text.charCodeAt(index))) {
+    throw new Error("分页游标不能位于 Unicode 字符内部。");
+  }
+}
+function pageEnd(text: string, start: number, maxChars: number): number {
+  let end = Math.min(text.length, start + maxChars);
+  if (end > start && end < text.length && isHighSurrogate(text.charCodeAt(end - 1)) && isLowSurrogate(text.charCodeAt(end))) {
+    end = end - start === 1 ? end + 1 : end - 1;
+  }
+  return end;
+}
+
 function output(value: unknown) {
-  let encoded = JSON.stringify(value);
-  if (Buffer.byteLength(encoded, "utf8") > 60 * 1024) {
+  let encoded = JSON.stringify(value) ?? "null";
+  if (Buffer.byteLength(encoded, "utf8") > OUTPUT_LIMIT_BYTES) {
     if (typeof value === "object" && value !== null && Array.isArray((value as { matches?: unknown }).matches)) {
       const source = value as { matches: unknown[]; [key: string]: unknown };
       let count = source.matches.length;
       do {
         count = Math.floor(count / 2);
         encoded = JSON.stringify({ ...source, matches: source.matches.slice(0, count), truncated: true, omittedMatches: source.matches.length - count });
-      } while (count > 0 && Buffer.byteLength(encoded, "utf8") > 60 * 1024);
+      } while (count > 0 && Buffer.byteLength(encoded, "utf8") > OUTPUT_LIMIT_BYTES);
     } else if (typeof value === "object" && value !== null && typeof (value as { text?: unknown }).text === "string") {
-      const source = value as { text: string; [key: string]: unknown };
+      const source = value as { text: string; startChar?: unknown; nextChar?: unknown; [key: string]: unknown };
+      const hasPageCursor = Number.isSafeInteger(source.startChar) && Number.isSafeInteger(source.nextChar) &&
+        (source.nextChar as number) - (source.startChar as number) === source.text.length;
       let length = source.text.length;
       do {
-        length = Math.floor(length / 2);
-        encoded = JSON.stringify({ ...source, text: source.text.slice(0, length), truncated: true });
-      } while (length > 0 && Buffer.byteLength(encoded, "utf8") > 60 * 1024);
-    } else encoded = JSON.stringify({ truncated: true, outputPreview: encoded.slice(0, 50_000) });
+        length = prefixLengthAtBoundary(source.text, Math.floor(length / 2));
+        const text = source.text.slice(0, length);
+        encoded = JSON.stringify({ ...source, text, ...(hasPageCursor ? { nextChar: (source.startChar as number) + text.length } : {}), truncated: true });
+      } while (length > 0 && Buffer.byteLength(encoded, "utf8") > OUTPUT_LIMIT_BYTES);
+    }
+    if (Buffer.byteLength(encoded, "utf8") > OUTPUT_LIMIT_BYTES) {
+      const original = encoded;
+      let previewLength = Math.min(original.length, 50_000);
+      do {
+        previewLength = prefixLengthAtBoundary(original, previewLength);
+        encoded = JSON.stringify({ truncated: true, outputPreview: original.slice(0, previewLength) });
+        if (Buffer.byteLength(encoded, "utf8") <= OUTPUT_LIMIT_BYTES) break;
+        previewLength = Math.floor(previewLength / 2);
+      } while (previewLength > 0);
+    }
   }
   return { content: [{ type: "text" as const, text: encoded }], details: {} };
 }
@@ -54,7 +88,8 @@ export function createProjectFileTools(project?: ProjectFileToolsAccess, attachm
       async execute(_id, args) {
         const file = await project.readFile(args.path);
         const start = Math.min(args.startChar ?? 0, file.text.length);
-        const end = Math.min(file.text.length, start + (args.maxChars ?? 24000));
+        assertPageBoundary(file.text, start);
+        const end = pageEnd(file.text, start, args.maxChars ?? 24000);
         return output({ ...file, text: file.text.slice(start, end), startChar: start, nextChar: end, truncated: end < file.text.length });
       },
     }));
