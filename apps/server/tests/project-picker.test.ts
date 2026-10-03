@@ -104,7 +104,7 @@ await test("picker binds directory grants to loopback session, imports immutable
   assert.equal((await session.request(`/projects/${opened.project.projectId}/rules`, { method: "DELETE" })).status, 200);
   assert.equal((await session.request(`/projects/${opened.project.projectId}/rules`).then((response) => response.json()) as { rules: unknown }).rules, null);
 
-  const plainConversation = await fetch(`${baseUrl}/api/v2/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }).then((response) => response.json()) as { conversationId: string };
+  const plainConversation = await session.request("/conversations", post({})).then((response) => response.json()) as { conversationId: string };
   const attachmentRoots = await session.request("/picker/roots?mode=attachment").then((response) => response.json()) as { roots: Array<{ token: string }> };
   const attachmentRoot = await session.request("/picker/browse", post({ schemaVersion: 2, mode: "attachment", directoryToken: attachmentRoots.roots[0]!.token }));
   const attachmentRootView = await attachmentRoot.json() as { entries: Array<{ name: string; kind: string; token?: string }> };
@@ -153,7 +153,7 @@ await test("picker binds directory grants to loopback session, imports immutable
   const retryListing = await session.request("/picker/browse", post({ schemaVersion: 2, mode: "attachment", directoryToken: attachmentNestedToken }));
   const retryEntries = await retryListing.json() as { entries: Array<{ name: string; token?: string }> };
   const retryToken = retryEntries.entries.find((entry) => entry.name === "retry.md")!.token!;
-  const retryConversation = await fetch(`${baseUrl}/api/v2/conversations`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }).then((response) => response.json()) as { conversationId: string };
+  const retryConversation = await session.request("/conversations", post({})).then((response) => response.json()) as { conversationId: string };
   const retryImport = await session.request(`/conversations/${retryConversation.conversationId}/attachments/import`, post({ schemaVersion: 2, fileTokens: [retryToken] }));
   assert.equal(retryImport.status, 200);
   const retryHash = createHash("sha256").update(retryContent).digest("hex");

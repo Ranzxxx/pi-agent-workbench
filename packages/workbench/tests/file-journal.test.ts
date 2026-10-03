@@ -90,3 +90,43 @@ test("restart recovery distinguishes expected postimage, preimage, and an extern
     }
   } finally { store.close(); await rm(parent, { recursive: true, force: true }); }
 });
+
+test("real committed writes with failed verification survive database reopen and recover without overwriting external edits", async (t) => {
+  const parent = await mkdtemp(path.join(tmpdir(), "pi-workbench-uncertain-"));
+  const projectRoot = path.join(parent, "project");
+  const dataDirectory = path.join(parent, "state");
+  await mkdir(projectRoot);
+  let store = openStorage({ dataDirectory: { dataDirectory } });
+  t.after(async () => { store.close(); await rm(parent, { recursive: true, force: true }); });
+  const rootIdentity = identity(await lstat(projectRoot));
+  store.projects.create({ id: "project_uncertain", displayName: "Uncertain", canonicalRoot: projectRoot, directoryIdentity: rootIdentity, validationState: "valid" });
+  store.conversations.create({ id: "conversation_uncertain", projectId: "project_uncertain", piSessionId: null, title: "Uncertain" });
+  for (const scenario of ["create", "replace", "external"] as const) {
+    const runId = `run_${scenario}`;
+    const name = `${scenario}.txt`;
+    store.runs.create({ runId, conversationId: "conversation_uncertain", request: { kind: "message", text: "edit" } });
+    const changeset = store.fileChangesets.ensureForRun({ id: `changeset_${scenario}`, conversationId: "conversation_uncertain", projectId: "project_uncertain", runId });
+    const journal = createPersistedFileJournal({ storage: store, dataDirectory, changesetId: changeset.id });
+    const files = createProjectFileAccess(projectRoot, rootIdentity, journal);
+    if (scenario === "replace") await writeFile(path.join(projectRoot, name), "before");
+    const before = scenario === "replace" ? await files.readFile(name) : undefined;
+    const realRead = files.readFile.bind(files);
+    const mock = t.mock.method(files, "readFile", async (relativePath: string) => {
+      const result = await realRead(relativePath);
+      if (result.text === "after") throw Object.assign(new Error("read failed after commit"), { code: "io_error" });
+      return result;
+    });
+    await assert.rejects(before ? files.editFile(name, before.token, "after") : files.createFile(name, "after"), /read failed after commit/u);
+    mock.mock.restore();
+    assert.equal(store.fileOperations.list(changeset.id)[0]?.status, "uncertain");
+    assert.equal(await readFile(path.join(projectRoot, name), "utf8"), "after");
+    if (scenario === "external") await writeFile(path.join(projectRoot, name), "external user content");
+  }
+  store.close();
+  store = openStorage({ dataDirectory: { dataDirectory } });
+  await recoverPreparedFileOperations(store);
+  for (const scenario of ["create", "replace", "external"]) {
+    assert.equal(store.fileOperations.list(`changeset_${scenario}`)[0]?.status, scenario === "external" ? "conflict" : "applied");
+    assert.equal(await readFile(path.join(projectRoot, `${scenario}.txt`), "utf8"), scenario === "external" ? "external user content" : "after");
+  }
+});
