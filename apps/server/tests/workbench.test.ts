@@ -392,7 +392,7 @@ await test("API restart detects Worker exit, marks run interrupted and only cont
   assert.equal((await fetchRun(baseUrl, run.runId)).status, "cancelled");
 });
 
-await test("terminal result rollback preserves the settled conversation checkpoint", { timeout: 30_000 }, async (t) => {
+await test("terminal result rollback recovers the durable reply without another provider call", { timeout: 30_000 }, async (t) => {
   const root = await temporaryRoot();
   let { app, baseUrl } = await createApp(root);
   t.after(async () => { await app.close().catch(() => undefined); await rm(root, { recursive: true, force: true }); });
@@ -420,6 +420,7 @@ await test("terminal result rollback preserves the settled conversation checkpoi
   assert.equal(store.attemptSafety.get(attempt!.attemptId)?.snapshotId, safeSnapshot.id);
   const settledUsage = store.usage.get(attempt!.attemptId);
   assert.ok(settledUsage?.modelCalls && settledUsage.modelCalls > 0);
+  assert.equal(store.completedConversationResults.get(attempt!.attemptId)?.result.status, "completed");
   assert.equal(attempt?.usageComplete, false, "the still-running attempt has not committed terminal usage completion");
   assert.equal(store.activeSlot.get().runId, run.runId);
   store.close();
@@ -429,16 +430,26 @@ await test("terminal result rollback preserves the settled conversation checkpoi
   ({ app, baseUrl } = await createApp(root));
   assert.equal(await waitForWorker(baseUrl), true);
   assert.equal((await fetchRun(baseUrl, run.runId)).status, "interrupted");
-  const rejectedContinue = await localFetch(`${baseUrl}/api/v2/runs/${run.runId}/continue`, {
-    method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: "{}",
+  const continueKey = crypto.randomUUID();
+  const recoveredContinue = await localFetch(`${baseUrl}/api/v2/runs/${run.runId}/continue`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": continueKey }, body: "{}",
   });
-  assert.equal(rejectedContinue.status, 409);
-  assert.match((await rejectedContinue.json() as { message: string }).message, /完整对话回复的用量已结算/u);
+  assert.equal(recoveredContinue.status, 202);
+  assert.equal((await recoveredContinue.json() as V2Run).status, "completed");
+  const repeated = await localFetch(`${baseUrl}/api/v2/runs/${run.runId}/continue`, {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": continueKey }, body: "{}",
+  });
+  assert.equal(repeated.status, 200);
   const recovered = openStorage({ dataDirectory: { dataDirectory: root } });
   assert.equal(recovered.snapshots.latest(conversation.conversationId)?.id, safeSnapshot.id);
-  assert.equal(recovered.results.get(run.runId), undefined);
-  assert.equal(recovered.attempts.list(run.runId).length, 1, "a settled conversation checkpoint cannot create a retry attempt");
-  assert.deepEqual(recovered.usage.get(attempt!.attemptId), settledUsage, "rejection must not invoke the provider or alter settled usage");
+  assert.equal((recovered.results.get(run.runId) as { result: { status: string } }).result.status, "completed");
+  assert.equal(recovered.messages.list(conversation.conversationId).length, 2);
+  assert.equal(recovered.attempts.list(run.runId).length, 1, "recovery must not create a second provider attempt");
+  assert.equal(recovered.attempts.get(attempt!.attemptId)?.status, "completed");
+  assert.equal(recovered.attempts.get(attempt!.attemptId)?.usageComplete, true);
+  const terminalEvents = recovered.events.after({ schemaVersion: 2, runId: run.runId, afterSequence: 0 }).events;
+  assert.equal(terminalEvents.filter((event) => event.type === "run.completed").length, 1);
+  assert.deepEqual(recovered.usage.get(attempt!.attemptId), settledUsage, "recovery must reuse settled usage without another provider call");
   recovered.close();
 });
 

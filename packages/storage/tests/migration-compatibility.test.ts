@@ -40,7 +40,7 @@ for (const version of [4, 5]) {
       assert.throws(() => openStorage({ path, readOnly: true }), StorageSchemaError);
 
       const store = openStorage({ path });
-      assert.equal(store.diagnostics.schemaVersion, 8);
+      assert.equal(store.diagnostics.schemaVersion, 9);
       assert.equal(store.projects.list().length, 1);
       assert.equal(store.messages.list("conversation")[0]?.content, "Preserved message");
       const operation = store.fileOperations.list("changeset")[0]!;
@@ -53,7 +53,7 @@ for (const version of [4, 5]) {
       try {
         assert.deepEqual(verify.prepare("SELECT applied_at FROM schema_migrations WHERE version = 4").get(), appliedAt);
         assert.equal(verify.prepare("SELECT checksum FROM schema_migrations WHERE version = 4").get()?.checksum, migrationChecksum(loadCoreMigrations()[3]!.sql));
-        assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count, 8);
+        assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()?.count, 9);
         assert.throws(() => verify.prepare("UPDATE file_operations SET result_sha256 = ? WHERE id = 'operation'").run("b".repeat(64)), /FOREIGN KEY/);
         assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
       } finally { verify.close(); }
@@ -79,7 +79,7 @@ test("schema 6 upgrades to managed object reservations without changing existing
     db.close();
 
     const store = openStorage({ path });
-    assert.equal(store.diagnostics.schemaVersion, 8);
+    assert.equal(store.diagnostics.schemaVersion, 9);
     assert.equal(store.contentObjects.totalBytes(), 9);
     assert.equal(store.attachments.totalBytes(), 11);
     assert.deepEqual(store.managedObjects.list(), []);
@@ -89,8 +89,8 @@ test("schema 6 upgrades to managed object reservations without changing existing
     const verify = new DatabaseSync(path, { readOnly: true });
     try {
       const latest = verify.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all().at(-1) as { version: number; name: string };
-      assert.equal(latest.version, 8);
-      assert.equal(latest.name, "attempt_usage_safety");
+      assert.equal(latest.version, 9);
+      assert.equal(latest.name, "recovery_and_deletion_cleanup");
       assert.equal(verify.prepare("SELECT status FROM file_object_garbage WHERE sha256=?").get(contentHash)?.status, "deleting");
       assert.equal(verify.prepare("SELECT status FROM garbage_queue WHERE object_ref='legacy_claim'").get()?.status, "deleting");
       assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
@@ -118,7 +118,7 @@ test("schema 7 upgrade defaults old attempts to unknown and attempt safety prese
     db.close();
 
     let store = openStorage({ path });
-    assert.equal(store.diagnostics.schemaVersion, 8);
+    assert.equal(store.diagnostics.schemaVersion, 9);
     assert.deepEqual(store.attemptSafety.get("legacy_attempt"), {
       attemptId: "legacy_attempt", state: "unknown", checkpointKind: null,
       checkpointId: null, snapshotId: null, updatedAt: at,
@@ -131,6 +131,31 @@ test("schema 7 upgrade defaults old attempts to unknown and attempt safety prese
     assert.equal(store.snapshots.latest("legacy_conversation"), undefined);
     store.close();
     openStorage({ path }).close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("schema 8 upgrades to recovery and deletion tracking without changing existing attempts", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-task018-migration-"));
+  const path = join(root, "workbench.sqlite");
+  try {
+    const db = new DatabaseSync(path);
+    applyMigrations(db, loadCoreMigrations().slice(0, 8));
+    db.exec(`INSERT INTO conversations(id, project_id, pi_session_id, title, status, created_at, updated_at)
+      VALUES ('existing_conversation', NULL, NULL, 'Retained', 'active', '${at}', '${at}');
+      INSERT INTO runs(id, conversation_id, project_id, extension_id, status, request_hash, request_json, retry_of_run_id, created_at, updated_at, ended_at)
+      VALUES ('existing_run', 'existing_conversation', NULL, NULL, 'interrupted', '${"d".repeat(64)}', '{"kind":"message","text":"retained"}', NULL, '${at}', '${at}', '${at}');
+      INSERT INTO run_attempts(id, run_id, attempt_number, status, usage_complete, worker_boot_id, started_at, ended_at, error_json)
+      VALUES ('existing_attempt', 'existing_run', 1, 'interrupted', 0, NULL, '${at}', '${at}', NULL);`);
+    db.close();
+    const store = openStorage({ path });
+    assert.equal(store.diagnostics.schemaVersion, 9);
+    assert.equal(store.conversations.get("existing_conversation")?.title, "Retained");
+    assert.equal(store.attempts.get("existing_attempt")?.status, "interrupted");
+    assert.equal(store.completedConversationResults.get("existing_attempt"), undefined);
+    assert.deepEqual(store.deletionCleanup.list(), []);
+    store.close();
+    openStorage({ path }).close();
+    openStorage({ path, readOnly: true }).close();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

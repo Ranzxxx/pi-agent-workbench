@@ -55,6 +55,12 @@ function makeError(code: WorkbenchError["code"], message: string, statusCode: nu
 }
 function now(): string { return new Date().toISOString(); }
 function hash(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
+function stableHash(value: unknown): string {
+  const normalized = (item: unknown): unknown => Array.isArray(item) ? item.map(normalized)
+    : item && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => [key, normalized(nested)])) : item;
+  return hash(normalized(value));
+}
 function terminal(status: V2RunStatus): boolean { return ["completed", "failed", "cancelled", "interrupted"].includes(status); }
 function extensionPrompt(input: Extract<V2RunSubmission, { kind: "capability" }>): string {
   return input.prompt ?? (typeof input.input.goal === "string" ? input.input.goal : "");
@@ -487,7 +493,15 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
           !Array.isArray(snapshot.entries) || (snapshot.leafId !== null && !snapshot.entries.some((entry) => entry.id === snapshot.leafId))) {
           throw makeError("conflict", "Worker did not return a compatible completed session snapshot.", 409);
         }
-        storage.snapshots.save({ id: randomUUID(), conversationId: record.conversationId, sdkVersion: snapshot.sdkVersion,
+        const safety = storage.attemptSafety.get(attempt.attemptId);
+        if (parse(V2RunSubmissionSchema, record.request).kind === "message" && safety?.state === "safe" && safety.checkpointKind === "conversation_turn") {
+          const saved = storage.completedConversationResults.get(attempt.attemptId);
+          if (!saved || stableHash(saved.result) !== stableHash(result) || stableHash(saved.snapshot) !== stableHash(snapshot) ||
+              !task.usage || stableHash(saved.usage) !== stableHash(task.usage) || locations.length !== 0 ||
+              storage.snapshots.latest(record.conversationId)?.id !== saved.snapshotId) {
+            throw makeError("conflict", "Worker result is not identical to its durable conversation checkpoint.", 409);
+          }
+        } else storage.snapshots.save({ id: randomUUID(), conversationId: record.conversationId, sdkVersion: snapshot.sdkVersion,
           formatVersion: snapshot.formatVersion, snapshot: snapshot as unknown as JsonValue, summary: null, createdAt: terminalAt });
         storage.conversations.update(record.conversationId, { piSessionId: snapshot.sessionId, updatedAt: terminalAt });
         storage.messages.append({ id: randomUUID(), conversationId: record.conversationId, runId, role: "assistant", content: result.reply, source: "agent", extensionId: null, createdAt: terminalAt });
@@ -731,10 +745,25 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
   function listConversationV2(): V2ConversationSummary[] {
     return storage.conversations.list().map((item) => v2Summary(item.id));
   }
-  function deleteConversation(conversationId: string): void {
+  function deleteConversation(conversationId: string) {
     if (fileMutationActive) throw makeError("active_task", "当前正在撤销文件修改，暂不能删除对话。", 409);
-    try { storage.conversations.deletePermanently(conversationId); void picker.flushGarbage().catch(() => undefined); }
+    try {
+      storage.conversations.deletePermanently(conversationId);
+      const cleanup = storage.deletionCleanup.get(conversationId)!;
+      void picker.flushGarbage(cleanup.items.map((item) => ({ kind: item.kind, objectRef: item.objectRef, attempts: item.attempts }))).catch(() => undefined);
+      return cleanup;
+    }
     catch (error) { translateError(error); }
+  }
+  function listDeletionCleanup() { return storage.deletionCleanup.list(); }
+  async function retryDeletionCleanup(conversationId: string) {
+    const cleanup = storage.deletionCleanup.get(conversationId);
+    if (!cleanup) throw makeError("not_found", "Deleted conversation cleanup was not found.", 404);
+    try {
+      await picker.flushGarbage(cleanup.items.filter((item) => item.status !== "completed")
+        .map((item) => ({ kind: item.kind, objectRef: item.objectRef, attempts: item.attempts })));
+      return storage.deletionCleanup.get(conversationId)!;
+    } catch (error) { translateError(error); }
   }
   function listRunsV2(conversationId: string): V2Run[] {
     getConversationRecord(conversationId);
@@ -765,7 +794,14 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     const previousAttempt = storage.attempts.list(runId).at(-1);
     const safety = previousAttempt ? storage.attemptSafety.get(previousAttempt.attemptId) : undefined;
     if (safety?.state === "safe" && safety.checkpointKind === "conversation_turn") {
-      throw makeError("conflict", "完整对话回复的用量已结算，但最终结果尚未确认；为避免重复提交原请求，暂不支持继续此运行。", 409);
+      if (workerUnavailable || !worker?.isAlive) throw makeError("worker_unavailable", "The Worker is not confirmed ready.", 503, true);
+      try {
+        const recovered = storage.completedConversationResults.recover(previousAttempt!.attemptId, {
+          schemaVersion: 2, scope: runId, endpoint: "POST /api/v2/runs/:id/continue", key, requestHash: inputHash,
+        });
+        for (const event of recovered.events) publish(runId, event);
+        return { run: v2Run(runId), replayed: recovered.replayed };
+      } catch (error) { translateError(error); }
     }
     if (fileMutationActive) throw makeError("active_task", "当前正在撤销文件修改，暂不能继续任务。", 409);
     if (workerUnavailable || !worker?.isAlive) throw makeError("worker_unavailable", "The Worker is not confirmed ready.", 503, true);
@@ -1086,6 +1122,8 @@ export async function createWorkbenchService(options: WorkbenchServiceOptions) {
     listConversationV2,
     getConversationV2: v2Conversation,
     deleteConversationV2: deleteConversation,
+    listDeletionCleanup,
+    retryDeletionCleanup,
     listRunsV2,
     getRunV2,
     submitV2,

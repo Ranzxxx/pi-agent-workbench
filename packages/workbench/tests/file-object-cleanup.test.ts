@@ -84,10 +84,12 @@ test("permanent conversation deletion removes run and workflow trees but preserv
     }
 
     storage.conversations.deletePermanently(deletedConversation.id);
+    assert.equal(storage.deletionCleanup.get(deletedConversation.id)?.status, "queued");
     assert.equal(storage.conversations.get(deletedConversation.id), undefined);
     assert.equal(storage.runs.get(deletedRun.runId), undefined);
     assert.ok(storage.garbage.list().some((item) => item.kind === "run_artifacts" && item.objectRef === deletedRun.runId));
     await picker.flushGarbage();
+    assert.equal(storage.deletionCleanup.get(deletedConversation.id)?.status, "completed");
 
     await assert.rejects(readFile(runArtifact), { code: "ENOENT" });
     await assert.rejects(readFile(workflowArtifact), { code: "ENOENT" });
@@ -130,6 +132,7 @@ test("run artifact cleanup records unsafe targets and retries after the path is 
     await symlink(outside, unsafeWorkflowTarget);
 
     storage.conversations.deletePermanently(conversation.id);
+    assert.equal(storage.deletionCleanup.get(conversation.id)?.status, "queued");
     assert.equal(storage.conversations.get(conversation.id), undefined);
     assert.equal(storage.runs.get(run.runId), undefined);
     await picker.flushGarbage();
@@ -137,6 +140,10 @@ test("run artifact cleanup records unsafe targets and retries after the path is 
     const failedQueueItem = storage.garbage.list().find((item) => item.kind === "run_artifacts" && item.objectRef === run.runId);
     assert.deepEqual(failedQueueItem, { kind: "run_artifacts", objectRef: run.runId, attempts: 1 },
       "database deletion must remain visible as a pending disk-cleanup failure");
+    assert.equal(storage.deletionCleanup.get(conversation.id)?.status, "failed");
+    const reopened = openStorage({ dataDirectory: { dataDirectory } });
+    try { assert.equal(reopened.deletionCleanup.get(conversation.id)?.items[0]?.attempts, 1); }
+    finally { reopened.close(); }
     assert.equal(await readFile(runArtifact, "utf8"), "preserve until both artifact paths validate");
     assert.equal(await readFile(outsideMarker, "utf8"), "outside data");
 
@@ -160,6 +167,7 @@ test("run artifact cleanup records unsafe targets and retries after the path is 
     await assert.rejects(readFile(workflowArtifact), { code: "ENOENT" });
     assert.equal(await readFile(outsideMarker, "utf8"), "outside data");
     assert.equal(storage.garbage.list().some((item) => item.kind === "run_artifacts" && item.objectRef === run.runId), false);
+    assert.deepEqual(storage.deletionCleanup.get(conversation.id)?.items.map((item) => [item.status, item.attempts]), [["completed", 2]]);
   } finally {
     storage.close();
     await rm(parent, { recursive: true, force: true });

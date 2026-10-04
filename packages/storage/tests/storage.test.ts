@@ -36,11 +36,11 @@ test("stable data directory honors override, XDG, and home fallback", () => {
 
 test("new database migrates to WAL/FULL with foreign keys, and repeated open preserves schema", () => withDb((_root, path) => {
   const first = openStorage({ path });
-  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 8 });
+  assert.deepEqual(first.diagnostics, { journalMode: "wal", synchronous: 2, foreignKeys: true, busyTimeoutMs: 100, schemaVersion: 9 });
   assert.equal(first.projects.list().length, 0);
   first.close();
   const reopened = openStorage({ path });
-  assert.equal(reopened.diagnostics.schemaVersion, 8);
+  assert.equal(reopened.diagnostics.schemaVersion, 9);
   assert.equal(reopened.projects.list().length, 0);
   reopened.close();
 }));
@@ -204,6 +204,53 @@ test("safe checkpoints require the exact attempt usage already settled in durabl
   assert.deepEqual(store.usage.get(attempt.attemptId), secondSettled);
   store.close();
 }));
+
+for (const corrupted of ["result", "snapshot", "usage", "request"] as const) {
+  test(`completed conversation recovery rejects corrupted ${corrupted} without committing an assistant message`, () => withDb((_root, path) => {
+    const store = openStorage({ path });
+    const conversationId = `conversation_recovery_${corrupted}`;
+    const runId = `run_recovery_${corrupted}`;
+    const attemptId = `attempt_recovery_${corrupted}`;
+    store.conversations.create({ id: conversationId, projectId: null, piSessionId: null, title: "Recovery fixture" });
+    store.runs.create({ runId, conversationId, request: { kind: "message", text: "restore this reply" } });
+    store.attempts.create({ attemptId, runId, startedAt: at });
+    const zero = { attemptId, modelId: null, modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0,
+      cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0, estimatedCostUsd: 0, costStatus: "estimate" as const,
+      pricingVersion: "fake-v1", updatedAt: at };
+    store.attemptSafety.initializeBeforeCall(zero);
+    store.attemptSafety.modelCallStarted({ ...zero, modelCalls: 1, estimatedCostUsd: null, costStatus: "unknown", pricingVersion: null });
+    const settled = { ...zero, modelCalls: 1, inputTokens: 2, outputTokens: 3, totalTokens: 5 };
+    store.attemptSafety.recordSettledUsage(settled);
+    const snapshot = { formatVersion: "pi-session-v3", sdkVersion: "0.86.1", sessionId: "session_recovery",
+      header: { id: "session_recovery", type: "session", cwd: process.cwd() }, entries: [], leafId: null };
+    store.attemptSafety.saveConversationCheckpoint({ attemptId, conversationId,
+      snapshot: { id: `snapshot_recovery_${corrupted}`, conversationId, sdkVersion: "0.86.1", formatVersion: "pi-session-v3",
+        snapshot, summary: null, createdAt: at }, usage: settled });
+    store.completedConversationResults.save({ attemptId, runId,
+      result: { schemaVersion: 1, status: "completed", runId, conversationId, endedAt: at, reply: "saved reply" },
+      snapshot, usage: { modelCalls: 1, toolCalls: 0, inputTokens: 2, outputTokens: 3, cacheReadTokens: 0,
+        cacheWriteTokens: 0, totalTokens: 5, estimatedCostUsd: 0, pricingVersion: "fake-v1" } });
+    const interruptedAt = new Date().toISOString();
+    store.attempts.finish(attemptId, "interrupted", interruptedAt, undefined, true);
+    store.runs.updateStatus(runId, "interrupted", interruptedAt, interruptedAt);
+    const raw = new DatabaseSync(path);
+    if (corrupted === "result") raw.prepare("UPDATE completed_conversation_results SET result_json = ? WHERE attempt_id = ?")
+      .run('{"status":"completed","reply":"tampered"}', attemptId);
+    else if (corrupted === "snapshot") raw.prepare("UPDATE session_snapshots SET snapshot_json = ? WHERE id = ?")
+      .run('{"sessionId":"other"}', `snapshot_recovery_${corrupted}`);
+    else if (corrupted === "usage") raw.prepare("UPDATE usage_records SET input_tokens = input_tokens + 1, total_tokens = total_tokens + 1 WHERE attempt_id = ?").run(attemptId);
+    else raw.prepare("UPDATE runs SET request_json = ? WHERE id = ?").run('{"kind":"message","text":"changed"}', runId);
+    raw.close();
+    assert.throws(() => store.completedConversationResults.recover(attemptId, {
+      schemaVersion: 2, scope: runId, endpoint: "POST /api/v2/runs/:id/continue", key: `resume_${corrupted}`, requestHash: hash,
+    }), StorageError);
+    assert.equal(store.runs.get(runId)?.status, "interrupted");
+    assert.equal(store.attempts.list(runId).length, 1);
+    assert.deepEqual(store.messages.list(conversationId), []);
+    assert.equal(store.results.get(runId), undefined);
+    store.close();
+  }));
+}
 
 test("migration failure rolls back schema and data, and unknown newer schema is not modified", () => {
   const db = new DatabaseSync(":memory:");
