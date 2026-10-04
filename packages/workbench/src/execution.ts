@@ -181,7 +181,7 @@ export async function composeToolsExtensionSet(
   return { tools: [...baseTools, ...extensionTools], toolCalls };
 }
 
-export async function executeWorkerTask(options: WorkerExecutionOptions): Promise<WorkerExecutionResult> {
+async function executeWorkerTaskInternal(options: WorkerExecutionOptions): Promise<WorkerExecutionResult> {
   const artifacts: Array<{ kind: string; path: string; sha256: string }> = [];
   const makeChat = async () => options.mode === "online" ? createOnlineConfiguration(options.apiKey ?? "") : createFakeChatConfiguration();
   const persistSession = async (context: string) => {
@@ -339,4 +339,26 @@ export async function executeWorkerTask(options: WorkerExecutionOptions): Promis
     if (options.signal.aborted) return { result: cancelled(options, "user"), artifacts };
     return { result: failure(options, error instanceof SnapshotError ? error.code : "runtime_error", error instanceof SnapshotError ? error.message : "运行失败；请检查服务端日志。未保留原始模型响应或凭据。"), artifacts };
   }
+}
+
+export async function executeWorkerTask(options: WorkerExecutionOptions): Promise<WorkerExecutionResult> {
+  let finalSnapshot: ConversationSessionSnapshot | undefined;
+  const completed = await executeWorkerTaskInternal({ ...options, saveSnapshot: async (snapshot) => {
+    await options.saveSnapshot(snapshot);
+    finalSnapshot = snapshot;
+  } });
+  if (options.input.kind === "message" && completed.result.status === "completed") {
+    const store = openStorage({ dataDirectory: { dataDirectory: path.resolve(options.dataDirectory) } });
+    try {
+      const safety = store.attemptSafety.get(options.attemptId);
+      if (safety?.state === "safe" && safety.checkpointKind === "conversation_turn") {
+        if (!finalSnapshot || !completed.usage || completed.usageComplete === false) {
+          throw new Error("Completed conversation result is missing its safe checkpoint");
+        }
+        store.completedConversationResults.save({ attemptId: options.attemptId, runId: options.runId,
+          result: completed.result, snapshot: JSON.parse(JSON.stringify(finalSnapshot)) as JsonValue, usage: completed.usage });
+      }
+    } finally { store.close(); }
+  }
+  return completed;
 }

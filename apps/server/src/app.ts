@@ -260,8 +260,16 @@ export async function createWorkbenchApp(options: WorkbenchServiceOptions): Prom
   app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId", async (request) => service.getConversationV2(request.params.conversationId));
   app.delete<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId", async (request) => {
     requirePickerSession(request, true);
-    service.deleteConversationV2(request.params.conversationId);
-    return { schemaVersion: 2, deleted: true, conversationId: request.params.conversationId };
+    const cleanup = service.deleteConversationV2(request.params.conversationId);
+    return { schemaVersion: 2, deleted: true, conversationId: request.params.conversationId, cleanup };
+  });
+  app.get("/api/v2/deletions", async (request) => {
+    requirePickerSession(request);
+    return { schemaVersion: 2, deletions: service.listDeletionCleanup() };
+  });
+  app.post<{ Params: { conversationId: string } }>("/api/v2/deletions/:conversationId/retry", async (request) => {
+    requirePickerSession(request, true);
+    return { schemaVersion: 2, cleanup: await service.retryDeletionCleanup(request.params.conversationId) };
   });
   app.get<{ Params: { conversationId: string } }>("/api/v2/conversations/:conversationId/changesets", async (request) => {
     requirePickerSession(request);

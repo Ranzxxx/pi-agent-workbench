@@ -30,6 +30,7 @@ export function loadCoreMigrations(): readonly StorageMigration[] {
   const capabilityStates = readFileSync(new URL("./migrations/006_capability_states.sql", import.meta.url), "utf8");
   const managedObjectReservations = readFileSync(new URL("./migrations/007_managed_object_reservations.sql", import.meta.url), "utf8");
   const attemptUsageSafety = readFileSync(new URL("./migrations/008_attempt_usage_safety.sql", import.meta.url), "utf8");
+  const recoveryAndDeletionCleanup = readFileSync(new URL("./migrations/009_recovery_and_deletion_cleanup.sql", import.meta.url), "utf8");
   return [
     { version: 1, name: "core", sql: core },
     { version: 2, name: "worker_recovery", sql: worker },
@@ -39,6 +40,7 @@ export function loadCoreMigrations(): readonly StorageMigration[] {
     { version: 6, name: "capability_states", sql: capabilityStates },
     { version: 7, name: "managed_object_reservations", sql: managedObjectReservations },
     { version: 8, name: "attempt_usage_safety", sql: attemptUsageSafety },
+    { version: 9, name: "recovery_and_deletion_cleanup", sql: recoveryAndDeletionCleanup },
   ];
 }
 

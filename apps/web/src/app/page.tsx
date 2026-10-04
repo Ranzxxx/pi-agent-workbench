@@ -22,6 +22,8 @@ type PickerDirectory = { schemaVersion: 2; directoryToken: string; parentToken?:
 type PickerRoot = { label: string; token: string };
 type LocalAttachment = { schemaVersion: 2; attachmentId: string; conversationId: string; fileName: string; relativePath: string; byteSize: number; mediaType: string; createdAt: string };
 type LocalAttachmentResult = V2AttachmentResult;
+type DeletionCleanup = { conversationId: string; deletedAt: string; status: "queued" | "deleting" | "failed" | "completed";
+  items: Array<{ kind: "attachment_object" | "file_backup_object" | "run_artifacts"; objectRef: string; status: "queued" | "deleting" | "failed" | "completed"; attempts: number }> };
 type ProjectRuleView = { schemaVersion: 2; projectId: string; sourcePath: string; sourceSha256: string; sourceVersion: string; content: string; acceptedAt: string; revokedAt?: string | null };
 const workbenchFetch = createWorkbenchFetch(API);
 
@@ -149,6 +151,7 @@ export default function HomePage() {
   const [events, setEvents] = useState<WorkbenchEvent[]>([]);
   const [draftReply, setDraftReply] = useState("");
   const [notice, setNotice] = useState("");
+  const [deletions, setDeletions] = useState<DeletionCleanup[]>([]);
   const [loading, setLoading] = useState(true);
   const [startupError, setStartupError] = useState(false);
   const [startupAttempt, setStartupAttempt] = useState(0);
@@ -186,6 +189,10 @@ export default function HomePage() {
   const refreshSidebar = useCallback(async () => {
     const result = await api<{ conversations: UiConversationSummary[] }>("/conversations");
     setConversations(result.conversations);
+  }, []);
+  const refreshDeletions = useCallback(async () => {
+    const result = await pickerApi<{ deletions: DeletionCleanup[] }>("/deletions");
+    setDeletions(result.deletions);
   }, []);
   const refreshConversationFiles = useCallback(async (id: string, token: number) => {
     const [attachmentData, resultData, changesetData] = await Promise.all([
@@ -345,6 +352,7 @@ export default function HomePage() {
         }, controller.signal);
         if (ignore) return;
         setMode(health.mode); setCapabilities(caps.capabilities); setConversations(listed.conversations);
+        void refreshDeletions().catch(() => setNotice("删除清理状态暂时无法读取。"));
         const saved = localStorage.getItem("pi-workbench-conversation");
         if (saved && listed.conversations.some((item) => item.conversationId === saved)) await loadConversation(saved, controller.signal);
         else if (listed.conversations[0]) await loadConversation(listed.conversations[0].conversationId, controller.signal);
@@ -356,7 +364,12 @@ export default function HomePage() {
       finally { if (!ignore) setLoading(false); }
     })();
     return () => { ignore = true; controller.abort(); navigationTokenRef.current++; eventSourceRef.current?.close(); eventSourceRef.current = null; };
-  }, [loadConversation, startupAttempt]);
+  }, [loadConversation, refreshDeletions, startupAttempt]);
+  useEffect(() => {
+    if (!deletions.some((item) => item.status === "queued" || item.status === "deleting")) return;
+    const timer = setInterval(() => { void refreshDeletions().catch(() => undefined); }, 2_000);
+    return () => clearInterval(timer);
+  }, [deletions, refreshDeletions]);
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [conversation?.messages.length, events.length, draftReply]);
   useEffect(() => { if (isNewConversationDraft && !loading) textareaRef.current?.focus(); }, [isNewConversationDraft, loading]);
 
@@ -396,7 +409,8 @@ export default function HomePage() {
     if (!accepted) return;
     const wasSelected = selectedConversationIdRef.current === id;
     try {
-      await pickerApi<{ deleted: boolean }>(`/conversations/${encodeURIComponent(id)}`, { method: "DELETE", body: "{}" });
+      const deletion = await pickerApi<{ deleted: boolean; cleanup: DeletionCleanup }>(`/conversations/${encodeURIComponent(id)}`, { method: "DELETE", body: "{}" });
+      setDeletions((current) => [deletion.cleanup, ...current.filter((item) => item.conversationId !== id)].slice(0, 50));
       const remaining = conversations.filter((item) => item.conversationId !== id);
       setConversations(remaining);
       if (wasSelected) {
@@ -412,10 +426,17 @@ export default function HomePage() {
           setIsNewConversationDraft(true);
         }
       } else await refreshSidebar();
-      setNotice("对话及其本地运行记录已永久删除。");
+      setNotice("对话记录已删除；磁盘清理状态显示在下方。");
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "无法删除对话；活动运行可能仍在执行。");
     }
+  }
+  async function retryDeletionCleanup(id: string) {
+    try {
+      const result = await pickerApi<{ cleanup: DeletionCleanup }>(`/deletions/${encodeURIComponent(id)}/retry`, { method: "POST", body: "{}" });
+      setDeletions((current) => current.map((item) => item.conversationId === id ? result.cleanup : item));
+      setNotice(result.cleanup.status === "completed" ? "磁盘清理已完成。" : "清理仍未完成；可稍后再次重试。");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "无法重试磁盘清理。"); }
   }
   async function openChangeset(changesetId: string) {
     const conversationId = selectedConversationIdRef.current;
@@ -619,7 +640,11 @@ export default function HomePage() {
       const next = await api<UiRun>(`/runs/${encodeURIComponent(runId)}/continue`, { method: "POST", headers: { "Idempotency-Key": key() }, body: "{}" });
       if (token !== navigationTokenRef.current || selectedConversationIdRef.current !== conversationId) return;
       setActiveRun(next); setRuns((current) => [next, ...current.filter((run) => run.runId !== next.runId)].slice(0, 32)); setSelectedRunId(next.runId);
-      setEvents([]); setDraftReply(""); connectEvents(next.runId);
+      setEvents([]); setDraftReply("");
+      if (next.status === "completed") {
+        await refreshSidebar();
+        if (conversationId) await loadConversation(conversationId);
+      } else connectEvents(next.runId);
     } catch (error) { setNotice(error instanceof Error ? error.message : "继续运行失败。"); }
   }
   async function openPicker(mode: "project" | "attachment") {
@@ -905,6 +930,12 @@ export default function HomePage() {
               </div>
             {isWelcome && canCompose && <div className="suggestions">{SUGGESTIONS.map((suggestion, index) => <button key={suggestion} className="suggestion" onClick={() => setText(suggestion)}>{index === 0 && <Icon name="spark" />}{suggestion}</button>)}</div>}
             {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")} aria-label="关闭提示"><Icon name="close" /></button></div>}
+            {deletions.slice(0, 3).map((item) => <div className="cleanup-status" role="status" key={item.conversationId}>
+              <span>已删除对话 {item.conversationId.slice(0, 8)} · {item.status === "completed" ? "磁盘清理完成" : item.status === "failed" ? "磁盘清理失败" : item.status === "deleting" ? "正在清理磁盘" : "等待磁盘清理"}
+                {`（${item.items.filter((entry) => entry.status === "completed").length}/${item.items.length} 项）`}
+                {item.status === "failed" ? `；已重试 ${Math.max(...item.items.map((entry) => entry.attempts), 0)} 次` : ""}</span>
+              {item.status === "failed" && <button type="button" onClick={() => void retryDeletionCleanup(item.conversationId)}>重试清理</button>}
+            </div>)}
             <div className="disclaimer">普通提示使用默认空工具集 · 对话保存于本地 SQLite · AI 生成内容请自行核验</div>
           </section>
         </>}

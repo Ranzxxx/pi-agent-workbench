@@ -365,8 +365,8 @@ export class ProjectPickerService {
     return bytes;
   }
 
-  async flushGarbage(): Promise<void> {
-    for (const item of this.storage.garbage.list(250)) {
+  async flushGarbage(items = this.storage.garbage.list(250)): Promise<void> {
+    for (const item of items) {
       try {
         if (!this.storage.garbage.claim(item)) continue;
         if (item.kind === "run_artifacts") {

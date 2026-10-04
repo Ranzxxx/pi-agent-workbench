@@ -11,6 +11,7 @@ import {
   parseV2RunEvent,
   parseV2RunEventPage,
   parseV2IdempotencyResult,
+  parseWorkbenchResult,
   type V2Error,
   type V2EventCursor,
   type V2IdempotencyRequest,
@@ -19,6 +20,8 @@ import {
   type V2RunAttempt,
   type V2RunEvent,
   type V2RunStatus,
+  type WorkbenchResult,
+  type Usage,
 } from "@pi-workbench/protocol";
 import { assertMigrationsCompatible, assertMigrationsCurrent, applyMigrations, loadCoreMigrations, StorageMigrationError, StorageSchemaError, type StorageMigration } from "./migrations.js";
 import { resolveDatabasePath, type DataDirectoryOptions } from "./data-directory.js";
@@ -67,6 +70,12 @@ export interface CapabilityStateRecord {
   capabilityId: string; apiVersion: string; enabled: boolean; config: Record<string, JsonValue>; updatedAt: string;
 }
 export interface GarbageRecord { kind: "attachment_object" | "run_artifacts" | "file_backup_object"; objectRef: string; attempts: number; }
+export interface DeletionCleanupItem {
+  kind: GarbageRecord["kind"]; objectRef: string; status: "queued" | "deleting" | "failed" | "completed"; attempts: number;
+}
+export interface DeletionCleanupRecord {
+  conversationId: string; deletedAt: string; status: "queued" | "deleting" | "failed" | "completed"; items: DeletionCleanupItem[];
+}
 export interface ContentObjectRecord { sha256: string; byteSize: number; createdAt: string; }
 export type ManagedObjectArea = "objects" | "file-objects";
 export interface ManagedObjectReservationRequest { reservationId: string; area: ManagedObjectArea; sha256: string; byteSize: number; }
@@ -116,6 +125,10 @@ export interface AttemptExecutionSafetyRecord {
   checkpointKind: "pre_call" | "conversation_turn" | "workflow_stage" | null;
   checkpointId: string | null; snapshotId: string | null; updatedAt: string;
 }
+export interface CompletedConversationResultRecord {
+  attemptId: string; runId: string; snapshotId: string; result: WorkbenchResult; snapshot: JsonValue; usage: Usage;
+  costStatus: "estimate" | "known";
+}
 export interface CheckpointRecord {
   id: string; runId: string; attemptId: string; phaseId: string; inputSha256: string;
   outputRef: string | null; status: "completed" | "failed" | "interrupted"; createdAt: string;
@@ -159,12 +172,14 @@ export class Storage {
   readonly projectRules: ProjectRulesRepository;
   readonly capabilityStates: CapabilityStateRepository;
   readonly garbage: GarbageRepository;
+  readonly deletionCleanup: DeletionCleanupRepository;
   readonly conversations: ConversationRepository;
   readonly messages: MessageRepository;
   readonly snapshots: SessionSnapshotRepository;
   readonly runs: RunRepository;
   readonly attempts: RunAttemptRepository;
   readonly attemptSafety: AttemptExecutionSafetyRepository;
+  readonly completedConversationResults: CompletedConversationResultRepository;
   readonly events: RunEventRepository;
   readonly checkpoints: CheckpointRepository;
   readonly usage: UsageRepository;
@@ -188,12 +203,14 @@ export class Storage {
     this.projectRules = new ProjectRulesRepository(context);
     this.capabilityStates = new CapabilityStateRepository(context);
     this.garbage = new GarbageRepository(context);
+    this.deletionCleanup = new DeletionCleanupRepository(context);
     this.conversations = new ConversationRepository(context);
     this.messages = new MessageRepository(context);
     this.snapshots = new SessionSnapshotRepository(context);
     this.runs = new RunRepository(context);
     this.attempts = new RunAttemptRepository(context);
     this.attemptSafety = new AttemptExecutionSafetyRepository(context);
+    this.completedConversationResults = new CompletedConversationResultRepository(context);
     this.events = new RunEventRepository(context);
     this.checkpoints = new CheckpointRepository(context);
     this.usage = new UsageRepository(context);
@@ -945,6 +962,11 @@ export class GarbageRepository {
     const owner = currentProcessIdentity();
     this.context.atomic((db) => {
       assertGarbageClaimOwner(db, item, owner);
+      const attemptsRow = item.kind === "file_backup_object"
+        ? db.prepare("SELECT attempts FROM file_object_garbage WHERE sha256 = ?").get(item.objectRef) as { attempts: number } | undefined
+        : db.prepare("SELECT attempts FROM garbage_queue WHERE kind = ? AND object_ref = ?").get(item.kind, item.objectRef) as { attempts: number } | undefined;
+      if (attemptsRow) db.prepare("UPDATE deletion_cleanup_items SET attempts = ? WHERE kind = ? AND object_ref = ?")
+        .run(attemptsRow.attempts, item.kind, item.objectRef);
       if (item.kind === "attachment_object") {
         const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM attachments WHERE object_sha256 = ?) + (SELECT COUNT(*) FROM attachment_results WHERE object_sha256 = ?) AS count").get(item.objectRef, item.objectRef), "count");
         if (refs > 0) { db.prepare("DELETE FROM garbage_queue WHERE kind = ? AND object_ref = ?").run(item.kind, item.objectRef); return; }
@@ -966,6 +988,38 @@ export class GarbageRepository {
       if (item.kind === "file_backup_object") db.prepare("UPDATE file_object_garbage SET status = 'pending', attempts = attempts + 1, last_error = ?, claim_pid = NULL, claim_start = NULL, claim_boot_id = NULL WHERE sha256 = ? AND status = 'deleting'").run(error.slice(0, 512), item.objectRef);
       else db.prepare("UPDATE garbage_queue SET status = 'pending', attempts = attempts + 1, last_error = ?, claim_pid = NULL, claim_start = NULL, claim_boot_id = NULL WHERE kind = ? AND object_ref = ? AND status = 'deleting'").run(error.slice(0, 512), item.kind, item.objectRef);
     });
+  }
+}
+
+export class DeletionCleanupRepository {
+  constructor(private readonly context: Context) {}
+  get(conversationId: string): DeletionCleanupRecord | undefined {
+    assertId(conversationId, "Deleted conversation id");
+    const deletion = this.context.db.prepare("SELECT conversation_id, deleted_at FROM deletion_cleanup WHERE conversation_id = ?")
+      .get(conversationId) as { conversation_id: string; deleted_at: string } | undefined;
+    if (!deletion) return undefined;
+    const rows = this.context.db.prepare(`SELECT i.kind, i.object_ref,
+      COALESCE(g.status, f.status) AS queue_status, COALESCE(g.attempts, f.attempts, i.attempts) AS attempts
+      FROM deletion_cleanup_items i
+      LEFT JOIN garbage_queue g ON i.kind != 'file_backup_object' AND g.kind = i.kind AND g.object_ref = i.object_ref
+      LEFT JOIN file_object_garbage f ON i.kind = 'file_backup_object' AND f.sha256 = i.object_ref
+      WHERE i.conversation_id = ? ORDER BY i.kind, i.object_ref`).all(conversationId) as Array<{
+        kind: GarbageRecord["kind"]; object_ref: string; queue_status: "pending" | "deleting" | null; attempts: number;
+      }>;
+    const items: DeletionCleanupItem[] = rows.map((row) => ({
+      kind: row.kind, objectRef: row.object_ref, attempts: row.attempts,
+      status: row.queue_status === null ? "completed" : row.queue_status === "deleting" ? "deleting" : row.attempts > 0 ? "failed" : "queued",
+    }));
+    const status = items.some((item) => item.status === "failed") ? "failed"
+      : items.some((item) => item.status === "deleting") ? "deleting"
+      : items.some((item) => item.status === "queued") ? "queued" : "completed";
+    return { conversationId, deletedAt: deletion.deleted_at, status, items };
+  }
+  list(limit = 50): DeletionCleanupRecord[] {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new StorageError("invalid_input", "Deletion history limit is invalid");
+    const rows = this.context.db.prepare("SELECT conversation_id FROM deletion_cleanup ORDER BY deleted_at DESC LIMIT ?")
+      .all(limit) as Array<{ conversation_id: string }>;
+    return rows.map((row) => this.get(row.conversation_id)!);
   }
 }
 
@@ -1030,20 +1084,33 @@ export class ConversationRepository {
       const backupHashes = db.prepare("SELECT backup_sha256 AS sha256 FROM file_operations o JOIN file_changesets c ON c.id = o.changeset_id WHERE c.conversation_id = ? AND backup_sha256 IS NOT NULL UNION SELECT result_sha256 AS sha256 FROM file_operations o JOIN file_changesets c ON c.id = o.changeset_id WHERE c.conversation_id = ? AND result_sha256 IS NOT NULL").all(id, id) as Array<{ sha256: string }>;
       const runIds = db.prepare("SELECT id FROM runs WHERE conversation_id = ?").all(id) as Array<{ id: string }>;
       const queuedAt = new Date().toISOString();
+      db.prepare("INSERT INTO deletion_cleanup(conversation_id, deleted_at) VALUES (?, ?)").run(id, queuedAt);
+      const trackCleanup = (kind: GarbageRecord["kind"], objectRef: string): void => {
+        db.prepare("INSERT INTO deletion_cleanup_items(conversation_id, kind, object_ref) VALUES (?, ?, ?)").run(id, kind, objectRef);
+      };
       db.prepare("DELETE FROM attachment_results WHERE conversation_id = ?").run(id);
       db.prepare("DELETE FROM attachments WHERE conversation_id = ?").run(id);
       for (const { object_sha256 } of objectHashes) {
         const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM attachments WHERE object_sha256 = ?) + (SELECT COUNT(*) FROM attachment_results WHERE object_sha256 = ?) AS count").get(object_sha256, object_sha256), "count");
-        if (refs === 0) db.prepare(`INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES ('attachment_object', ?, ?)
-          ON CONFLICT(kind, object_ref) DO NOTHING`).run(object_sha256, queuedAt);
+        if (refs === 0) {
+          db.prepare(`INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES ('attachment_object', ?, ?)
+            ON CONFLICT(kind, object_ref) DO NOTHING`).run(object_sha256, queuedAt);
+          trackCleanup("attachment_object", object_sha256);
+        }
       }
       db.prepare("DELETE FROM file_changesets WHERE conversation_id = ?").run(id);
       for (const { sha256 } of backupHashes) {
         const refs = numberFrom(db.prepare("SELECT (SELECT COUNT(*) FROM file_operations WHERE backup_sha256 = ?) + (SELECT COUNT(*) FROM file_operations WHERE result_sha256 = ?) AS count").get(sha256, sha256), "count");
-        if (refs === 0) db.prepare("INSERT INTO file_object_garbage(sha256, queued_at) VALUES (?, ?) ON CONFLICT(sha256) DO NOTHING").run(sha256, queuedAt);
+        if (refs === 0) {
+          db.prepare("INSERT INTO file_object_garbage(sha256, queued_at) VALUES (?, ?) ON CONFLICT(sha256) DO NOTHING").run(sha256, queuedAt);
+          trackCleanup("file_backup_object", sha256);
+        }
       }
-      for (const { id: runId } of runIds) db.prepare(`INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES ('run_artifacts', ?, ?)
-        ON CONFLICT(kind, object_ref) DO NOTHING`).run(runId, queuedAt);
+      for (const { id: runId } of runIds) {
+        db.prepare(`INSERT INTO garbage_queue(kind, object_ref, queued_at) VALUES ('run_artifacts', ?, ?)
+          ON CONFLICT(kind, object_ref) DO NOTHING`).run(runId, queuedAt);
+        trackCleanup("run_artifacts", runId);
+      }
 
       db.prepare("DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?)").run(id);
       db.prepare("DELETE FROM checkpoints WHERE run_id IN (SELECT id FROM runs WHERE conversation_id = ?)").run(id);
@@ -1547,6 +1614,140 @@ export class AttemptExecutionSafetyRepository {
       db.prepare("UPDATE attempt_execution_safety SET state = 'safe', checkpoint_kind = 'workflow_stage', checkpoint_id = ?, snapshot_id = NULL, updated_at = ? WHERE attempt_id = ?")
         .run(input.checkpointId, input.usage.updatedAt, input.attemptId);
       return this.get(input.attemptId)!;
+    });
+  }
+}
+
+export class CompletedConversationResultRepository {
+  constructor(private readonly context: Context) {}
+  save(input: { attemptId: string; runId: string; result: WorkbenchResult; snapshot: JsonValue; usage: Usage }): CompletedConversationResultRecord {
+    assertId(input.attemptId, "Attempt id"); assertId(input.runId, "Run id");
+    const result = parseWorkbenchResult(input.result);
+    if (result.status !== "completed" || result.runId !== input.runId) throw new StorageError("invalid_input", "Only a completed conversation result can be persisted");
+    const resultJson = safeJson(result);
+    const snapshotJson = safeJson(input.snapshot);
+    const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+    this.context.atomic((db) => {
+      assertRunningAttempt(db, input.attemptId);
+      const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(input.runId) as RunRow | undefined;
+      const attempt = db.prepare("SELECT run_id FROM run_attempts WHERE id = ?").get(input.attemptId) as { run_id: string } | undefined;
+      const safety = db.prepare("SELECT * FROM attempt_execution_safety WHERE attempt_id = ?").get(input.attemptId) as AttemptExecutionSafetyRow | undefined;
+      if (!run || !attempt || attempt.run_id !== input.runId || run.conversation_id !== result.conversationId ||
+          (parseJson(run.request_json) as { kind?: string }).kind !== "message" || safety?.state !== "safe" || safety.checkpoint_kind !== "conversation_turn" ||
+          !safety.snapshot_id || safety.checkpoint_id !== safety.snapshot_id) {
+        throw new StorageError("conflict", "Completed result has no matching safe conversation checkpoint");
+      }
+      const snapshot = db.prepare("SELECT conversation_id, snapshot_json FROM session_snapshots WHERE id = ?")
+        .get(safety.snapshot_id) as { conversation_id: string; snapshot_json: string } | undefined;
+      if (!snapshot || snapshot.conversation_id !== run.conversation_id || snapshot.snapshot_json !== snapshotJson) {
+        throw new StorageError("conflict", "Completed result snapshot does not match its durable checkpoint");
+      }
+      const usageRow = db.prepare("SELECT * FROM usage_records WHERE attempt_id = ?").get(input.attemptId) as UsageRow | undefined;
+      if (!usageRow) throw new StorageError("conflict", "Completed result has no settled usage");
+      const usage = mapUsage(usageRow);
+      if (usage.costStatus === "unknown" || usage.estimatedCostUsd === null || usage.pricingVersion === null ||
+          usage.modelCalls !== input.usage.modelCalls || usage.toolCalls !== input.usage.toolCalls ||
+          usage.inputTokens !== input.usage.inputTokens || usage.outputTokens !== input.usage.outputTokens ||
+          usage.cacheReadTokens !== input.usage.cacheReadTokens || usage.cacheWriteTokens !== input.usage.cacheWriteTokens ||
+          usage.totalTokens !== input.usage.totalTokens || usage.estimatedCostUsd !== input.usage.estimatedCostUsd ||
+          usage.pricingVersion !== input.usage.pricingVersion) {
+        throw new StorageError("conflict", "Completed result usage does not match its durable ledger");
+      }
+      const requestHash = hashRunRequest({ runId: run.id, conversationId: run.conversation_id, projectId: run.project_id,
+        extensionId: run.extension_id, retryOfRunId: run.retry_of_run_id ?? undefined, request: parseJson(run.request_json) }, run.project_id, run.request_json);
+      if (requestHash !== run.request_hash) throw new StorageError("conflict", "Completed result request digest is invalid");
+      db.prepare(`INSERT INTO completed_conversation_results(attempt_id, run_id, request_sha256, snapshot_id,
+        snapshot_sha256, usage_sha256, result_json, result_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(input.attemptId, input.runId, requestHash, safety.snapshot_id, digest(snapshotJson),
+          digest(safeJson(usage)), resultJson, digest(resultJson), new Date().toISOString());
+    });
+    return this.get(input.attemptId)!;
+  }
+  get(attemptId: string): CompletedConversationResultRecord | undefined {
+    assertId(attemptId, "Attempt id");
+    const row = this.context.db.prepare("SELECT * FROM completed_conversation_results WHERE attempt_id = ?").get(attemptId) as {
+      attempt_id: string; run_id: string; request_sha256: string; snapshot_id: string; snapshot_sha256: string;
+      usage_sha256: string; result_json: string; result_sha256: string;
+    } | undefined;
+    if (!row) return undefined;
+    const run = this.context.db.prepare("SELECT * FROM runs WHERE id = ?").get(row.run_id) as RunRow | undefined;
+    const attempt = this.context.db.prepare("SELECT run_id FROM run_attempts WHERE id = ?").get(attemptId) as { run_id: string } | undefined;
+    const safety = this.context.db.prepare("SELECT * FROM attempt_execution_safety WHERE attempt_id = ?").get(attemptId) as AttemptExecutionSafetyRow | undefined;
+    const snapshot = this.context.db.prepare("SELECT * FROM session_snapshots WHERE id = ?").get(row.snapshot_id) as SnapshotRow | undefined;
+    const usageRow = this.context.db.prepare("SELECT * FROM usage_records WHERE attempt_id = ?").get(attemptId) as UsageRow | undefined;
+    const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+    if (!run || attempt?.run_id !== row.run_id || !safety || !snapshot || !usageRow || safety.state !== "safe" || safety.checkpoint_kind !== "conversation_turn" ||
+        safety.snapshot_id !== row.snapshot_id || safety.checkpoint_id !== row.snapshot_id || snapshot.conversation_id !== run.conversation_id ||
+        digest(snapshot.snapshot_json) !== row.snapshot_sha256 || digest(row.result_json) !== row.result_sha256 ||
+        digest(safeJson(mapUsage(usageRow))) !== row.usage_sha256 || run.request_hash !== row.request_sha256 ||
+        hashRunRequest({ runId: run.id, conversationId: run.conversation_id, projectId: run.project_id,
+          extensionId: run.extension_id, retryOfRunId: run.retry_of_run_id ?? undefined, request: parseJson(run.request_json) }, run.project_id, run.request_json) !== row.request_sha256) {
+      throw new StorageError("conflict", "Completed conversation result failed integrity validation");
+    }
+    const snapshotValue = parseJson(snapshot.snapshot_json);
+    const session = snapshotValue as { formatVersion?: unknown; sdkVersion?: unknown; sessionId?: unknown;
+      header?: { id?: unknown; type?: unknown; cwd?: unknown }; entries?: unknown; leafId?: unknown };
+    if (!session || typeof session !== "object" || session.formatVersion !== "pi-session-v3" || session.sdkVersion !== "0.86.1" ||
+        typeof session.sessionId !== "string" || session.sessionId !== session.header?.id || session.header.type !== "session" ||
+        typeof session.header.cwd !== "string" || !Array.isArray(session.entries) ||
+        (session.leafId !== null && (typeof session.leafId !== "string" ||
+          !session.entries.some((entry: { id?: unknown }) => entry?.id === session.leafId)))) {
+      throw new StorageError("conflict", "Completed result session snapshot is invalid");
+    }
+    const result = parseWorkbenchResult(parseJson(row.result_json));
+    if (result.status !== "completed" || result.runId !== row.run_id || result.conversationId !== run.conversation_id ||
+        (parseJson(run.request_json) as { kind?: string }).kind !== "message") throw new StorageError("conflict", "Completed result identity is invalid");
+    const usage = mapUsage(usageRow);
+    if (usage.costStatus === "unknown" || usage.estimatedCostUsd === null || usage.pricingVersion === null) throw new StorageError("conflict", "Completed result usage is not settled");
+    return { attemptId, runId: row.run_id, snapshotId: row.snapshot_id, result, snapshot: snapshotValue,
+      costStatus: usage.costStatus, usage: {
+      modelCalls: usage.modelCalls, toolCalls: usage.toolCalls, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens, cacheWriteTokens: usage.cacheWriteTokens, totalTokens: usage.totalTokens,
+      estimatedCostUsd: usage.estimatedCostUsd, pricingVersion: usage.pricingVersion,
+    } };
+  }
+  recover(attemptId: string, key: V2IdempotencyRequest): { events: V2RunEvent[]; replayed: boolean } {
+    parseV2IdempotencyRequest(key);
+    return this.context.atomic((db) => {
+      const saved = this.get(attemptId);
+      if (!saved || key.scope !== saved.runId || key.endpoint !== "POST /api/v2/runs/:id/continue") {
+        throw new StorageError("conflict", "Completed conversation result is unavailable for this continuation");
+      }
+      const idempotency = new IdempotencyRepository(this.context);
+      if (idempotency.lookup(key, { schemaVersion: 2, resourceKind: "run", resourceId: saved.runId })) return { events: [], replayed: true };
+      const run = db.prepare("SELECT * FROM runs WHERE id = ?").get(saved.runId) as RunRow;
+      const attempt = db.prepare("SELECT * FROM run_attempts WHERE id = ?").get(attemptId) as AttemptRow | undefined;
+      const slot = db.prepare("SELECT active_run_id FROM global_slot WHERE singleton = 1").get() as { active_run_id: string | null };
+      const latest = db.prepare("SELECT id FROM session_snapshots WHERE conversation_id = ? ORDER BY version DESC LIMIT 1")
+        .get(run.conversation_id) as { id: string } | undefined;
+      const newer = db.prepare("SELECT 1 FROM runs WHERE conversation_id = ? AND id != ? AND created_at >= ? LIMIT 1")
+        .get(run.conversation_id, run.id, run.created_at);
+      const duplicate = db.prepare("SELECT 1 FROM messages WHERE run_id = ? AND role = 'assistant' LIMIT 1").get(run.id);
+      const fileEffects = db.prepare("SELECT 1 FROM file_operations o JOIN file_changesets c ON c.id = o.changeset_id WHERE c.run_id = ? LIMIT 1").get(run.id);
+      const attachmentEffects = db.prepare("SELECT 1 FROM attachment_results WHERE run_id = ? LIMIT 1").get(run.id);
+      if (run.status !== "interrupted" || attempt?.status !== "interrupted" || attempt.usage_complete !== 1 ||
+          slot.active_run_id !== null || latest?.id !== saved.snapshotId || newer || duplicate || fileEffects || attachmentEffects ||
+          db.prepare("SELECT 1 FROM run_results WHERE run_id = ?").get(run.id)) {
+        throw new StorageError("conflict", "Conversation changed after the completed result was saved; recovery was refused");
+      }
+      const timestamp = new Date().toISOString();
+      db.prepare("UPDATE conversations SET pi_session_id = ?, updated_at = ? WHERE id = ?")
+        .run((saved.snapshot as { sessionId?: string }).sessionId ?? null, timestamp, run.conversation_id);
+      db.prepare(`INSERT INTO messages(id, conversation_id, run_id, sequence, role, content, source, extension_id, attachment_refs_json, created_at)
+        VALUES (?, ?, ?, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE conversation_id = ?), 'assistant', ?, 'agent', NULL, '[]', ?)`)
+        .run(randomUUID(), run.conversation_id, run.id, run.conversation_id, saved.result.status === "completed" ? saved.result.reply : "", timestamp);
+      new RunResultRepository(this.context).save(run.id, { result: saved.result, artifacts: [] }, timestamp);
+      db.prepare("UPDATE run_attempts SET status = 'completed', ended_at = ?, error_json = NULL WHERE id = ?").run(timestamp, attemptId);
+      db.prepare("UPDATE runs SET status = 'completed', updated_at = ?, ended_at = ? WHERE id = ?").run(timestamp, timestamp, run.id);
+      const usageEvent = new RunEventRepository(this.context).append({ eventId: randomUUID(), runId: run.id,
+        attemptId, type: "usage.updated", timestamp, data: { modelCalls: saved.usage.modelCalls, toolCalls: saved.usage.toolCalls,
+          inputTokens: saved.usage.inputTokens, outputTokens: saved.usage.outputTokens, cacheReadTokens: saved.usage.cacheReadTokens,
+          cacheWriteTokens: saved.usage.cacheWriteTokens, totalTokens: saved.usage.totalTokens,
+          costStatus: saved.costStatus, estimatedCostUsd: saved.usage.estimatedCostUsd } });
+      const event = new RunEventRepository(this.context).append({ eventId: randomUUID(), runId: run.id,
+        attemptId, type: "run.completed", timestamp, data: { resultRef: run.id } });
+      idempotency.resolve(key, { schemaVersion: 2, resourceKind: "run", resourceId: run.id }, timestamp);
+      return { events: [usageEvent, event], replayed: false };
     });
   }
 }

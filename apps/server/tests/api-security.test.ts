@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createWorkbenchApp } from "../src/app.js";
+import { openStorage } from "@pi-workbench/storage";
 import { localSessionHeaders } from "./local-client.js";
 
 test("all private API routes reject unauthenticated or foreign requests before reading or mutating state", { timeout: 30_000 }, async (t) => {
@@ -21,7 +22,7 @@ test("all private API routes reject unauthenticated or foreign requests before r
     "/api/v1/runs/missing", "/api/v1/runs/missing/artifacts/report.json",
     "/api/v2/conversations", `/api/v2/conversations/${id}`, `/api/v2/conversations/${id}/runs`,
     "/api/v2/runs/missing", "/api/v2/runs/missing/events", "/api/v2/runs/missing/artifacts/report.json",
-    "/api/v2/projects", "/api/v2/capabilities",
+    "/api/v2/projects", "/api/v2/capabilities", "/api/v2/deletions",
   ];
   for (const route of readRoutes) {
     assert.equal((await fetch(`${base}${route}`)).status, 401, `${route}: no cookie`);
@@ -34,6 +35,7 @@ test("all private API routes reject unauthenticated or foreign requests before r
     ["POST", "/api/v2/conversations"], ["DELETE", `/api/v2/conversations/${id}`],
     ["POST", "/api/v2/runs"], ["POST", "/api/v2/runs/missing/cancel"],
     ["POST", "/api/v2/runs/missing/retry"], ["POST", "/api/v2/runs/missing/continue"],
+    ["POST", "/api/v2/deletions/missing/retry"],
     ["PATCH", "/api/v2/capabilities/development_greeting_tool/state"],
     ["POST", "/api/v1/conversations"], ["POST", "/api/v1/runs/missing/retry"],
   ];
@@ -74,6 +76,58 @@ test("all private API routes reject unauthenticated or foreign requests before r
   const stream = await fetch(`${base}/api/v2/runs/${run.runId}/events`, { headers: { cookie: headers.cookie! } });
   assert.equal(stream.status, 200, "EventSource needs no custom CSRF header");
   assert.match(await stream.text(), /event: run.completed/u);
+});
+
+test("deleted conversation cleanup is authenticated, durable, and retryable without following symlinks", { timeout: 30_000 }, async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-deletion-status-"));
+  const dataDirectory = path.join(root, "state");
+  const outside = path.join(root, "outside");
+  const app = await createWorkbenchApp({ mode: "fake", dataDirectory });
+  t.after(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
+  const base = await app.listen({ host: "127.0.0.1", port: 0 });
+  const headers = await localSessionHeaders(base);
+  const created = await fetch(`${base}/api/v2/conversations`, { method: "POST", headers });
+  assert.equal(created.status, 201);
+  const { conversationId } = await created.json() as { conversationId: string };
+  const storage = openStorage({ dataDirectory: { dataDirectory } });
+  const run = storage.runs.create({ runId: crypto.randomUUID(), conversationId, request: { kind: "message", text: "cleanup fixture" } });
+  storage.runs.updateStatus(run.runId, "failed");
+  storage.close();
+  await mkdir(outside);
+  const marker = path.join(outside, "keep.txt");
+  await writeFile(marker, "outside data");
+  const workflowPath = path.join(dataDirectory, "workflows", run.runId);
+  await mkdir(path.dirname(workflowPath), { recursive: true });
+  await symlink(outside, workflowPath);
+
+  const deleted = await fetch(`${base}/api/v2/conversations/${conversationId}`, { method: "DELETE", headers });
+  assert.equal(deleted.status, 200);
+  const response = await deleted.json() as { deleted: boolean; cleanup: { conversationId: string; status: string } };
+  assert.equal(response.deleted, true);
+  assert.equal(response.cleanup.conversationId, conversationId);
+  assert.equal((await fetch(`${base}/api/v2/deletions`)).status, 401);
+  let cleanup: { status: string; items: Array<{ attempts: number; status: string }> } | undefined;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const listed = await fetch(`${base}/api/v2/deletions`, { headers }).then((item) => item.json()) as { deletions: Array<{ conversationId: string; status: string; items: Array<{ attempts: number; status: string }> }> };
+    cleanup = listed.deletions.find((item) => item.conversationId === conversationId);
+    if (cleanup?.status === "failed") break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(cleanup?.status, "failed");
+  assert.equal(cleanup.items[0]?.attempts, 1);
+  assert.equal(await readFile(marker, "utf8"), "outside data");
+  const retryRoute = `${base}/api/v2/deletions/${conversationId}/retry`;
+  assert.equal((await fetch(retryRoute, { method: "POST", headers: { cookie: headers.cookie! }, body: "{}" })).status, 403);
+  await rm(workflowPath);
+  await mkdir(path.join(workflowPath, "analysis"), { recursive: true });
+  await writeFile(path.join(workflowPath, "analysis", "result.json"), "safe artifact");
+  const retried = await fetch(retryRoute, { method: "POST", headers, body: "{}" });
+  assert.equal(retried.status, 200);
+  const after = await retried.json() as { cleanup: { status: string; items: Array<{ attempts: number }> } };
+  assert.equal(after.cleanup.status, "completed");
+  assert.equal(after.cleanup.items[0]?.attempts, 1);
+  assert.equal(await readFile(marker, "utf8"), "outside data");
+  await assert.rejects(readFile(path.join(workflowPath, "analysis", "result.json")), { code: "ENOENT" });
 });
 
 test("session bootstrap verifies local authority including proxy headers and expires the legacy cookie path", { timeout: 20_000 }, async (t) => {
